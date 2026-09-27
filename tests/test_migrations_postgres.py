@@ -24,6 +24,7 @@ binaries are available, so a skip can never be mistaken for executable
 validation.
 """
 
+import copy
 import hashlib
 import json
 import os
@@ -9871,19 +9872,22 @@ def test_pr_z_identity_key_and_filtering_rule_are_the_backend_rule(db):
     from backend.catalog import coverage
 
     identities = [
-        ("טויוטה", "4RUNNER", 2026, 2026, "TRN285L-GKTSKA", "SR5",
+        ("טויוטה", "4RUNNER", 2026, 2026, "TRN285L-GKTSKA", "SR5", "413", "722", "P",
          {"fuel_type": "petrol", "propulsion_technology": "conventional",
           "drivetrain": "awd", "body_style": "suv"}),
-        ("טויוטה", "4RUNNER", 2026, 2026, "TZNA55L-GKZSZA", "LIMITED", {}),
-        ("Toyota", "RAV4 | 3:x", None, None, None, None, {"market": "IL"}),
-        ("a|4:b", "c", 2018, 2019, "", "=", {"engine_code": "1:=|"}),
+        ("טויוטה", "4RUNNER", 2026, 2026, "TZNA55L-GKZSZA", "LIMITED", "413", "758", "P", {}),
+        ("טויוטה", "4RUNNER", 2026, 2026, "TZNA55L-GKZSZA", "LIMITED", "413", "839", "P", {}),
+        ("Toyota", "RAV4 | 3:x", None, None, None, None, None, None, None, {"market": "IL"}),
+        ("a|4:b", "c", 2018, 2019, "", "=", "", " 07 ", "1:|", {"engine_code": "1:=|"}),
     ]
     for identity in identities:
-        manufacturer, model, start, end, code, trim, dimensions = identity
+        manufacturer, model, start, end, code, trim, maker, degem, kind, dimensions = identity
         args = (f"{_sql_text(manufacturer)}, {_sql_text(model)}, "
                 f"{'null' if start is None else start}::integer, "
                 f"{'null' if end is None else end}::integer, {_sql_text(code)}, "
-                f"{_sql_text(trim)}, $d${json.dumps(dimensions, ensure_ascii=False)}$d$::jsonb")
+                f"{_sql_text(trim)}, {_sql_text(maker)}, {_sql_text(degem)}, "
+                f"{_sql_text(kind)}, "
+                f"$d${json.dumps(dimensions, ensure_ascii=False)}$d$::jsonb")
         assert db.psql(f"select public.catalog_variant_identity_text({args})") == \
             coverage.variant_identity_text(*identity)
         assert db.psql(f"select public.catalog_variant_identity_key({args})") == \
@@ -9920,6 +9924,7 @@ def _coverage_seed(db, world: dict, index: int, status: str, *, content: str | N
         "last_run_id, snapshot_key, content_sha256, vocabulary_version) "
         "select public.catalog_variant_identity_key(c.manufacturer, c.commercial_model, "
         "c.model_year_start, c.model_year_end, c.official_model_code, c.trim, "
+        "r.payload->>'tozeret_cd', r.payload->>'degem_cd', r.payload->>'sug_degem', "
         f"c.identity_dimensions), 'register', '{status}', '{world['capture_run']}', 'seed', "
         f"{_sql_text(content) if content else 'public.catalog_variant_content_sha256(r.payload)'}, "
         f"{_sql_text(vocabulary) if vocabulary else 'public.catalog_vocabulary_version()'} "
@@ -10052,6 +10057,174 @@ def test_pr_z_the_batch_read_and_the_ledger_write(ledger_db):
     listed = _rpc_as_service(db, "select string_agg(run_id::text, ',') from "
                                  "public.catalog_variant_coverage_runs(null, null, 50)")
     assert run in listed.split(",")
+
+
+# PR-Z2: the key carries the Government's registration identifiers verbatim,
+# and a key whose rows state different content is a collision -- recorded
+# `failed` with CATALOG_COVERAGE_KEY_COLLISION, never settled by a pick.
+
+Z2_FIXTURE = json.loads((Path(__file__).resolve().parent / "fixtures"
+                         / "production_4runner_2026_rows.json").read_text())
+Z2_ROWS = {str(row["_id"]): row for row in Z2_FIXTURE["rows"]}
+
+
+def _z2_world(db, rows: list[dict]) -> dict:
+    """A prepared plan over ONE scoped Toyota snapshot holding exactly `rows`,
+    each candidate stating the identity production stored for its register
+    row (`production_candidates`, by the row's own identity fields)."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(max_items=25, batch_size=10)
+    created = _ws_create(db, conversation, user, scope)
+    capture_run, args = _wsp_capture_run(db, conversation)
+    label = f"z2-{conversation[:8]}"
+    payload = json.loads(_catalog_snapshot_json(f"wsp-{label}", declared=len(rows)))
+    payload["retrieval_metadata"] = _wsp_metadata(WSP_TOYOTA, count=len(rows))
+    snapshot = _rpc_as_service(db, "select id from public.record_catalog_snapshot_guarded("
+                                   f"{args}, $j${json.dumps(payload)}$j$::jsonb)")
+    records = []
+    for index, row in enumerate(rows):
+        record = _catalog_record_json(snapshot, f"{label}-rec-{index}",
+                                      upstream=str(row["_id"]), payload=row)
+        records.append(_rpc_as_service(
+            db, "select id from public.record_catalog_raw_record_guarded("
+                f"{args}, $j${record}$j$::jsonb)"))
+    _rpc_as_service(db, f"select id from public.activate_catalog_snapshot_guarded({args},"
+                        f"'{json.dumps({'snapshot_id': snapshot})}'::jsonb)")
+    candidates = {}
+    identities = {(item["official_model_code"], item["trim"]): item
+                  for item in Z2_FIXTURE["production_candidates"].values()}
+    for index, (row, record) in enumerate(zip(rows, records)):
+        stated = identities[(row["degem_nm"], row["ramat_gimur"])]
+        candidate = _catalog_candidate_json(
+            snapshot, record, f"{label}-cand-{index}", make=WSP_TOYOTA,
+            model=stated["commercial_model"], years=(row["shnat_yitzur"], row["shnat_yitzur"]),
+            code=stated["official_model_code"], trim=stated["trim"],
+            dimensions=stated["identity_dimensions"])
+        candidates[str(row["_id"])] = _rpc_as_service(
+            db, "select id from public.record_catalog_candidate_guarded("
+                f"{args}, $j${candidate}$j$::jsonb)")
+    summary = _wsp_prepare(db, args, created["work_scope"]["id"], 1, scope.digest(),
+                           _wsp_units(snapshot))
+    return {"user": user, "conversation": conversation, "scope": scope,
+            "plan": created["work_scope"]["id"], "digest": scope.digest(),
+            "capture_run": capture_run, "args": args, "snapshot": snapshot,
+            "candidates": candidates, "batches": [b["id"] for b in summary["batches"]]}
+
+
+def _z2_finished_run(db, world: dict, key: str) -> str:
+    started = _wsb_start(db, world, world["batches"][0], key=key)
+    run = started["run"]["id"]
+    _wsb_finish(db, run, "partial_success")
+    db.psql(f"update public.runs set finished_at=now() where id='{run}'")
+    return run
+
+
+def _z2_rebuild(db, run: str, entries: list[dict]) -> dict:
+    return json.loads(_rpc_as_service(
+        db, f"select public.rebuild_catalog_variant_coverage('{run}', 'register', "
+            f"$e${json.dumps(entries)}$e$::jsonb)"))
+
+
+def _z2_ledger(db) -> dict[str, tuple[str, str, str]]:
+    rows = db.psql("select variant_identity_key || '|' || status || '|' || content_sha256 "
+                   "|| '|' || coalesce(reason_code, '-') from public.catalog_variant_coverage")
+    return {line.split("|")[0]: tuple(line.split("|")[1:]) for line in rows.splitlines() if line}
+
+
+def test_pr_z2_the_fixture_is_production_verbatim(db):
+    # The same aggregate, over the same rows, as the production read recorded.
+    rows = sorted(Z2_FIXTURE["rows"], key=lambda row: str(row["_id"]))
+    literal = json.dumps(rows, ensure_ascii=False)
+    assert db.psql(f"select md5(($f${literal}$f$::jsonb)::text)") == \
+        Z2_FIXTURE["provenance"]["md5"]
+
+
+def test_pr_z2_the_real_rows_get_five_keys_and_python_agrees_row_by_row(ledger_db):
+    from backend.catalog import coverage
+
+    db = ledger_db
+    world = _z2_world(db, [copy.deepcopy(row) for row in Z2_FIXTURE["rows"]])
+    keys = {}
+    for record, candidate in world["candidates"].items():
+        key = db.psql(
+            "select public.catalog_variant_identity_key(c.manufacturer, c.commercial_model, "
+            "c.model_year_start, c.model_year_end, c.official_model_code, c.trim, "
+            "r.payload->>'tozeret_cd', r.payload->>'degem_cd', r.payload->>'sug_degem', "
+            "c.identity_dimensions) from public.catalog_candidate_variants c "
+            f"join public.catalog_raw_records r on r.id = c.raw_record_id where c.id='{candidate}'")
+        stored = json.loads(db.psql(f"select row_to_json(c)::text from "
+                                    f"public.catalog_candidate_variants c where c.id='{candidate}'"))
+        payload = json.loads(db.psql(f"select r.payload::text from public.catalog_raw_records r "
+                                     f"join public.catalog_candidate_variants c "
+                                     f"on c.raw_record_id = r.id where c.id='{candidate}'"))
+        # Python, from the SAME stored candidate and payload, renders the same key.
+        assert coverage.candidate_identity_key(stored, payload) == key, record
+        keys[record] = key
+    assert len(set(keys.values())) == 5
+    for left, right in (("37350", "37439"), ("37309", "37345")):
+        assert keys[left] != keys[right]
+
+
+def test_pr_z2_a_key_collision_is_recorded_failed_never_picked(ledger_db):
+    from backend.catalog import coverage
+
+    db = ledger_db
+    real = Z2_ROWS["37350"]
+    rows = [
+        copy.deepcopy(real),
+        # Same key as 37350 (same codes, same identity), DIFFERENT content.
+        {**copy.deepcopy(real), "_id": 91001, "koah_sus": int(real["koah_sus"]) + 1},
+        # True duplicates: identical content minus `_id`.
+        copy.deepcopy(Z2_ROWS["37309"]), {**copy.deepcopy(Z2_ROWS["37309"]), "_id": 91002},
+        copy.deepcopy(Z2_ROWS["37425"]),
+    ]
+    world = _z2_world(db, rows)
+    run = _z2_finished_run(db, world, key=f"z2-col-{world['plan'][:8]}")
+    ids = world["candidates"]
+    # The run names ONLY 37350 of the colliding pair; the other row sits in
+    # the same snapshot and still collides.
+    entries = [{"candidate_id": ids["37350"], "status": "enriched"},
+               {"candidate_id": ids["37309"], "status": "enriched"},
+               {"candidate_id": ids["91002"], "status": "unresolved_ambiguous"},
+               {"candidate_id": ids["37425"], "status": "enriched"}]
+    answer = _z2_rebuild(db, run, entries)
+    assert (answer["written"], answer["collisions"]) == (3, 1)
+    contents = {record: db.psql(
+        "select public.catalog_variant_content_sha256(r.payload) from "
+        "public.catalog_raw_records r join public.catalog_candidate_variants c "
+        f"on c.raw_record_id = r.id where c.id='{candidate}'") for record, candidate in ids.items()}
+    ledger = _z2_ledger(db)
+    assert sorted(ledger.values()) == sorted([
+        ("failed", coverage.collision_content_sha256([contents["37350"], contents["91001"]]),
+         "CATALOG_COVERAGE_KEY_COLLISION"),
+        ("enriched", contents["37309"], "-"),
+        ("enriched", contents["37425"], "-")])
+    assert contents["37309"] == contents["91002"]
+    # Nothing about the run changed.
+    assert db.psql(f"select status from public.runs where id='{run}'") == "partial_success"
+    # Stable: the same run again writes nothing; the colliding rows are queued
+    # again (failed), the settled ones are not.
+    again = _z2_rebuild(db, run, entries)
+    assert (again["written"], again["collisions"]) == (0, 1)
+    assert _z2_ledger(db) == ledger
+    read = json.loads(_rpc_as_service(
+        db, f"select public.catalog_variant_coverage_for_batch('{world['batches'][0]}', "
+            "'register')"))
+    decisions = {item["upstream_record_id"]: (item["decision"], item["reason_code"])
+                 for item in read["items"]}
+    assert decisions == {
+        "37350": ("queue", "CATALOG_COVERAGE_KEY_COLLISION"),
+        "91001": ("queue", "CATALOG_COVERAGE_KEY_COLLISION"),
+        "37309": ("excluded_already_enriched", None),
+        "91002": ("excluded_already_enriched", None),
+        "37425": ("excluded_already_enriched", None)}
+    # The reason is the database's only, and only on a failed row.
+    with pytest.raises(AssertionError, match="catalog_variant_coverage_reason"):
+        db.psql("update public.catalog_variant_coverage set reason_code = "
+                "'CATALOG_COVERAGE_KEY_COLLISION' where status = 'enriched'")
+    with pytest.raises(AssertionError, match="catalog_variant_coverage_reason"):
+        db.psql("update public.catalog_variant_coverage set reason_code = 'OTHER' "
+                "where status = 'failed'")
 
 
 def test_pr_z_relations_and_functions_are_service_only(db):
@@ -10219,9 +10392,11 @@ def test_pr_z_a_claim_is_scoped_by_level(ledger_db):
         "attempt, batch_id, candidate_id, content_sha256) "
         "select public.catalog_variant_identity_key(c.manufacturer, c.commercial_model, "
         "c.model_year_start, c.model_year_end, c.official_model_code, c.trim, "
+        "r.payload->>'tozeret_cd', r.payload->>'degem_cd', r.payload->>'sug_degem', "
         f"c.identity_dimensions), 'web', '{b['run']}', 1, i.batch_id, c.id, repeat('c', 64) "
         "from public.catalog_work_scope_queue_items i join public.catalog_candidate_variants c "
-        f"on c.id = i.candidate_id where i.batch_id = '{second['batches'][0]}'",
+        "on c.id = i.candidate_id join public.catalog_raw_records r on r.id = c.raw_record_id "
+        f"where i.batch_id = '{second['batches'][0]}'",
         _acquire_sql(a), "rollback"), capture_output=True, text=True)
     assert out.returncode == 0, out.stderr
     (answer,) = _json_lines(out.stdout)

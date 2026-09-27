@@ -174,6 +174,10 @@ COVERAGE_LEVEL = catalog_coverage.BATCH_COVERAGE_LEVEL
 #: an identity whose stated filters match more rows than one page holds is left
 #: unannotated rather than annotated from a partial read.
 MAX_DUPLICATE_SCAN_ROWS = 200
+#: PR-Z2: the most rows of ONE would-be duplicate group whose stored register
+#: row is read (one row per read) to prove them the same variant. A larger
+#: group is left unannotated rather than annotated unproven.
+MAX_DUPLICATE_GROUP_READS = 20
 
 #: Per-item progress states, all DERIVED from durable state.
 PROGRESS_PENDING = "pending"        # no durable trace of work on this item yet
@@ -244,10 +248,13 @@ class GovernmentWorkItem:
     official_model_code: str | None
     trim: str | None
     #: PR-V: the register rows (`upstream_record_id`, sorted) of EVERY
-    #: candidate in the pinned snapshot that states exactly this identity --
-    #: manufacturer, commercial model, model year, official model code, trim
-    #: and identity dimensions -- this item's own row included. Empty when the
-    #: identity is unique. Such a group can only ever resolve as ambiguous.
+    #: candidate in the pinned snapshot that is the SAME variant as this item
+    #: -- this item's own row included. PR-Z2: the same variant means the same
+    #: variant identity key (`coverage.candidate_identity_key`, which carries
+    #: the Government's registration identifiers) AND identical content minus
+    #: `_id`; rows that only state the same identity columns are different
+    #: vehicles and are never grouped. Empty when the variant is unique. Such
+    #: a group can only ever resolve as ambiguous.
     duplicate_identity_record_ids: tuple[str, ...] = ()
 
     def as_record(self) -> dict[str, Any]:
@@ -687,24 +694,65 @@ def _claim_exclusions(repository: Any, run_id: Any, lease: Mapping[str, Any],
             if item["decision"] != catalog_coverage.RESERVED}
 
 
+def _same_variant_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    return {name: value for name, value in payload.items()
+            if name not in catalog_coverage.VOLATILE_PAYLOAD_FIELDS}
+
+
+def _same_variant_rows(query: GovernmentCatalogQuery, own: Any, rows: Sequence[Any],
+                       payloads: dict[str, Mapping[str, Any]]) -> list[str]:
+    """PR-Z2: the register ids of `rows` that are the SAME variant as `own`.
+
+    The same variant identity key and identical content minus `_id`, each
+    proven from the stored register row (one single-row read per row, cached
+    per preparation). A row whose key cannot be taken is no one's duplicate.
+    """
+    def facts(row: Any) -> tuple[str, dict[str, Any]] | None:
+        record_id = str(row.upstream_record_id)
+        if record_id not in payloads:
+            stored = query.raw_record(record_id)
+            payload = stored.get("payload") if isinstance(stored, Mapping) else None
+            payloads[record_id] = payload if isinstance(payload, Mapping) else {}
+        payload = payloads[record_id]
+        try:
+            return (catalog_coverage.candidate_identity_key(row, payload),
+                    _same_variant_payload(payload))
+        except (KeyError, ValueError):
+            return None
+
+    mine = facts(own)
+    if mine is None:
+        return []
+    return sorted({str(row.upstream_record_id) for row in rows if facts(row) == mine})
+
+
 def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
                                    queue: Sequence[GovernmentWorkItem],
                                    cancellation_checker: Callable[[], bool] | None = None,
                                    query: GovernmentCatalogQuery | None = None
                                    ) -> list[GovernmentWorkItem]:
-    """PR-V: mark every queue item whose exact identity other register rows share.
+    """PR-V: mark every queue item whose variant other register rows repeat.
 
     Bounded reads only -- never the whole-snapshot projection (plan item O16).
     For each DISTINCT stated identity: ONE `catalog_candidate_variant_page`
     page (the read `resolve_variant` answers from) filtered by manufacturer,
     commercial model, model year, code and trim; the item's own row there
-    supplies its identity dimensions, and every row stating the same model
-    years, code, trim and dimensions is in its group. An identity whose filters
-    match more rows than one page holds is left unannotated. An unreadable
-    snapshot refuses preparation exactly as the placeholder read does.
+    supplies its identity dimensions. An identity whose filters match more
+    rows than one page holds is left unannotated.
+
+    PR-Z2: rows that merely state the same model years, code, trim and
+    dimensions are NOT a duplicate group -- production showed them to be
+    different vehicles (different `degem_cd` / `sug_degem`), and telling the
+    Commander otherwise has it resolve different vehicles as one. The group
+    is only the rows with the same variant identity key AND identical content
+    minus `_id` (`_same_variant_rows`), proven from at most
+    `MAX_DUPLICATE_GROUP_READS` single-row reads; a larger candidate group is
+    left unannotated. An unreadable snapshot refuses preparation exactly as
+    the placeholder read does.
     """
     query = query or _pinned_query(repository, snapshot_key, cancellation_checker)
     pages: dict[tuple[Any, ...], Any] = {}
+    payloads: dict[str, Mapping[str, Any]] = {}
     annotated: list[GovernmentWorkItem] = []
     try:
         for item in queue:
@@ -725,12 +773,13 @@ def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
             if page.has_more or own is None:
                 annotated.append(item)
                 continue
-            group = sorted(
-                {row.upstream_record_id for row in page.items
-                 if (row.model_year_start, row.model_year_end, row.official_model_code,
-                     row.trim, dict(row.identity_dimensions)) ==
-                    (own.model_year_start, own.model_year_end, own.official_model_code,
-                     own.trim, dict(own.identity_dimensions))})
+            stated = [row for row in page.items
+                      if (row.model_year_start, row.model_year_end, row.official_model_code,
+                          row.trim, dict(row.identity_dimensions)) ==
+                         (own.model_year_start, own.model_year_end, own.official_model_code,
+                          own.trim, dict(own.identity_dimensions))]
+            group = (_same_variant_rows(query, own, stated, payloads)
+                     if 2 <= len(stated) <= MAX_DUPLICATE_GROUP_READS else [])
             annotated.append(item if len(group) < 2 else GovernmentWorkItem(
                 **{**item.__dict__, "duplicate_identity_record_ids": tuple(group)}))
     except GovernmentProjectionError as refusal:
@@ -933,6 +982,7 @@ __all__ = [
     "COVERAGE_LEVEL", "DUPLICATE_IDENTITY_RULE", "EXCLUDED_ALREADY_ENRICHED",
     "EXCLUDED_KNOWN_UNRESOLVED", "EXCLUDED_PLACEHOLDER_SOURCE_RECORD",
     "EXCLUDED_RESERVED_BY_ANOTHER_RUN", "EXCLUSION_COUNT_KEYS",
+    "MAX_DUPLICATE_GROUP_READS",
     "MAX_DUPLICATE_SCAN_ROWS",
     "GOVERNMENT_WORK_QUEUE_LIMIT", "PREPARATION_PHASE",
     "PREPARATION_REASONS", "PROGRESS_EVIDENCED", "PROGRESS_PENDING", "PROGRESS_PROMOTED",

@@ -48,8 +48,11 @@ from backend.finalization import RunFinalizer, TerminalClaim
 from backend.testing.memory_repository import MemoryRepository
 from backend.testing.work_scope_seed import (committed_records, seed_prepared_plan,
                                              start_batch_run)
+from backend.tools import ToolContext
+from backend.tools.government_vehicle import GOVERNMENT_TOOL_NAME, GovernmentVehicleTool
 
 REPLAY = Path(__file__).resolve().parent / "replay"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 MIGRATION = (Path(__file__).resolve().parents[1] / "supabase" / "migrations"
              / "20260927000100_catalog_variant_coverage.sql")
 
@@ -207,7 +210,7 @@ class World:
                 continue
             candidate = next(row for row in self.repository.catalog_candidates.values()
                              if row["raw_record_id"] == record["id"])
-            keys.add(candidate_identity_key(candidate))
+            keys.add(candidate_identity_key(candidate, record["payload"]))
         (key,) = keys
         return key
 
@@ -228,15 +231,43 @@ def aa_world() -> tuple[World, dict[str, Any], str]:
 
 def test_the_identity_text_is_length_prefixed_and_orders_dimensions_by_code_point():
     text = variant_identity_text("טויוטה", "4RUNNER", 2026, 2026, None, "SR5",
+                                 "413", "758", "P",
                                  {"fuel_type": "petrol", "body_style": "suv"})
-    assert text == ("milo-variant-identity/1|6:טויוטה|7:4RUNNER|4:2026|4:2026|-|3:SR5"
-                    "|10:body_style=3:suv|9:fuel_type=6:petrol")
+    assert text == ("milo-variant-identity/2|6:טויוטה|7:4RUNNER|4:2026|4:2026|-|3:SR5"
+                    "|3:413|3:758|1:P|10:body_style=3:suv|9:fuel_type=6:petrol")
     # No value can imitate a separator, and absent is not empty.
-    assert variant_identity_key("a|4:b", "c", None, None, None, None, {}) != \
-        variant_identity_key("a", "b|1:c", None, None, None, None, {})
-    assert variant_identity_text("a", "b", None, None, None, None, {}).endswith("|-|-|-|-")
+    assert variant_identity_key("a|4:b", "c", None, None, None, None, None, None, None, {}) \
+        != variant_identity_key("a", "b|1:c", None, None, None, None, None, None, None, {})
+    assert variant_identity_text("a", "b", None, None, None, None, None, None, None,
+                                 {}).endswith("|-|-|-|-|-|-|-")
+    assert variant_identity_text("a", "b", None, None, None, None, "", None, None,
+                                 {}).endswith("|-|-|-|-|0:|-|-")
     with pytest.raises(ValueError):
-        variant_identity_key("a", "b", True, None, None, None, {})
+        variant_identity_key("a", "b", True, None, None, None, None, None, None, {})
+
+
+def test_the_register_codes_are_read_verbatim_as_the_database_renders_them():
+    # `payload->>'field'`: no trimming, no case folding, no number formatting
+    # beyond PostgreSQL's own; absent and JSON null are both absent.
+    assert coverage.register_codes({"tozeret_cd": 413, "degem_cd": " 0758 ",
+                                    "sug_degem": "p"}) == ("413", " 0758 ", "p")
+    assert coverage.register_codes({"tozeret_cd": None}) == (None, None, None)
+    assert coverage.register_code({"x": True}, "x") == "true"
+    assert coverage.register_code({"x": 413.0}, "x") == "413.0"
+    assert coverage.register_code({"x": 1e-7}, "x") == "0.0000001"
+    with pytest.raises(ValueError):
+        coverage.register_code({"x": {"nested": 1}}, "x")
+    # Each code changes the key; the same codes in another field do not match.
+    row = next(item for item in AA["snapshot_rows"] if str(item["_id"]) == "37254")
+    candidate = {"manufacturer": "טויוטה", "commercial_model": "4RUNNER",
+                 "model_year_start": 2026, "model_year_end": 2026,
+                 "official_model_code": None, "trim": "SR5", "identity_dimensions": {}}
+    keys = {candidate_identity_key(candidate, row)}
+    for field in ("tozeret_cd", "degem_cd", "sug_degem"):
+        keys.add(candidate_identity_key(candidate, {**row, field: "changed"}))
+    assert len(keys) == 4
+    assert candidate_identity_key(candidate, {**row, "_id": 1}) == \
+        candidate_identity_key(candidate, row)
 
 
 def test_the_key_is_stable_across_two_snapshots_of_the_same_row():
@@ -259,12 +290,20 @@ def test_the_key_is_stable_across_two_snapshots_of_the_same_row():
     assert records["37254"]["payload_sha256"] != records["91254"]["payload_sha256"]
 
 
-def test_the_eight_aa63369b_variants_get_eight_keys_and_each_duplicate_group_one():
+def test_the_eight_aa63369b_variants_get_eight_keys_and_each_true_duplicate_group_one():
     world = World()
     plan = world.plan(AA["snapshot_rows"])
     keys = {record: world.key_of(record, plan["snapshot_key"])
             for record in (*AA_RESOLVED, *AA_GROUP_ROWS)}
     assert len({keys[record] for record in AA_RESOLVED}) == 8
+    # The REPLAY's group rows are stand-ins whose content minus `_id` is
+    # identical -- true duplicates, so they share one key under /2 as well.
+    # (Production's real 37350 / 37439 and 37309 / 37345 are different
+    # vehicles with different `degem_cd`: see the Z2-4 fixture tests below.)
+    for left, right in AA_GROUPS:
+        rows = {str(row["_id"]): {k: v for k, v in row.items() if k != "_id"}
+                for row in AA["snapshot_rows"]}
+        assert rows[left] == rows[right]
     # 37350 / 37439 share one key; so do 37309 / 37345; the two groups differ,
     # and no group shares a key with a resolved variant.
     for left, right in AA_GROUPS:
@@ -289,8 +328,9 @@ def test_the_upstream_record_id_alone_is_not_the_key():
 def test_the_database_vocabulary_version_is_the_reviewed_one():
     text = MIGRATION.read_text()
     assert f"select '{vocabulary.VOCABULARY_VERSION}'::text;" in text
-    assert "select 'milo-variant-identity/1'" in text
-    assert coverage.VARIANT_IDENTITY_CONTRACT == "milo-variant-identity/1"
+    assert "select 'milo-variant-identity/2'" in text
+    assert coverage.VARIANT_IDENTITY_CONTRACT == "milo-variant-identity/2"
+    assert "milo-variant-identity/1" not in text
 
 
 # =============================================================================
@@ -832,7 +872,8 @@ def test_the_backfill_reproduces_6825eb96():
     assert len(world.ledger()) == 9
 
 
-def test_both_runs_share_the_37350_37439_key_across_their_snapshots():
+def test_both_runs_share_the_replay_37350_37439_key_across_their_snapshots():
+    # The replay stand-ins are true duplicates (identical content minus `_id`).
     world = World()
     gate0 = world.plan(GATE0["snapshot_rows"])
     aa = world.plan(AA["snapshot_rows"])
@@ -895,8 +936,11 @@ def test_the_worker_writes_the_ledger_after_the_run_is_finalized(monkeypatch):
     handed = {item["candidate_id"] for item in repository.work_scope_batch_for_run(run_id)["items"]
               if item["commercial_model"] != "11111"}
     candidates = {row["id"]: row for row in repository.catalog_candidates.values()}
+    records = {row["id"]: row for row in repository.catalog_raw_records.values()}
     assert {row["variant_identity_key"] for row in rows} == \
-        {candidate_identity_key(candidates[candidate]) for candidate in handed}
+        {candidate_identity_key(candidates[candidate],
+                                records[candidates[candidate]["raw_record_id"]]["payload"])
+         for candidate in handed}
     # The worker claimed all four before its first model call, and the
     # settlement released every claim with the ledger write.
     assert repository.catalog_variant_reservations == {}
@@ -1195,3 +1239,248 @@ def test_the_operator_preparation_settles_before_it_builds_the_queue(monkeypatch
                                              work_scope_id=str(uuid4()), revision=1,
                                              digest="a" * 64)
     assert calls == ["reconcile", "capture"]
+
+
+# =============================================================================
+# PR-Z2: the key carries the Government's registration identifiers; a
+# duplicate is ONLY identical content; anything else sharing a key collides
+# =============================================================================
+
+#: Five REAL production register rows (tests/fixtures): the pairs the /1 key
+#: collapsed -- 37350 / 37439 and 37309 / 37345 -- are different vehicles.
+REAL = json.loads((FIXTURES / "production_4runner_2026_rows.json").read_text())
+REAL_ROWS = {str(row["_id"]): row for row in REAL["rows"]}
+REAL_PAIRS = (("37350", "37439"), ("37309", "37345"))
+REAL_PAIR_ROWS = tuple(record for pair in REAL_PAIRS for record in pair)
+
+
+def real_aa_rows() -> list[dict[str, Any]]:
+    """aa63369b's snapshot with the five rows production actually holds in
+    place of their reconstructed stand-ins."""
+    return [copy.deepcopy(REAL_ROWS.get(str(row["_id"]), row)) for row in AA["snapshot_rows"]]
+
+
+def _without_id(row: dict[str, Any]) -> dict[str, Any]:
+    return {name: value for name, value in row.items() if name != "_id"}
+
+
+def snapshot_candidates(world: World, snapshot_key: str) -> dict[str, tuple[dict, dict]]:
+    """register id -> (candidate row, raw payload) of one snapshot."""
+    snapshot = next(row["id"] for row in world.repository.catalog_snapshots.values()
+                    if row["snapshot_key"] == snapshot_key)
+    records = {row["id"]: row for row in world.repository.catalog_raw_records.values()}
+    return {str(records[row["raw_record_id"]]["upstream_record_id"]):
+            (row, records[row["raw_record_id"]]["payload"])
+            for row in world.repository.catalog_candidates.values()
+            if row["snapshot_id"] == snapshot}
+
+
+def tool_recording(world: World, plan: dict[str, Any]) -> dict[str, Any]:
+    """aa63369b's shape -- ONE resolve_variant task per distinct stated identity
+    -- answered by the REAL Government tool over the plan's own snapshot."""
+    tool = GovernmentVehicleTool(world.repository, snapshot_key=plan["snapshot_key"])
+    asked: dict[str, dict[str, Any]] = {}
+    for _record, (candidate, _payload) in sorted(snapshot_candidates(
+            world, plan["snapshot_key"]).items()):
+        arguments = {"manufacturer": candidate["manufacturer"],
+                     "commercial_model": candidate["commercial_model"],
+                     "model_year": candidate["model_year_start"]}
+        for name, field in (("trim", "trim"), ("official_model_code", "official_model_code")):
+            if candidate.get(field):
+                arguments[name] = candidate[field]
+        asked.setdefault(json.dumps(arguments, sort_keys=True, ensure_ascii=False), arguments)
+    return {"tool_results": [
+        {"task_id": f"t{index:02d}", "call_id": "c1", "tool": GOVERNMENT_TOOL_NAME,
+         "operation": "resolve_variant", "arguments": arguments,
+         "result": tool.execute(ToolContext(), "resolve_variant", arguments)}
+        for index, arguments in enumerate(asked.values(), start=1)]}
+
+
+def test_z2_the_register_codes_give_each_real_row_its_own_key():
+    world = World()
+    plan = world.plan(real_aa_rows())
+    candidates = snapshot_candidates(world, plan["snapshot_key"])
+    # The reviewed normalization states exactly what production stored.
+    for record, stored in REAL["production_candidates"].items():
+        candidate, _payload = candidates[record]
+        assert {name: candidate[name] for name in stored} == stored, record
+    keys = {record: candidate_identity_key(*candidates[record]) for record in REAL_ROWS}
+    assert len(set(keys.values())) == 5
+    # Every one of them is a different vehicle ...
+    assert len({json.dumps(_without_id(row), sort_keys=True) for row in REAL["rows"]}) == 5
+    # ... which the identity columns alone (/1's rendering, codes absent) cannot see.
+    collapsed = {record: variant_identity_key(
+        candidate["manufacturer"], candidate["commercial_model"], candidate["model_year_start"],
+        candidate["model_year_end"], candidate["official_model_code"], candidate["trim"],
+        None, None, None, candidate["identity_dimensions"])
+        for record, (candidate, _payload) in candidates.items() if record in REAL_ROWS}
+    assert len(set(collapsed.values())) == 3
+    for left, right in REAL_PAIRS:
+        assert collapsed[left] == collapsed[right] and keys[left] != keys[right]
+        assert REAL_ROWS[left]["degem_cd"] != REAL_ROWS[right]["degem_cd"]
+
+
+def test_z2_aa63369b_backfill_then_fresh_preparations_queue_none_and_never_ping_pong():
+    world = World()
+    rows = real_aa_rows()
+    # A plan prepared BEFORE the run finished: its queue holds all twelve.
+    early = world.plan(rows)
+    assert len(world.queued_records(early)) == 12
+    plan = world.plan(rows)
+    result = production_result(tool_recording(world, plan))
+    run, _preparation, _ = world.finish_batch(plan, result, write_ledger=False)
+    assert world.ledger() == {}
+    report = backfill(world.repository)
+    assert report.as_record()["runs_recorded"] == 1
+    assert report.by_run[run] == {ENRICHED: 8, UNRESOLVED_AMBIGUOUS: 4}
+    ledger = world.ledger()
+    # Twelve rows, twelve variants: 8 resolved + the 4 rows of the two pairs,
+    # each under its OWN key (the /1 key gave 10: the pairs collapsed to 2).
+    assert len(ledger) == 12
+    assert all(row["reason_code"] is None for row in ledger.values())
+    assert ledger_by_record(world, plan, REAL_ROWS) == {
+        "37425": ENRICHED, **{record: UNRESOLVED_AMBIGUOUS for record in REAL_PAIR_ROWS}}
+
+    # A fresh preparation queues none of them; a second one, neither; and
+    # neither changes a byte of the ledger.
+    for _attempt in range(2):
+        revision = world.plan(rows)
+        assert world.queued_records(revision) == []
+        unit = world.unit_coverage(revision)
+        assert (unit["excluded_already_enriched"], unit["excluded_known_unresolved"]) == (8, 4)
+        assert world.ledger() == ledger
+    # The early plan's run preparation -- twice -- is refused before any paid
+    # call, and leaves the ledger as it was.
+    started = start_batch_run(world.repository, early)["run"]["id"]
+    for _attempt in range(2):
+        with pytest.raises(GovernmentPreparationError) as refused:
+            prepare_government_work(world.repository, run_id=started)
+        assert refused.value.code == "GOVERNMENT_BATCH_ALREADY_COVERED"
+        assert world.ledger() == ledger
+    # A second backfill changes nothing either.
+    backfill(world.repository)
+    assert world.ledger() == ledger
+
+
+def test_z2_settle_keys_never_picks_between_different_contents():
+    c1, c2, c3 = "1" * 64, "2" * 64, "3" * 64
+    # One key, one content: the strongest status.
+    assert coverage.settle_keys([("k", c1, FAILED), ("k", c1, ENRICHED)], {"k": [c1]}) == {
+        "k": coverage.KeySettlement(ENRICHED, c1)}
+    # A true duplicate group: still one content.
+    assert coverage.settle_keys([("k", c1, UNRESOLVED_AMBIGUOUS)], {"k": [c1, c1]})["k"] \
+        == coverage.KeySettlement(UNRESOLVED_AMBIGUOUS, c1)
+    # Two contents among the entries: a collision, whatever the statuses.
+    collision = coverage.KeySettlement(FAILED, coverage.collision_content_sha256([c1, c2]),
+                                       coverage.KEY_COLLISION)
+    assert coverage.settle_keys([("k", c1, ENRICHED), ("k", c2, PENDING)], {}) == \
+        {"k": collision}
+    # A second content elsewhere in the snapshot collides as well.
+    assert coverage.settle_keys([("k", c2, ENRICHED)], {"k": [c1, c2]}) == {"k": collision}
+    # The collision content is order-free, and names every content involved.
+    assert coverage.collision_content_sha256([c2, c1, c2]) == \
+        coverage.collision_content_sha256([c1, c2]) != \
+        coverage.collision_content_sha256([c1, c2, c3])
+    # Another key is untouched by it.
+    assert coverage.settle_keys([("k", c1, ENRICHED), ("j", c3, ENRICHED)],
+                                {"k": [c1, c2], "j": [c3]})["j"] == \
+        coverage.KeySettlement(ENRICHED, c3)
+
+
+def _collapsed_codes(monkeypatch) -> None:
+    """A key WITHOUT the registration identifiers -- /1's collapse -- so the real
+    pairs share a key while their content differs."""
+    monkeypatch.setattr(coverage, "register_codes", lambda payload: (None, None, None))
+
+
+def test_z2_a_key_collision_is_recorded_failed_and_the_run_is_untouched(monkeypatch):
+    _collapsed_codes(monkeypatch)
+    world = World()
+    rows = real_aa_rows()
+    plan = world.plan(rows)
+    result = production_result(tool_recording(world, plan))
+    run, preparation, answer = world.finish_batch(plan, result)
+    assert answer is not None and answer["collisions"] == 2
+    ledger = world.ledger()
+    candidates = snapshot_candidates(world, plan["snapshot_key"])
+    for left, right in REAL_PAIRS:
+        key = candidate_identity_key(*candidates[left])
+        assert key == candidate_identity_key(*candidates[right])
+        row = ledger[key]
+        # Never one of the two picked: failed, with the reason and every content.
+        assert (row["status"], row["reason_code"]) == (FAILED, coverage.KEY_COLLISION)
+        assert row["content_sha256"] == coverage.collision_content_sha256(
+            [variant_content_sha256(candidates[record][1]) for record in (left, right)])
+    assert world.repository.get_run(run)["status"] == "partial_success"
+    assert world.repository.get_run(run)["output"] == result
+    # Stable: settling the same run again changes nothing -- no ping-pong.
+    lease = {key: world.repository.get_run(run)[key]
+             for key in ("worker_id", "attempt", "lease_token")}
+    again = record_run_coverage(world.repository, run, preparation, result, lease)
+    assert again is not None and again["written"] == 0 and again["collisions"] == 2
+    assert world.ledger() == ledger
+    # A failed variant is queued again: none of the colliding rows is excluded.
+    revision = world.plan(rows)
+    assert world.queued_records(revision) == sorted(REAL_PAIR_ROWS)
+
+
+def test_z2_a_collision_with_a_row_the_run_never_named_still_collides(monkeypatch):
+    _collapsed_codes(monkeypatch)
+    world = World()
+    plan = world.plan(real_aa_rows())
+    run, _preparation, _ = world.finish_batch(
+        plan, production_result(tool_recording(world, plan)), write_ledger=False)
+    candidates = snapshot_candidates(world, plan["snapshot_key"])
+    # ONE entry, for 37350 only; 37439 shares its key in the same snapshot.
+    answer = world.repository.rebuild_catalog_variant_coverage(
+        run, "register", [{"candidate_id": candidates["37350"][0]["id"], "status": ENRICHED}])
+    assert (answer["written"], answer["collisions"]) == (1, 1)
+    (row,) = world.ledger().values()
+    assert (row["status"], row["reason_code"]) == (FAILED, coverage.KEY_COLLISION)
+
+
+def test_z2_true_duplicates_settle_as_one_variant_without_a_collision():
+    world = World()
+    real = REAL_ROWS["37350"]
+    twin = {**copy.deepcopy(real), "_id": 90_350}                  # identical minus _id
+    plan = world.plan([copy.deepcopy(real), twin])
+    run, _preparation, _ = world.finish_batch(
+        plan, production_result(tool_recording(world, plan)), write_ledger=False)
+    candidates = snapshot_candidates(world, plan["snapshot_key"])
+    assert candidate_identity_key(*candidates["37350"]) == \
+        candidate_identity_key(*candidates["90350"])
+    answer = world.repository.rebuild_catalog_variant_coverage(
+        run, "register", [{"candidate_id": candidates["37350"][0]["id"], "status": ENRICHED},
+                          {"candidate_id": candidates["90350"][0]["id"],
+                           "status": UNRESOLVED_AMBIGUOUS}])
+    assert (answer["written"], answer["collisions"]) == (1, 0)
+    (row,) = world.ledger().values()
+    assert (row["status"], row["reason_code"]) == (ENRICHED, None)
+    assert row["content_sha256"] == variant_content_sha256(real)
+
+
+def _replay_snapshots() -> list[tuple[str, list[dict[str, Any]]]]:
+    found = []
+    for path in sorted(REPLAY.glob("*/manifest.json")):
+        rows = json.loads(path.read_text()).get("snapshot_rows") or []
+        if rows:
+            found.append((path.parent.name, rows))
+    found.append(("production-4runner-2026", [copy.deepcopy(row) for row in REAL["rows"]]))
+    return found
+
+
+@pytest.mark.parametrize("name,rows", _replay_snapshots(), ids=lambda value: value
+                         if isinstance(value, str) else None)
+def test_z2_property_rows_that_share_a_key_have_identical_content(name, rows):
+    """Z2-5: over EVERY replay fixture's snapshot (and the real rows), two rows
+    with the same variant identity key have identical content minus `_id`."""
+    world = World()
+    plan = world.plan(rows)
+    by_key: dict[str, list[dict[str, Any]]] = {}
+    for _record, (candidate, payload) in snapshot_candidates(world, plan["snapshot_key"]).items():
+        by_key.setdefault(candidate_identity_key(candidate, payload), []).append(payload)
+    assert by_key, name
+    for key, payloads in by_key.items():
+        contents = {json.dumps(_without_id(payload), sort_keys=True, ensure_ascii=False)
+                    for payload in payloads}
+        assert len(contents) == 1, (name, key, len(payloads))

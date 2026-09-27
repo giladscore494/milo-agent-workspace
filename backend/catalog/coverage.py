@@ -60,14 +60,30 @@ The variant identity key
 
 `variant_identity_key` is the SHA-256 of `variant_identity_text`: the marque
 (`tozar`), commercial model (`kinuy_mishari`), model years (`shnat_yitzur`),
-official model code (`degem_nm`), trim (`ramat_gimur`) and every identity
-dimension, exactly as the reviewed normalization stored them on the candidate
-row -- never a model's value. NOT the register's `_id`: the register reuses
-ids across captures, so an id names a row of ONE snapshot and nothing more.
-Two rows that state the same identity (a duplicate-identity group) share one
-key, which is exactly right: they are one variant the register cannot tell
-apart. `public.catalog_variant_identity_key` is the database's copy of the
-same rule, and tests/test_migrations_postgres.py proves the two agree.
+official model code (`degem_nm`), trim (`ramat_gimur`), exactly as the
+reviewed normalization stored them on the candidate row; then (contract
+``milo-variant-identity/2``) the Government's own registration identifiers
+-- manufacturer code (`tozeret_cd`), model code (`degem_cd`) and vehicle
+type code (`sug_degem`) -- VERBATIM from the stored raw payload, exactly as
+PostgreSQL's ``payload->>'field'`` renders them, no normalization; then every
+identity dimension. Never a model's value. NOT the register's `_id`: the
+register reuses ids across captures, so an id names a row of ONE snapshot and
+nothing more.
+
+Version 1 left the registration identifiers out, and production showed what
+that costs: Toyota 2018+ has 835 groups of rows that shared a v1 key while
+stating DIFFERENT vehicles (different `degem_cd`, some a different
+`sug_degem`), so one enrichment could exclude another vehicle and two runs
+could overwrite each other's row forever. Under v2 every one of those rows has
+its own key.
+
+A duplicate is ONLY rows whose content minus `_id` is identical: they share a
+key and are one variant the register cannot tell apart. Rows that share a key
+while their content differs are a KEY COLLISION (`KEY_COLLISION`): the
+ledger never picks one of them -- the key is recorded ``failed`` with that
+reason (`settle_keys`), and the run is untouched.
+`public.catalog_variant_identity_key` is the database's copy of the same
+rule, and tests/test_migrations_postgres.py proves the two agree.
 
 Pure except `record_run_coverage` and `backfill`, which take a repository.
 """
@@ -75,7 +91,9 @@ Pure except `record_run_coverage` and `backfill`, which take a repository.
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass, field
+from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from backend.catalog.digest import catalog_payload_digest
@@ -84,7 +102,18 @@ from backend.catalog.government.vocabulary import (GOVERNMENT_RECORD_ID_FIELD,
 
 #: The contract the identity text is written under. Changing the text changes
 #: every key, so it is versioned like every other durable rendering here.
-VARIANT_IDENTITY_CONTRACT = "milo-variant-identity/1"
+VARIANT_IDENTITY_CONTRACT = "milo-variant-identity/2"
+
+#: The Government registration identifiers the key carries (contract /2), in
+#: key order, as (name, raw payload field): read verbatim from the stored raw
+#: record, never from the candidate's normalized columns.
+REGISTER_IDENTITY_FIELDS = (("register_manufacturer_code", "tozeret_cd"),
+                            ("register_model_code", "degem_cd"),
+                            ("vehicle_type_code", "sug_degem"))
+
+#: The ledger reason of a key whose rows state DIFFERENT content: recorded as
+#: ``failed``, never settled by picking one of them.
+KEY_COLLISION = "CATALOG_COVERAGE_KEY_COLLISION"
 
 #: The levels of work a variant can be covered at. ONE today: the Government
 #: register resolution a Mapping Plan batch run performs. A later level (a web
@@ -161,19 +190,52 @@ def _year(value: Any) -> str | None:
     return str(value)
 
 
+def register_code(payload: Mapping[str, Any], name: str) -> str | None:
+    """``payload->>name`` exactly as PostgreSQL renders it: verbatim, no normalization.
+
+    A string as it is, a whole number in decimal, a boolean as ``true`` /
+    ``false``, a fraction in plain (never exponent) notation; absent or JSON
+    null is None. A nested object or array names no register code and is
+    refused rather than rendered differently from the database.
+    """
+    value = payload.get(name)
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and math.isfinite(value):
+        return format(Decimal(repr(value)), "f")
+    raise ValueError("a register identity code is a JSON scalar")
+
+
+def register_codes(payload: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """(manufacturer code, model code, vehicle type code) of one raw payload."""
+    manufacturer, model, vehicle_type = (register_code(payload, field)
+                                         for _name, field in REGISTER_IDENTITY_FIELDS)
+    return manufacturer, model, vehicle_type
+
+
 def variant_identity_text(manufacturer: str, commercial_model: str,
                           model_year_start: int | None, model_year_end: int | None,
                           official_model_code: str | None, trim: str | None,
+                          register_manufacturer_code: str | None,
+                          register_model_code: str | None,
+                          vehicle_type_code: str | None,
                           identity_dimensions: Mapping[str, str] | None) -> str:
     """The ONE canonical rendering the key is taken over.
 
-    ``milo-variant-identity/1`` then, separated by ``|``, each identity column
-    as ``<length>:<text>`` (``-`` when absent), then each identity dimension in
-    code-point key order as ``<length>:<name>=<length>:<value>``.
+    ``milo-variant-identity/2`` then, separated by ``|``, each identity column
+    -- manufacturer, commercial model, first and last model year, official
+    model code, trim, register manufacturer code, register model code, vehicle
+    type code -- as ``<length>:<text>`` (``-`` when absent), then each identity
+    dimension in code-point key order as ``<length>:<name>=<length>:<value>``.
     """
     parts = [VARIANT_IDENTITY_CONTRACT]
     for value in (manufacturer, commercial_model, _year(model_year_start),
-                  _year(model_year_end), official_model_code, trim):
+                  _year(model_year_end), official_model_code, trim,
+                  register_manufacturer_code, register_model_code, vehicle_type_code):
         if value is not None and not isinstance(value, str):
             raise ValueError("an identity column is text")
         parts.append(_token(value))
@@ -189,21 +251,34 @@ def variant_identity_text(manufacturer: str, commercial_model: str,
 def variant_identity_key(manufacturer: str, commercial_model: str,
                          model_year_start: int | None, model_year_end: int | None,
                          official_model_code: str | None, trim: str | None,
+                         register_manufacturer_code: str | None,
+                         register_model_code: str | None,
+                         vehicle_type_code: str | None,
                          identity_dimensions: Mapping[str, str] | None) -> str:
     """SHA-256 (lowercase hex) of `variant_identity_text`."""
     text = variant_identity_text(manufacturer, commercial_model, model_year_start,
                                  model_year_end, official_model_code, trim,
-                                 identity_dimensions)
+                                 register_manufacturer_code, register_model_code,
+                                 vehicle_type_code, identity_dimensions)
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def candidate_identity_key(candidate: Mapping[str, Any]) -> str:
-    """The key of one stored candidate row (or anything shaped like one)."""
+def candidate_identity_key(candidate: Any, payload: Mapping[str, Any]) -> str:
+    """The key of one stored candidate row and the raw payload it was normalized from.
+
+    `candidate` is a stored candidate row (a mapping) or anything with the
+    same attributes (`CandidateVariantRow`).
+    """
+    def read(name: str, default: Any = None) -> Any:
+        if isinstance(candidate, Mapping):
+            return candidate.get(name, default)
+        return getattr(candidate, name, default)
+
     return variant_identity_key(
-        candidate["manufacturer"], candidate["commercial_model"],
-        candidate.get("model_year_start"), candidate.get("model_year_end"),
-        candidate.get("official_model_code"), candidate.get("trim"),
-        candidate.get("identity_dimensions") or {})
+        read("manufacturer"), read("commercial_model"),
+        read("model_year_start"), read("model_year_end"),
+        read("official_model_code"), read("trim"), *register_codes(payload),
+        dict(read("identity_dimensions") or {}))
 
 
 def variant_content_sha256(payload: Mapping[str, Any]) -> str:
@@ -216,6 +291,60 @@ def variant_content_sha256(payload: Mapping[str, Any]) -> str:
     """
     return catalog_payload_digest({key: value for key, value in payload.items()
                                    if key not in VOLATILE_PAYLOAD_FIELDS})
+
+
+def collision_content_sha256(contents: Iterable[str]) -> str:
+    """The content a KEY COLLISION is recorded with: every distinct content hash
+    its rows state, sorted, joined by ``,``, hashed. Mirrored by
+    `catalog_variant_coverage_apply`; like every content hash, storage-local."""
+    joined = ",".join(sorted(set(contents)))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class KeySettlement:
+    """What ONE run's entries settle for one identity key."""
+
+    status: str
+    content_sha256: str
+    #: None, or `KEY_COLLISION`.
+    reason_code: str | None = None
+
+
+def settle_keys(entries: Iterable[tuple[str, str, str]],
+                snapshot_contents: Mapping[str, Iterable[str]]
+                ) -> dict[str, KeySettlement]:
+    """Per identity key, what one run's entries settle.
+
+    `entries` holds (identity key, content hash, status) per entry;
+    `snapshot_contents` the content hash of EVERY row of the run's snapshot
+    that states each key (the entries' own rows included).
+
+    *   every row of the key states the SAME content (one row, or a true
+        duplicate group): the strongest status any entry earned, with that
+        content;
+    *   the key's rows state DIFFERENT content: a KEY COLLISION -- never one
+        of them picked -- ``failed`` with `KEY_COLLISION` and
+        `collision_content_sha256` over every content involved. Nothing is
+        refused: the ledger write itself succeeds and the run is untouched.
+    """
+    statuses: dict[str, str] = {}
+    contents: dict[str, set[str]] = {}
+    for key, content, status in entries:
+        contents.setdefault(key, set()).add(content)
+        current = statuses.get(key)
+        if current is None or (-STATUS_RANK[status], status.encode()) \
+                < (-STATUS_RANK[current], current.encode()):
+            statuses[key] = status
+    settled: dict[str, KeySettlement] = {}
+    for key, status in statuses.items():
+        seen = contents[key] | set(snapshot_contents.get(key, ()))
+        if len(seen) > 1:
+            settled[key] = KeySettlement(FAILED, collision_content_sha256(seen), KEY_COLLISION)
+        else:
+            (content,) = seen
+            settled[key] = KeySettlement(status, content)
+    return settled
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +560,10 @@ def record_run_coverage(repository: Any, run_id: Any, preparation: Any,
     if derived.unmapped_records:
         log(f"catalog coverage ledger: run_id={run_id} "
             f"unmapped_records={derived.unmapped_records}")
+    collisions = answer.get("collisions") if isinstance(answer, Mapping) else None
+    if collisions:
+        log(f"catalog coverage ledger: run_id={run_id} reason_code={KEY_COLLISION} "
+            f"keys={collisions}")
     return dict(answer) if isinstance(answer, Mapping) else None
 
 
@@ -607,4 +740,6 @@ __all__ = ["BACKFILL_SKIP_REASONS", "CLAIM_DECISIONS", "MAX_RECONCILE_RUNS",
            "VARIANT_IDENTITY_CONTRACT", "VOLATILE_PAYLOAD_FIELDS", "backfill", "backfill_run",
            "candidate_identity_key", "coverage_decision", "derive_coverage",
            "record_run_coverage", "variant_content_sha256", "variant_identity_key",
-           "variant_identity_text"]
+           "variant_identity_text", "KEY_COLLISION", "KeySettlement",
+           "REGISTER_IDENTITY_FIELDS", "collision_content_sha256", "register_code",
+           "register_codes", "settle_keys"]

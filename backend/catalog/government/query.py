@@ -457,6 +457,14 @@ class GovernmentCatalogQuery:
 
     # --- helpers -------------------------------------------------------------
 
+    def raw_record(self, upstream_record_id: str) -> Mapping[str, Any]:
+        """ONE stored register row of the pinned snapshot, by its register id.
+
+        A single-row read (never a page of payloads), refused like every other
+        read of this layer when the row is missing or unreadable.
+        """
+        return self._raw_record(upstream_record_id)
+
     def _raw_record(self, upstream_record_id: str) -> Mapping[str, Any]:
         self._check_cancelled()
         try:

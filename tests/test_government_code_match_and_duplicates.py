@@ -12,15 +12,25 @@ LIMITED / TZNA55L-GKZSZA pair 37350 + 37439 and TRAILHUNTER / TZNH55L GKVSZA
 pair 37309 + 37345) are annotated at preparation with
 `duplicate_identity_record_ids`, through bounded reads only, and the
 Commander context carries the one rule that goes with it.
+
+PR-Z2. "An identical identity" is the variant identity key (which carries the
+Government's registration identifiers `tozeret_cd`, `degem_cd`, `sug_degem`)
+AND identical content minus `_id`. The REAL rows 37350 / 37439 and 37309 /
+37345 are different vehicles -- different `degem_cd` -- and are never told to
+the Commander as duplicates; the stand-ins above are identical copies and
+still are.
 """
 
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 
 import backend.catalog.government.query as query_module
+import backend.catalog.government.preparation as preparation_module
 from backend.catalog.government.preparation import (DUPLICATE_IDENTITY_RULE,
                                                     GovernmentPreparationError,
                                                     GovernmentWorkItem,
@@ -222,3 +232,82 @@ def test_preparation_never_reads_the_whole_snapshot():
     # Bounded: one page per DISTINCT stated identity (4 here), each at most
     # MAX_DUPLICATE_SCAN_ROWS rows.
     assert spy.catalog_rows_read < 100
+
+
+# =============================================================================
+# PR-Z2: a duplicate is the same key AND identical content
+# =============================================================================
+
+REAL = json.loads((Path(__file__).resolve().parent / "fixtures"
+                   / "production_4runner_2026_rows.json").read_text())
+REAL_ROWS = {str(row["_id"]): row for row in REAL["rows"]}
+
+
+def _groups(preparation) -> dict[str, tuple[str, ...]]:
+    records = {}
+    for item in preparation.queue:
+        records[item.candidate_id] = item.duplicate_identity_record_ids
+    return records
+
+
+def test_the_real_production_pairs_are_different_vehicles_and_never_annotated():
+    rows = [copy.deepcopy(row) for row in REAL["rows"]]
+    repository, run = seeded_batch(rows)
+    preparation = prepare_government_work(repository, run_id=run)
+    assert len(preparation.queue) == 5
+    # PR-V annotated 37350 + 37439 and 37309 + 37345 by their stated identity;
+    # the register gives each its own degem_cd, so none is anyone's duplicate.
+    assert all(item.duplicate_identity_record_ids == () for item in preparation.queue)
+    assert "duplicate_identity_rule" not in preparation.work_context({})
+    # The register still cannot tell each pair apart by the identity a task
+    # states: resolving it stays ambiguous -- an honest answer, not a group.
+    snapshot = next(row for row in repository.catalog_snapshots.values()
+                    if row.get("activated_at"))
+    tool = GovernmentVehicleTool(repository, snapshot_key=snapshot["snapshot_key"])
+    assert _rows_of(_resolve(tool, "TZNA55L-GKZSZA")) == ["37350", "37439"]
+
+
+def test_only_an_identical_copy_is_a_duplicate():
+    real = REAL_ROWS["37350"]
+    copy_of = {**copy.deepcopy(real), "_id": 90001}                    # identical minus _id
+    other_model_code = {**copy.deepcopy(real), "_id": 90002, "degem_cd": 999}   # another key
+    same_key_other_content = {**copy.deepcopy(real), "_id": 90003,
+                              "koah_sus": int(real["koah_sus"]) + 1}    # same key, collision
+    rows = [copy.deepcopy(real), copy_of, other_model_code, same_key_other_content]
+    repository, run = seeded_batch(rows)
+    preparation = prepare_government_work(repository, run_id=run)
+    by_record = {}
+    records = {row["id"]: row["upstream_record_id"]
+               for row in repository.catalog_raw_records.values()}
+    for candidate in repository.catalog_candidates.values():
+        by_record[str(records[candidate["raw_record_id"]])] = candidate["id"]
+    groups = _groups(preparation)
+    assert groups[by_record["37350"]] == groups[by_record["90001"]] == ("37350", "90001")
+    assert groups[by_record["90002"]] == ()
+    assert groups[by_record["90003"]] == ()
+
+
+def test_a_would_be_group_larger_than_the_read_bound_is_left_unannotated(monkeypatch):
+    monkeypatch.setattr(preparation_module, "MAX_DUPLICATE_GROUP_READS", 1)
+    repository, run = seeded_batch(duplicate_rows())
+    preparation = prepare_government_work(repository, run_id=run)
+    assert all(item.duplicate_identity_record_ids == () for item in preparation.queue)
+
+
+def test_the_proof_reads_one_register_row_per_group_member_and_never_a_snapshot():
+    repository, run = seeded_batch(duplicate_rows())
+    reads: list[str] = []
+    real = repository.catalog_raw_record_by_upstream_id
+
+    def counted(snapshot_id, upstream_record_id, **kwargs):
+        reads.append(str(upstream_record_id))
+        return real(snapshot_id, upstream_record_id, **kwargs)
+
+    repository.catalog_raw_record_by_upstream_id = counted
+    spy = WholeSnapshotSpy(repository)
+    preparation = prepare_government_work(spy, run_id=run)
+    assert spy.whole_snapshot_reads == []
+    assert any(item.duplicate_identity_record_ids for item in preparation.queue)
+    # Each member of the two would-be groups is read once, cached per preparation.
+    assert sorted(set(reads)) == ["37309", "37345", "37350", "37439"]
+    assert len(reads) == 4

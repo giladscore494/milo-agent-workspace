@@ -17,14 +17,24 @@
 --                                 ledger left out of its queue (counts AND
 --                                 register ids), immutable like the preparation
 --
---   catalog_variant_identity_key()   the variant's identity, hashed: the
+--   catalog_variant_identity_key()   the variant's identity, hashed
+--                                    (`milo-variant-identity/2`): the
 --                                    register's marque, commercial model,
---                                    model years, official model code, trim
---                                    and every identity dimension, exactly as
---                                    the reviewed normalization stored them.
---                                    NOT `_id`: the register reuses ids across
---                                    captures. A duplicate-identity group
---                                    shares one key.
+--                                    model years, official model code and
+--                                    trim, exactly as the reviewed
+--                                    normalization stored them; the
+--                                    Government's registration identifiers
+--                                    `tozeret_cd`, `degem_cd` and `sug_degem`
+--                                    verbatim from the raw payload (`->>`, no
+--                                    normalization); and every identity
+--                                    dimension. NOT `_id`: the register reuses
+--                                    ids across captures. Only rows with
+--                                    identical content (minus `_id`) are a
+--                                    duplicate; rows that share a key with
+--                                    DIFFERENT content are a key collision,
+--                                    recorded `failed` with
+--                                    CATALOG_COVERAGE_KEY_COLLISION and never
+--                                    settled by picking one of them.
 --   catalog_variant_content_sha256() the stored register row, minus `_id`
 --   catalog_variant_coverage_decision()
 --                                    the ONE filtering rule
@@ -94,22 +104,29 @@ as $$
   select case when p_value is null then '-' else char_length(p_value)::text || ':' || p_value end;
 $$;
 
--- `coverage.variant_identity_text`, byte for byte.
+-- `coverage.variant_identity_text`, byte for byte. The three register codes
+-- are passed as `payload->>'tozeret_cd'`, `payload->>'degem_cd'` and
+-- `payload->>'sug_degem'` of the candidate's own raw record: verbatim.
 create or replace function public.catalog_variant_identity_text(
   p_manufacturer text, p_commercial_model text, p_model_year_start integer,
-  p_model_year_end integer, p_official_model_code text, p_trim text, p_dimensions jsonb
+  p_model_year_end integer, p_official_model_code text, p_trim text,
+  p_register_manufacturer_code text, p_register_model_code text,
+  p_vehicle_type_code text, p_dimensions jsonb
 ) returns text
 language sql
 immutable
 set search_path = pg_catalog
 as $$
-  select 'milo-variant-identity/1'
+  select 'milo-variant-identity/2'
          || '|' || public.catalog_variant_identity_token(p_manufacturer)
          || '|' || public.catalog_variant_identity_token(p_commercial_model)
          || '|' || public.catalog_variant_identity_token(p_model_year_start::text)
          || '|' || public.catalog_variant_identity_token(p_model_year_end::text)
          || '|' || public.catalog_variant_identity_token(p_official_model_code)
          || '|' || public.catalog_variant_identity_token(p_trim)
+         || '|' || public.catalog_variant_identity_token(p_register_manufacturer_code)
+         || '|' || public.catalog_variant_identity_token(p_register_model_code)
+         || '|' || public.catalog_variant_identity_token(p_vehicle_type_code)
          || coalesce((select string_agg('|' || public.catalog_variant_identity_token(d.key)
                                         || '=' || public.catalog_variant_identity_token(d.value #>> '{}'),
                                         '' order by d.key collate "C")
@@ -118,7 +135,9 @@ $$;
 
 create or replace function public.catalog_variant_identity_key(
   p_manufacturer text, p_commercial_model text, p_model_year_start integer,
-  p_model_year_end integer, p_official_model_code text, p_trim text, p_dimensions jsonb
+  p_model_year_end integer, p_official_model_code text, p_trim text,
+  p_register_manufacturer_code text, p_register_model_code text,
+  p_vehicle_type_code text, p_dimensions jsonb
 ) returns text
 language sql
 immutable
@@ -126,7 +145,8 @@ set search_path = pg_catalog
 as $$
   select encode(sha256(convert_to(public.catalog_variant_identity_text(
            p_manufacturer, p_commercial_model, p_model_year_start, p_model_year_end,
-           p_official_model_code, p_trim, p_dimensions), 'UTF8')), 'hex');
+           p_official_model_code, p_trim, p_register_manufacturer_code,
+           p_register_model_code, p_vehicle_type_code, p_dimensions), 'UTF8')), 'hex');
 $$;
 
 -- The stored register row's content, minus the datastore's own `_id`.
@@ -197,8 +217,15 @@ create table if not exists public.catalog_variant_coverage (
   -- The reviewed vocabulary in force when the row was written; an unresolved
   -- variant is queued again once it moves.
   vocabulary_version text not null,
+  -- Why a row is `failed` when the database, not the run, decided it:
+  -- CATALOG_COVERAGE_KEY_COLLISION -- rows of the run's snapshot share this
+  -- key while their content differs, so none of them may settle it.
+  reason_code text,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  constraint catalog_variant_coverage_reason
+    check (reason_code is null
+           or (reason_code = 'CATALOG_COVERAGE_KEY_COLLISION' and status = 'failed')),
   constraint catalog_variant_coverage_key_shape check (variant_identity_key ~ '^[0-9a-f]{64}$'),
   constraint catalog_variant_coverage_level check (level in ('register')),
   constraint catalog_variant_coverage_status
@@ -405,7 +432,8 @@ as $$
       on cv.level = 'register'
      and cv.variant_identity_key = public.catalog_variant_identity_key(
            c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
-           c.official_model_code, c.trim, c.identity_dimensions)
+           c.official_model_code, c.trim, r.payload->>'tozeret_cd', r.payload->>'degem_cd',
+           r.payload->>'sug_degem', c.identity_dimensions)
    where c.snapshot_id = p_snapshot_id and c.status = 'candidate'
      and (p_from is null or c.model_year_start >= p_from)
      and (p_to is null or c.model_year_end <= p_to);
@@ -834,7 +862,8 @@ begin
                'batch_position', i.batch_position, 'candidate_id', c.id,
                'candidate_key', c.candidate_key, 'upstream_record_id', r.upstream_record_id,
                'variant_identity_key', k.identity_key, 'content_sha256', k.content,
-               'status', cv.status, 'last_run_id', cv.last_run_id,
+               'status', cv.status, 'reason_code', cv.reason_code,
+               'last_run_id', cv.last_run_id,
                'decision', public.catalog_variant_coverage_decision(
                              cv.status, cv.content_sha256, cv.vocabulary_version, k.content,
                              coalesce(v_include, false)))
@@ -845,7 +874,8 @@ begin
         cross join lateral (
           select public.catalog_variant_identity_key(
                    c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
-                   c.official_model_code, c.trim, c.identity_dimensions) as identity_key,
+                   c.official_model_code, c.trim, r.payload->>'tozeret_cd', r.payload->>'degem_cd',
+                   r.payload->>'sug_degem', c.identity_dimensions) as identity_key,
                  public.catalog_variant_content_sha256(r.payload) as content) as k
         left join public.catalog_variant_coverage cv
           on cv.variant_identity_key = k.identity_key and cv.level = p_level
@@ -889,6 +919,7 @@ declare
   v_count integer;
   v_written integer;
   v_released integer;
+  v_collisions integer;
 begin
   if p_level is distinct from 'register' then
     raise exception 'CATALOG_COVERAGE_INVALID' using errcode = '22023';
@@ -926,47 +957,116 @@ begin
     raise exception 'CATALOG_COVERAGE_CANDIDATE_INVALID' using errcode = '22023';
   end if;
 
-  -- One row per identity key: a duplicate group is ONE variant, settled by
-  -- the strongest status any of its rows earned.
-  insert into public.catalog_variant_coverage as cv
-    (variant_identity_key, level, status, last_run_id, snapshot_key, content_sha256,
-     vocabulary_version)
-  select distinct on (x.identity_key)
-         x.identity_key, p_level, x.status, p_run_id, v_snapshot_key, x.content,
-         public.catalog_vocabulary_version()
-    from (select public.catalog_variant_identity_key(
-                   c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
-                   c.official_model_code, c.trim, c.identity_dimensions) as identity_key,
-                 public.catalog_variant_content_sha256(r.payload) as content,
-                 e->>'status' as status
-            from jsonb_array_elements(p_entries) as e
-            join public.catalog_candidate_variants c on c.id = (e->>'candidate_id')::uuid
-            join public.catalog_raw_records r on r.id = c.raw_record_id) as x
-   order by x.identity_key, public.catalog_variant_coverage_rank(x.status) desc,
-            x.status collate "C", x.content collate "C"
-  on conflict (variant_identity_key, level) do update
-     set status = excluded.status,
-         last_run_id = excluded.last_run_id,
-         snapshot_key = excluded.snapshot_key,
-         content_sha256 = excluded.content_sha256,
-         vocabulary_version = excluded.vocabulary_version,
-         updated_at = now()
-   where cv.content_sha256 is distinct from excluded.content_sha256
-      or public.catalog_variant_coverage_rank(excluded.status)
-           > public.catalog_variant_coverage_rank(cv.status)
-      or (public.catalog_variant_coverage_rank(excluded.status)
-            = public.catalog_variant_coverage_rank(cv.status)
-          and (cv.status, cv.last_run_id, cv.snapshot_key, cv.vocabulary_version)
-              is distinct from (excluded.status, excluded.last_run_id, excluded.snapshot_key,
-                                excluded.vocabulary_version));
-  get diagnostics v_written = row_count;
+  -- One row per identity key (`coverage.settle_keys`). A duplicate group --
+  -- rows whose content minus `_id` is IDENTICAL -- is ONE variant, settled by
+  -- the strongest status any of its rows earned. Rows that share a key while
+  -- their content DIFFERS -- among the entries, or anywhere else in the run's
+  -- snapshot -- are a key collision: none of them is picked; the key is
+  -- recorded `failed` with CATALOG_COVERAGE_KEY_COLLISION and the hash of
+  -- every content involved. Nothing is refused: the write succeeds, and the
+  -- run is untouched either way.
+  --
+  -- The snapshot's rows are read by the identity columns every row of a key
+  -- states (the snapshot identity index), never the whole snapshot.
+  with x as (
+    select public.catalog_variant_identity_key(
+             c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
+             c.official_model_code, c.trim, r.payload->>'tozeret_cd', r.payload->>'degem_cd',
+             r.payload->>'sug_degem', c.identity_dimensions) as identity_key,
+           public.catalog_variant_content_sha256(r.payload) as content,
+           e->>'status' as status,
+           c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
+           c.official_model_code, c.trim
+      from jsonb_array_elements(p_entries) as e
+      join public.catalog_candidate_variants c on c.id = (e->>'candidate_id')::uuid
+      join public.catalog_raw_records r on r.id = c.raw_record_id
+  ),
+  peers as (
+    select k.identity_key, k.content
+      from (select distinct x.manufacturer, x.commercial_model, x.model_year_start,
+                   x.model_year_end, x.official_model_code, x.trim from x) as w
+      join public.catalog_candidate_variants c
+        on c.snapshot_id = v_snapshot_id
+       and c.manufacturer = w.manufacturer and c.commercial_model = w.commercial_model
+       and c.model_year_start is not distinct from w.model_year_start
+       and c.model_year_end is not distinct from w.model_year_end
+       and c.official_model_code is not distinct from w.official_model_code
+       and c.trim is not distinct from w.trim
+      join public.catalog_raw_records r on r.id = c.raw_record_id
+      cross join lateral (
+        select public.catalog_variant_identity_key(
+                 c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
+                 c.official_model_code, c.trim, r.payload->>'tozeret_cd',
+                 r.payload->>'degem_cd', r.payload->>'sug_degem',
+                 c.identity_dimensions) as identity_key,
+               public.catalog_variant_content_sha256(r.payload) as content) as k
+  ),
+  contents as (
+    -- `union` leaves each (key, content) pair once.
+    select u.identity_key, count(*) as distinct_contents,
+           encode(sha256(convert_to(string_agg(u.content, ',' order by u.content collate "C"),
+                                    'UTF8')), 'hex') as collision_content,
+           min(u.content collate "C") as only_content
+      from (select x.identity_key, x.content from x
+            union
+            select p.identity_key, p.content from peers p
+             where p.identity_key in (select x.identity_key from x)) as u
+     group by u.identity_key
+  ),
+  strongest as (
+    select x.identity_key,
+           (array_agg(x.status order by public.catalog_variant_coverage_rank(x.status) desc,
+                      x.status collate "C"))[1] as status
+      from x
+     group by x.identity_key
+  ),
+  settled as (
+    select s.identity_key,
+           case when k.distinct_contents > 1 then 'failed' else s.status end as status,
+           case when k.distinct_contents > 1 then k.collision_content
+                else k.only_content end as content,
+           case when k.distinct_contents > 1
+                then 'CATALOG_COVERAGE_KEY_COLLISION' end as reason_code
+      from strongest s
+      join contents k on k.identity_key = s.identity_key
+  ),
+  written as (
+    insert into public.catalog_variant_coverage as cv
+      (variant_identity_key, level, status, last_run_id, snapshot_key, content_sha256,
+       vocabulary_version, reason_code)
+    select t.identity_key, p_level, t.status, p_run_id, v_snapshot_key, t.content,
+           public.catalog_vocabulary_version(), t.reason_code
+      from settled t
+     order by t.identity_key collate "C"
+    on conflict (variant_identity_key, level) do update
+       set status = excluded.status,
+           last_run_id = excluded.last_run_id,
+           snapshot_key = excluded.snapshot_key,
+           content_sha256 = excluded.content_sha256,
+           vocabulary_version = excluded.vocabulary_version,
+           reason_code = excluded.reason_code,
+           updated_at = now()
+     where cv.content_sha256 is distinct from excluded.content_sha256
+        or public.catalog_variant_coverage_rank(excluded.status)
+             > public.catalog_variant_coverage_rank(cv.status)
+        or (public.catalog_variant_coverage_rank(excluded.status)
+              = public.catalog_variant_coverage_rank(cv.status)
+            and (cv.status, cv.last_run_id, cv.snapshot_key, cv.vocabulary_version,
+                 cv.reason_code)
+                is distinct from (excluded.status, excluded.last_run_id, excluded.snapshot_key,
+                                  excluded.vocabulary_version, excluded.reason_code))
+    returning 1
+  )
+  select (select count(*) from written),
+         (select count(*) from settled where settled.reason_code is not null)
+    into v_written, v_collisions;
   delete from public.catalog_variant_reservations
    where run_id = p_run_id and level = p_level;
   get diagnostics v_released = row_count;
   return jsonb_build_object(
     'run_id', p_run_id, 'level', p_level, 'snapshot_key', v_snapshot_key,
     'entries', jsonb_array_length(p_entries), 'written', v_written,
-    'released', v_released);
+    'released', v_released, 'collisions', v_collisions);
 end;
 $$;
 
@@ -1160,7 +1260,8 @@ begin
       select c.id as candidate_id, r.upstream_record_id,
              public.catalog_variant_identity_key(
                c.manufacturer, c.commercial_model, c.model_year_start, c.model_year_end,
-               c.official_model_code, c.trim, c.identity_dimensions) as identity_key,
+               c.official_model_code, c.trim, r.payload->>'tozeret_cd', r.payload->>'degem_cd',
+               r.payload->>'sug_degem', c.identity_dimensions) as identity_key,
              public.catalog_variant_content_sha256(r.payload) as content
         from jsonb_array_elements(p_candidate_ids) as e
         join public.catalog_candidate_variants c on c.id = (e #>> '{}')::uuid
@@ -1268,8 +1369,8 @@ begin
   foreach fn in array array[
     'public.catalog_vocabulary_version()',
     'public.catalog_variant_identity_token(text)',
-    'public.catalog_variant_identity_text(text,text,integer,integer,text,text,jsonb)',
-    'public.catalog_variant_identity_key(text,text,integer,integer,text,text,jsonb)',
+    'public.catalog_variant_identity_text(text,text,integer,integer,text,text,text,text,text,jsonb)',
+    'public.catalog_variant_identity_key(text,text,integer,integer,text,text,text,text,text,jsonb)',
     'public.catalog_variant_content_sha256(jsonb)',
     'public.catalog_variant_coverage_rank(text)',
     'public.catalog_variant_coverage_decision(text,text,text,text,boolean)',
