@@ -63,6 +63,12 @@
 --                                    finished runs whose claims still await
 --                                    settlement: the automatic reconciliation
 --                                    sweep's bounded listing
+--   catalog_candidate_variant_page() restated (PR-Z3): three optional exact
+--                                    filters on the register's own
+--                                    identifiers (`tozeret_cd`, `degem_cd`,
+--                                    `sug_degem`, verbatim `->>`), applied on
+--                                    the page's existing raw-record join, and
+--                                    the three values returned per row
 --
 -- Mirrors `backend/catalog/coverage.py` (the key, the rule, the ranks) and
 -- `backend/catalog/government/vocabulary.VOCABULARY_VERSION`.
@@ -76,7 +82,9 @@
 -- relations, new functions, and three restated ones -- the plan record check
 -- (which additionally admits the optional `"include_unresolved": true`, so
 -- every stored revision still satisfies it), the queue build and its summary
--- (same signatures, same answers while the ledger is empty). Rerun-safe.
+-- (same signatures, same answers while the ledger is empty). PR-Z3 restates
+-- one more, the bounded variant page, with three trailing optional filters
+-- (same answers when none is stated). Rerun-safe.
 
 -- ---------------------------------------------------------------------------
 -- 1. The rule's pure parts.
@@ -1356,6 +1364,124 @@ as $$
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 6c. PR-Z3: the register's own identifiers in the bounded variant read.
+-- ---------------------------------------------------------------------------
+--
+-- `resolve_variant` narrowed only by marque, commercial model, model year,
+-- trim, official model code and identity dimensions, so rows that differ only
+-- in the Government's registration identifiers -- `tozeret_cd`, `degem_cd`,
+-- `sug_degem` -- always came back ambiguous (Toyota 2018+ in production: 833
+-- of 1,645 queue items, in 295 groups, every one split by `degem_cd`).
+--
+-- The page is restated with three OPTIONAL exact filters on those fields,
+-- compared verbatim as `payload->>'field'` (the same rendering the identity
+-- key and `coverage.register_code` use), and it returns the three values per
+-- row. Why a join and not a candidate column: the page ALREADY joins each
+-- matched candidate to its own raw record by primary key, AFTER the indexed
+-- identity filters have narrowed the candidates, so the filter adds no scan;
+-- the codes live verbatim in the raw payload the identity key already reads
+-- them from; and a candidate column would have to be backfilled into
+-- candidate rows the schema keeps append-only (6,374 Toyota rows alone in
+-- production). A NULL filter states nothing, exactly like every other one.
+--
+-- The previous eleven-argument signature is dropped so the RPC is ONE
+-- function: the three new parameters are trailing defaults, so a caller that
+-- names only the old parameters is answered exactly as before.
+drop function if exists public.catalog_candidate_variant_page(
+  uuid, text, text, integer, text, text, jsonb, text, integer, integer, boolean);
+create or replace function public.catalog_candidate_variant_page(
+  p_snapshot_id uuid,
+  p_manufacturer text default null,
+  p_commercial_model text default null,
+  p_model_year integer default null,
+  p_official_model_code text default null,
+  p_trim text default null,
+  p_identity_dimensions jsonb default null,
+  p_status text default null,
+  p_limit integer default 50,
+  p_offset integer default 0,
+  p_allow_incomplete boolean default false,
+  p_register_manufacturer_code text default null,
+  p_register_model_code text default null,
+  p_vehicle_type_code text default null
+) returns table (
+  id uuid, snapshot_id uuid, raw_record_id uuid, manufacturer text,
+  commercial_model text, model_year_start integer, model_year_end integer,
+  official_model_code text, "trim" text, identity_dimensions jsonb, status text,
+  candidate_key text, upstream_record_id text, resource_id text,
+  source_locator jsonb, payload_sha256 text, register_manufacturer_code text,
+  register_model_code text, vehicle_type_code text, total_count bigint
+)
+language plpgsql stable
+set search_path = pg_catalog
+as $$
+declare v_limit integer; v_offset integer; v_dimensions jsonb;
+begin
+  perform public.catalog_readable_snapshot(p_snapshot_id, p_allow_incomplete);
+  if p_status is not null
+     and p_status not in ('candidate', 'ambiguous', 'rejected', 'ready_for_review') then
+    raise exception 'unknown catalog candidate status' using errcode = '22023';
+  end if;
+  if p_identity_dimensions is not null
+     and not public.catalog_identity_dimensions_valid(p_identity_dimensions) then
+    raise exception 'unknown catalog identity dimension' using errcode = '22023';
+  end if;
+  v_dimensions := coalesce(p_identity_dimensions, '{}'::jsonb);
+  v_limit := greatest(1, least(coalesce(p_limit, 50), public.catalog_page_limit()));
+  v_offset := greatest(0, coalesce(p_offset, 0));
+  return query
+  with matched as (
+    select c.id, c.snapshot_id, c.raw_record_id, c.manufacturer, c.commercial_model,
+           c.model_year_start, c.model_year_end, c.official_model_code, c.trim,
+           c.identity_dimensions, c.status, c.candidate_key,
+           r.upstream_record_id, r.resource_id, r.source_locator, r.payload_sha256,
+           r.payload->>'tozeret_cd' as register_manufacturer_code,
+           r.payload->>'degem_cd' as register_model_code,
+           r.payload->>'sug_degem' as vehicle_type_code
+      from public.catalog_candidate_variants c
+      join public.catalog_raw_records r
+        on r.id = c.raw_record_id and r.snapshot_id = c.snapshot_id
+     where c.snapshot_id = p_snapshot_id
+       and (p_manufacturer is null or c.manufacturer = p_manufacturer)
+       and (p_commercial_model is null or c.commercial_model = p_commercial_model)
+       and (p_official_model_code is null or c.official_model_code = p_official_model_code)
+       and (p_trim is null or c.trim = p_trim)
+       and (p_status is null or c.status = p_status)
+       and (p_model_year is null
+            or (c.model_year_start is not null
+                and p_model_year between c.model_year_start and c.model_year_end))
+       and c.identity_dimensions @> v_dimensions
+       and (p_register_manufacturer_code is null
+            or r.payload->>'tozeret_cd' = p_register_manufacturer_code)
+       and (p_register_model_code is null
+            or r.payload->>'degem_cd' = p_register_model_code)
+       and (p_vehicle_type_code is null
+            or r.payload->>'sug_degem' = p_vehicle_type_code)
+  ), page as (
+    select m.*
+      from matched m
+     order by m.manufacturer collate "C", m.commercial_model collate "C",
+              m.model_year_start, m.model_year_end,
+              coalesce(m.official_model_code, '') collate "C",
+              coalesce(m.trim, '') collate "C", m.candidate_key collate "C"
+     limit v_limit offset v_offset
+  )
+  select p.id, p.snapshot_id, p.raw_record_id, p.manufacturer, p.commercial_model,
+         p.model_year_start, p.model_year_end, p.official_model_code, p.trim,
+         p.identity_dimensions, p.status, p.candidate_key, p.upstream_record_id,
+         p.resource_id, p.source_locator, p.payload_sha256, p.register_manufacturer_code,
+         p.register_model_code, p.vehicle_type_code,
+         (select count(*) from matched)
+    from (select 1) as anchor
+    left join page p on true
+   order by p.manufacturer collate "C" nulls last, p.commercial_model collate "C",
+            p.model_year_start, p.model_year_end,
+            coalesce(p.official_model_code, '') collate "C",
+            coalesce(p.trim, '') collate "C", p.candidate_key collate "C";
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 7. RLS and privileges: service-path only. The owner reads the counts
 --    through the API (the membership-gated plan progress), never directly.
 -- ---------------------------------------------------------------------------
@@ -1387,7 +1513,8 @@ begin
     'public.catalog_variant_reservation_grace()',
     'public.catalog_variant_reservation_state(uuid)',
     'public.acquire_catalog_variant_reservations_guarded(uuid,text,integer,text,text,jsonb)',
-    'public.catalog_variant_reservations_settling(integer)'
+    'public.catalog_variant_reservations_settling(integer)',
+    'public.catalog_candidate_variant_page(uuid,text,text,integer,text,text,jsonb,text,integer,integer,boolean,text,text,text)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname='anon') then

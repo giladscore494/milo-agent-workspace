@@ -91,25 +91,20 @@ Pure except `record_run_coverage` and `backfill`, which take a repository.
 from __future__ import annotations
 
 import hashlib
-import math
 from dataclasses import dataclass, field
-from decimal import Decimal
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from backend.catalog.digest import catalog_payload_digest
+# The register-code rendering lives in a leaf module so the Government query
+# layer can share it without importing this one (which imports the package).
+from backend.catalog.register_codes import (REGISTER_IDENTITY_FIELDS, register_code,
+                                            register_codes)
 from backend.catalog.government.vocabulary import (GOVERNMENT_RECORD_ID_FIELD,
                                                    VOCABULARY_VERSION)
 
 #: The contract the identity text is written under. Changing the text changes
 #: every key, so it is versioned like every other durable rendering here.
 VARIANT_IDENTITY_CONTRACT = "milo-variant-identity/2"
-
-#: The Government registration identifiers the key carries (contract /2), in
-#: key order, as (name, raw payload field): read verbatim from the stored raw
-#: record, never from the candidate's normalized columns.
-REGISTER_IDENTITY_FIELDS = (("register_manufacturer_code", "tozeret_cd"),
-                            ("register_model_code", "degem_cd"),
-                            ("vehicle_type_code", "sug_degem"))
 
 #: The ledger reason of a key whose rows state DIFFERENT content: recorded as
 #: ``failed``, never settled by picking one of them.
@@ -188,33 +183,6 @@ def _year(value: Any) -> str | None:
     if isinstance(value, bool) or not isinstance(value, int):
         raise ValueError("a model year is a whole number")
     return str(value)
-
-
-def register_code(payload: Mapping[str, Any], name: str) -> str | None:
-    """``payload->>name`` exactly as PostgreSQL renders it: verbatim, no normalization.
-
-    A string as it is, a whole number in decimal, a boolean as ``true`` /
-    ``false``, a fraction in plain (never exponent) notation; absent or JSON
-    null is None. A nested object or array names no register code and is
-    refused rather than rendered differently from the database.
-    """
-    value = payload.get(name)
-    if value is None or isinstance(value, str):
-        return value
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float) and math.isfinite(value):
-        return format(Decimal(repr(value)), "f")
-    raise ValueError("a register identity code is a JSON scalar")
-
-
-def register_codes(payload: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
-    """(manufacturer code, model code, vehicle type code) of one raw payload."""
-    manufacturer, model, vehicle_type = (register_code(payload, field)
-                                         for _name, field in REGISTER_IDENTITY_FIELDS)
-    return manufacturer, model, vehicle_type
 
 
 def variant_identity_text(manufacturer: str, commercial_model: str,

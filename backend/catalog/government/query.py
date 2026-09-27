@@ -46,6 +46,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
+from backend.catalog.register_codes import REGISTER_IDENTITY_FIELDS, register_code
 from backend.errors import AppError
 from backend.runtime import CancellationRequested
 
@@ -73,6 +74,17 @@ IDENTITY_RECORD_FIELD_TYPES: Mapping[str, type] = {
     "ramat_gimur": str, "delek_cd": int, "delek_nm": str,
 }
 IDENTITY_RECORD_FIELDS: tuple[str, ...] = tuple(IDENTITY_RECORD_FIELD_TYPES)
+
+#: PR-Z3: the Government's own registration identifiers, as (filter / row
+#: attribute name, register field). A resolved row's identity projection
+#: carries them too, so evidence and the vehicle output name the exact
+#: registration. Unlike the reviewed identity fields above they travel as TEXT
+#: -- the `payload->>'field'` rendering (`register_codes.register_code`) that the
+#: database filter compares -- so the projection states exactly what a caller
+#: must state to narrow by them. A register value that is no JSON scalar is
+#: dropped, like every unstated field.
+REGISTER_CODE_FIELDS: tuple[tuple[str, str], ...] = REGISTER_IDENTITY_FIELDS
+REGISTER_CODE_FILTERS: tuple[str, ...] = tuple(name for name, _field in REGISTER_CODE_FIELDS)
 
 #: The largest number of matches `resolve_variant` will carry back. An
 #: ambiguity wider than this is still an ambiguity -- the count is exact and
@@ -166,6 +178,19 @@ class CandidateVariantRow:
     snapshot_key: str
     upstream_version: str
     upstream_version_kind: str
+    #: PR-Z3: the row's `payload->>'tozeret_cd'`, `->>'degem_cd'` and
+    #: `->>'sug_degem'`, verbatim; None when the register states none.
+    register_manufacturer_code: str | None = None
+    register_model_code: str | None = None
+    vehicle_type_code: str | None = None
+
+    @property
+    def register_codes(self) -> dict[str, str]:
+        """The register codes this row states, by filter name (absent when unstated)."""
+        return {name: value for name, value in (
+            ("register_manufacturer_code", self.register_manufacturer_code),
+            ("register_model_code", self.register_model_code),
+            ("vehicle_type_code", self.vehicle_type_code)) if value is not None}
 
 
 @dataclass(frozen=True)
@@ -266,6 +291,13 @@ def identity_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(value, str) and not value.strip():
             continue
         projected[name] = value
+    for _name, field_name in REGISTER_CODE_FIELDS:
+        try:
+            code = register_code(payload, field_name)
+        except ValueError:
+            continue
+        if code is not None:
+            projected[field_name] = code
     return projected
 
 
@@ -362,20 +394,34 @@ class GovernmentCatalogQuery:
                       official_model_code: str | None = None, trim: str | None = None,
                       identity_dimensions: Mapping[str, str] | None = None,
                       status: str | None = None,
-                      limit: int = DEFAULT_RESULT_ITEMS, offset: int = 0) -> QueryPage:
+                      limit: int = DEFAULT_RESULT_ITEMS, offset: int = 0,
+                      register_manufacturer_code: str | None = None,
+                      register_model_code: str | None = None,
+                      vehicle_type_code: str | None = None) -> QueryPage:
         """Every candidate matching exactly the STATED filters, one page at a time.
 
         Nothing collapses two rows and nothing picks a first: a model year with
         several trims is several rows here, because that is what the register
         states.
+
+        PR-Z3: the register's own identifiers are three more EXACT filters,
+        applied in the database in the same one bounded read (never a Python
+        filter over a page): `register_manufacturer_code` (`tozeret_cd`),
+        `register_model_code` (`degem_cd`), `vehicle_type_code` (`sug_degem`),
+        each compared verbatim with the row's `payload->>'field'`. An unstated
+        filter states nothing, like every other one.
         """
         provenance = self.dataset_metadata()
+        codes = {name: str(value) for name, value in (
+            ("register_manufacturer_code", register_manufacturer_code),
+            ("register_model_code", register_model_code),
+            ("vehicle_type_code", vehicle_type_code)) if value is not None}
         rows, total = self._read(
             self._repository.catalog_candidate_variant_page, self._active()["id"],
             manufacturer=manufacturer, commercial_model=commercial_model,
             model_year=model_year, official_model_code=official_model_code, trim=trim,
             identity_dimensions=dict(identity_dimensions or {}) or None, status=status,
-            limit=limit, offset=offset)
+            limit=limit, offset=offset, **codes)
         return self._page([self._variant_row(row, provenance) for row in rows],
                           total, limit, offset, provenance)
 
@@ -387,7 +433,10 @@ class GovernmentCatalogQuery:
 
     def resolve_variant(self, manufacturer: str, commercial_model: str, model_year: int, *,
                         trim: str | None = None, official_model_code: str | None = None,
-                        identity_dimensions: Mapping[str, str] | None = None
+                        identity_dimensions: Mapping[str, str] | None = None,
+                        register_manufacturer_code: str | None = None,
+                        register_model_code: str | None = None,
+                        vehicle_type_code: str | None = None
                         ) -> VariantResolutionResult:
         """Narrow by what the caller STATES, and refuse to choose beyond it.
 
@@ -395,16 +444,26 @@ class GovernmentCatalogQuery:
         not return the first, and no further argument could break the tie --
         allowing that would let a caller resolve a real ambiguity by fiat.
 
+        PR-Z3: the register's own identifiers narrow too, as exact database
+        filters. They are not a caller's choice between rows: they are what
+        ONE register row states, and the trusted tool accepts them only when
+        they name a row the server handed the run (`GovernmentVehicleTool`,
+        GOVERNMENT_REGISTER_CODE_NOT_IN_BATCH). Rows that state the same
+        identity AND the same codes stay ambiguous here, exactly as before.
+
         The identity projection is read ONLY for a unique resolution, and only
         for that one row: an ambiguous answer quotes nothing, because there is
         no single row whose fields it could quote.
         """
+        codes = {"register_manufacturer_code": register_manufacturer_code,
+                 "register_model_code": register_model_code,
+                 "vehicle_type_code": vehicle_type_code}
         page = self.list_variants(manufacturer=str(manufacturer),
                                   commercial_model=str(commercial_model),
                                   model_year=int(model_year), trim=trim,
                                   official_model_code=official_model_code,
                                   identity_dimensions=identity_dimensions,
-                                  limit=MAX_RESOLUTION_MATCHES, offset=0)
+                                  limit=MAX_RESOLUTION_MATCHES, offset=0, **codes)
         matches, total, mode = tuple(page.items), page.total, MATCH_EXACT
         if total == 0 and official_model_code is not None:
             # PR-V: ONLY when the exact spelling matched nothing. An exact
@@ -412,7 +471,7 @@ class GovernmentCatalogQuery:
             retried = self._separator_insensitive(
                 str(manufacturer), str(commercial_model), int(model_year), trim=trim,
                 official_model_code=str(official_model_code),
-                identity_dimensions=identity_dimensions)
+                identity_dimensions=identity_dimensions, codes=codes)
             if retried is not None:
                 matches, total, mode = retried[0], retried[1], MATCH_SEPARATOR_INSENSITIVE
         if total != 1 or not matches:
@@ -428,7 +487,8 @@ class GovernmentCatalogQuery:
     def _separator_insensitive(self, manufacturer: str, commercial_model: str,
                                model_year: int, *, trim: str | None,
                                official_model_code: str,
-                               identity_dimensions: Mapping[str, str] | None
+                               identity_dimensions: Mapping[str, str] | None,
+                               codes: Mapping[str, str | None] | None = None
                                ) -> tuple[tuple[CandidateVariantRow, ...], int] | None:
         """The ONE retry: the same stated filters, the code compared by `separator_key`.
 
@@ -445,7 +505,7 @@ class GovernmentCatalogQuery:
         page = self.list_variants(manufacturer=manufacturer, commercial_model=commercial_model,
                                   model_year=model_year, trim=trim,
                                   identity_dimensions=identity_dimensions,
-                                  limit=MAX_SEPARATOR_SCAN_ROWS, offset=0)
+                                  limit=MAX_SEPARATOR_SCAN_ROWS, offset=0, **dict(codes or {}))
         if page.has_more:
             return None
         found = tuple(item for item in page.items
@@ -525,7 +585,10 @@ class GovernmentCatalogQuery:
             payload_sha256=str(row.get("payload_sha256") or ""),
             snapshot_key=provenance.snapshot_key,
             upstream_version=provenance.upstream_version,
-            upstream_version_kind=provenance.upstream_version_kind)
+            upstream_version_kind=provenance.upstream_version_kind,
+            register_manufacturer_code=_code(row.get("register_manufacturer_code")),
+            register_model_code=_code(row.get("register_model_code")),
+            vehicle_type_code=_code(row.get("vehicle_type_code")))
 
     @staticmethod
     def _page(items: Sequence[Any], total: int, limit: Any, offset: Any,
@@ -544,6 +607,10 @@ class GovernmentCatalogQuery:
             raise CancellationRequested("RUN_CANCELLED")
 
 
+def _code(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
+
+
 def _whole(value: Any) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
@@ -553,6 +620,7 @@ def _whole(value: Any) -> int | None:
 __all__ = ["IDENTITY_RECORD_FIELDS", "IDENTITY_RECORD_FIELD_TYPES",
            "MATCH_EXACT", "MATCH_MODES", "MATCH_SEPARATOR_INSENSITIVE",
            "MAX_RESOLUTION_MATCHES", "MAX_SEPARATOR_SCAN_ROWS", "CandidateVariantRow",
+           "REGISTER_CODE_FIELDS", "REGISTER_CODE_FILTERS",
            "GovernmentCatalogQuery", "ManufacturerCoverage", "ModelCoverage", "QueryPage",
            "TOTAL_COUNT_FIELD", "VariantResolutionResult", "bounded_limit",
            "bounded_offset", "is_count_row",

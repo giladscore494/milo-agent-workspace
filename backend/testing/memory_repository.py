@@ -73,6 +73,21 @@ def _declared_scope_key(row: Mapping[str, Any]) -> tuple[str, str] | None:
     return ("declared", "")
 
 
+def _register_codes(payload: Mapping[str, Any]) -> tuple[str | None, str | None, str | None]:
+    """The page's `payload->>'tozeret_cd' / 'degem_cd' / 'sug_degem'`.
+
+    `coverage.register_codes`' rendering; a value that is not a JSON scalar
+    names no code here (the database would render its JSON text, which no
+    register code is)."""
+    codes = []
+    for _name, field in catalog_coverage.REGISTER_IDENTITY_FIELDS:
+        try:
+            codes.append(catalog_coverage.register_code(payload, field))
+        except ValueError:
+            codes.append(None)
+    return codes[0], codes[1], codes[2]
+
+
 def _variant_page_key(row: Mapping[str, Any]) -> tuple:
     """The order `catalog_candidate_variant_page` returns candidates in.
 
@@ -2112,9 +2127,14 @@ class MemoryRepository:
                                        identity_dimensions: dict[str, Any] | None = None,
                                        status: str | None = None, limit: int = 50,
                                        offset: int = 0,
-                                       allow_incomplete: bool = False) -> list[dict[str, Any]]:
+                                       allow_incomplete: bool = False,
+                                       register_manufacturer_code: str | None = None,
+                                       register_model_code: str | None = None,
+                                       vehicle_type_code: str | None = None
+                                       ) -> list[dict[str, Any]]:
         with self.lock:
             self._readable_snapshot(snapshot_id, allow_incomplete)
+            stated_codes = (register_manufacturer_code, register_model_code, vehicle_type_code)
             if status is not None and status not in CANDIDATE_STATUSES:
                 raise AppError("CATALOG_QUERY_INVALID",
                                "unknown catalog candidate status", 400)
@@ -2146,6 +2166,11 @@ class MemoryRepository:
                 record = records.get(row["raw_record_id"])
                 if record is None:
                     continue
+                # PR-Z3: `payload->>'field'`, compared verbatim.
+                codes = _register_codes(record["payload"])
+                if any(wanted_code is not None and str(wanted_code) != code
+                       for wanted_code, code in zip(stated_codes, codes)):
+                    continue
                 matched.append({
                     "id": row["id"], "snapshot_id": row["snapshot_id"],
                     "raw_record_id": row["raw_record_id"],
@@ -2160,7 +2185,9 @@ class MemoryRepository:
                     "upstream_record_id": record["upstream_record_id"],
                     "resource_id": record["resource_id"],
                     "source_locator": dict(record.get("source_locator") or {}),
-                    "payload_sha256": record["payload_sha256"]})
+                    "payload_sha256": record["payload_sha256"],
+                    "register_manufacturer_code": codes[0], "register_model_code": codes[1],
+                    "vehicle_type_code": codes[2]})
             matched.sort(key=_variant_page_key)
             return self._aggregate_page(matched, limit, offset)
 

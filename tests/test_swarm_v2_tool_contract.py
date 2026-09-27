@@ -897,7 +897,8 @@ def test_production_registers_exactly_one_read_tool_and_routes_the_seam():
     assert 'promotion_enabled = posture["promotion"]' in source
     # Pinned to the snapshot the Government preparation stage resolved after
     # the lease: still exactly one READ tool, still the wrapper, never the reader.
-    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key, "
+            "handed_rows=handed)] "
             "if government_read_enabled else [])") in " ".join(source.split())
     assert "scopes=frozenset({GOVERNMENT_TOOL_SCOPE}) if government_read_enabled" in source
     assert "tool_result_sink=evidence_sink" in source

@@ -60,7 +60,7 @@ from backend.testing.memory_repository import MemoryRepository
 from backend.testing.work_scope_seed import seed_prepared_plan, start_batch_run
 from backend.tools import ToolContext, ToolRegistry
 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_NAME, GOVERNMENT_TOOL_SCOPE,
-                                              GovernmentVehicleTool)
+                                              GovernmentVehicleTool, handed_register_rows)
 
 REPLAY_ROOT = Path(__file__).resolve().parent / "replay"
 MANIFEST_NAME = "manifest.json"
@@ -262,11 +262,20 @@ class ReplayGovernmentTool(GovernmentVehicleTool):
         ids = lambda result: sorted(str(item["upstream_record_id"])
                                     for item in result.get("variants") or [])
         if operation == "resolve_variant":
+            # A recording is history: it is compared on what it RECORDED. The
+            # register codes a source record states since PR-Z3 are additive
+            # fields no older recording could have, so the real record is
+            # read on the recording's own fields -- every one of which must
+            # still agree.
+            recorded_fields = set(recorded.get("source_record") or {})
             summary = lambda result: {"resolved": result["resolved"],
                                       "ambiguous": result["ambiguous"],
                                       "match_count": result["match_count"],
                                       "rows": ids(result),
-                                      "source_record": result.get("source_record")}
+                                      "source_record": None if result.get("source_record") is None
+                                      else {name: value for name, value
+                                            in result["source_record"].items()
+                                            if name in recorded_fields}}
             if "match_mode" in recorded:
                 # A recording that states how its code matched (PR-V) must
                 # match the same way now; older recordings predate the field.
@@ -433,15 +442,19 @@ def _seed_snapshot(rows: list[Mapping[str, Any]]) -> tuple[MemoryRepository, str
 
 def _work_context(manifest: Mapping[str, Any]) -> dict[str, Any]:
     """The Commander context production built, from the recorded preparation."""
+    return _preparation(manifest).work_context({})
+
+
+def _preparation(manifest: Mapping[str, Any]) -> GovernmentPreparation:
+    """The recorded preparation, read back exactly as a resumed run reads it."""
     record = manifest["preparation"]
-    preparation = GovernmentPreparation(
+    return GovernmentPreparation(
         snapshot_key=record["snapshot_key"], snapshot_id=str(record.get("snapshot_id") or ""),
         resource_id=record["resource_id"], upstream_version=record["upstream_version"],
         upstream_version_kind=record["upstream_version_kind"],
         queue=tuple(GovernmentWorkItem.from_record(item) for item in record["queue"]),
         total_candidates=int(record["total_candidates"]), bounded=bool(record["bounded"]),
         resumed=False)
-    return preparation.work_context({})
 
 
 def replay(manifest: Mapping[str, Any]) -> ReplayReport:
@@ -456,8 +469,14 @@ def replay(manifest: Mapping[str, Any]) -> ReplayReport:
     evidence_store = ProofRepository(lease)
     combined = RunRepository(spy, evidence_store)
 
-    real_tool = (GovernmentVehicleTool(spy, snapshot_key=snapshot_key)
-                 if snapshot_key is not None else None)
+    # Bound to the recording's OWN handed queue, as the worker binds the tool
+    # (PR-Z3): a recorded call that states register codes is cross-checked
+    # against the rows that run was handed. A recording whose items carry no
+    # codes binds nothing, exactly as before.
+    real_tool = (GovernmentVehicleTool(
+        spy, snapshot_key=snapshot_key,
+        handed_rows=handed_register_rows(_preparation(manifest).queue))
+        if snapshot_key is not None else None)
     replay_tool = ReplayGovernmentTool(manifest.get("tool_results", []), real_tool)
     tools = ToolRegistry([replay_tool])
     limits = reviewed_first_run_policy().plan_limits()

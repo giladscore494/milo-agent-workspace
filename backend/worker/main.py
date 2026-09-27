@@ -894,7 +894,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 from backend.engines.swarm_v2.grounding import RepositoryEvidenceResolver
                 from backend.tools import ToolContext, ToolRegistry
                 from backend.tools.government_vehicle import (GOVERNMENT_TOOL_SCOPE,
-                                                              GovernmentVehicleTool)
+                                                              GovernmentVehicleTool,
+                                                              handed_register_rows,
+                                                              register_code_plan_rule)
                 from backend.catalog.execution import catalog_posture
                 from backend.catalog.pipeline import CatalogPromotionPipeline
 
@@ -953,8 +955,15 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                 # PINNED to the snapshot preparation resolved: every read this
                 # run makes answers from the same immutable snapshot, and a
                 # resumed attempt from the same one again.
+                # PR-Z3: the run's own handed queue items and their register
+                # codes -- server data from the preparation record -- bind both
+                # the tool (a call stating codes must name a handed row) and
+                # the plan firewall (a call for a handed row states its codes).
+                handed = handed_register_rows(preparation.queue) \
+                    if government_read_enabled else ()
                 tools = ToolRegistry(
-                    [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)]
+                    [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key,
+                                           handed_rows=handed)]
                     if government_read_enabled else [])
                 # PR-Y: MILO_CAPTURE_REPLAY, read ONCE here. Off (the default and
                 # every deployed posture): no recorder, nothing wrapped, zero
@@ -994,7 +1003,9 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
                     tool_descriptors=tools.descriptors(),
                     cancellation_checker=is_cancelled, agent_step_callback=record_agent_step,
                     plan_limits=limits)
-                validator = PlanValidator(allowed_tools=tools.descriptors(), limits=limits)
+                validator = PlanValidator(
+                    allowed_tools=tools.descriptors(), limits=limits,
+                    call_rules=(register_code_plan_rule(handed),) if handed else ())
                 commander = Commander(client=gateway,
                     resolver=CommanderModelResolver(allowed, set(allowed)), validator=validator,
                     retry_callback=record_retry)

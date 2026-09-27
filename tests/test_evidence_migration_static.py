@@ -448,7 +448,8 @@ def test_r3_provenance_stays_internal_and_the_production_mapping_is_one_pair():
     # enabled shape is unchanged, and the enabled/disabled behaviour is proven
     # in `tests/test_catalog_execution_flag.py`.
     collapsed = " ".join(worker.split())
-    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key, "
+            "handed_rows=handed)] "
             "if government_read_enabled else [])") in collapsed
     assert "tool_result_sink=evidence_sink" in worker
     assert "RegisteredOperationEvidenceSink(" in worker

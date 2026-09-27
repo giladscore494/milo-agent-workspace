@@ -29,6 +29,10 @@ Where identity comes from, and where it never comes from
   record locator names that row (``["record_field", "<snapshot>:<row>", ...]``).
   Evidence without a record locator -- a web page, a pre-R3 claim -- is about
   no particular row and stays where it always was, in ``fields``.
+* PR-Z3: a vehicle whose resolution stated its row's registration
+  (``tozeret_cd`` / ``degem_cd`` / ``sug_degem`` in the tool's server-built
+  source record) carries it as ``registration``; one without does not, and
+  keeps its exact shape.
 * Nothing is read from task output, model text, a goal string or an entity
   spelling. An ambiguous or not-found candidate is never merged into a
   vehicle and never carries a value: it appears only in its own group.
@@ -47,8 +51,9 @@ from backend.engines.swarm_v2.contracts import EvidenceReference, VerificationVe
 from backend.engines.swarm_v2.current_verdict import current_verdict_by_claim
 from backend.engines.swarm_v2.evidence_contracts import (EvidenceContractError,
                                                          parse_locator_key)
-from backend.engines.swarm_v2.resolution import (CANDIDATE_KEYS, RESOLVED, SOFT_GAP_CODES,
-                                                 UNRESOLVED_AMBIGUOUS, UNRESOLVED_NOT_FOUND)
+from backend.engines.swarm_v2.resolution import (CANDIDATE_KEYS, REGISTRATION_FIELDS, RESOLVED,
+                                                 SOFT_GAP_CODES, UNRESOLVED_AMBIGUOUS,
+                                                 UNRESOLVED_NOT_FOUND)
 
 #: The identity every vehicle and every unresolved group states, in this order.
 #: `resolution.CANDIDATE_KEYS` is the operation's input vocabulary; a key the
@@ -75,6 +80,19 @@ UNRESOLVED_GROUP_OUTCOMES = (UNRESOLVED_AMBIGUOUS, UNRESOLVED_NOT_FOUND)
 def _canonical(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
                       default=str)
+
+
+def _registration(items: Iterable[Mapping[str, Any]]) -> dict[str, str]:
+    """The ONE row's registration its resolutions state (the first, by task/call)."""
+    for item in sorted(items, key=lambda entry: (str(entry.get("task_id")),
+                                                 str(entry.get("call_id")))):
+        registration = item.get("registration")
+        if isinstance(registration, Mapping):
+            stated = {name: str(registration[name]) for name in REGISTRATION_FIELDS
+                      if isinstance(registration.get(name), str) and registration[name]}
+            if stated:
+                return stated
+    return {}
 
 
 def _text(value: Any) -> str | None:
@@ -208,14 +226,21 @@ class VehicleCatalogResultAssembler:
             for task_id in task_ids:
                 review.update((code, "", task_id) for code in task_codes.get(task_id, ()))
             fields = self._fields(attached.get(record, []), verdict_by_claim, review)
-            vehicles.append({
+            vehicle = {
                 "vehicle_key": record,
                 "identity": identity,
                 "fields": fields,
                 "needs_review": [self._review_entry(*entry) for entry in sorted(review)],
                 "sources": sorted({entry["source_id"] for field in fields.values()
                                    for entry in field["provenance"]}),
-            })
+            }
+            registration = _registration(items)
+            if registration:
+                # PR-Z3: the row's exact registration, as the server-built
+                # source record stated it. Present only when stated, so a
+                # vehicle without one keeps its exact shape.
+                vehicle["registration"] = registration
+            vehicles.append(vehicle)
         return vehicles
 
     @staticmethod

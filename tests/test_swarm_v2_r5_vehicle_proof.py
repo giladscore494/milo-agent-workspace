@@ -420,7 +420,8 @@ def test_none_of_r5s_proof_tools_reached_the_production_registry():
     worker_main = Path("backend/worker/main.py").read_text()
     # Pinned to the snapshot the Government preparation stage resolved after
     # the lease: still exactly one READ tool, still the wrapper, never the reader.
-    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key)] "
+    assert ("tools = ToolRegistry( [GovernmentVehicleTool(repo, snapshot_key=preparation.snapshot_key, "
+            "handed_rows=handed)] "
             "if government_read_enabled else [])") in " ".join(worker_main.split())
     for name in ("yeda.vehicle_catalog", "gov_il.vehicle_registry",
                  "toyota.archived_model_document"):

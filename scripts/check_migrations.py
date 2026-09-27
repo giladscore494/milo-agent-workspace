@@ -201,6 +201,12 @@ REQUIRED_PER_FILE["20260927000100_catalog_variant_coverage.sql"] = [
     "select 'milo-variant-identity/2'",
     "r.payload->>'tozeret_cd', r.payload->>'degem_cd',",
     "then 'catalog_coverage_key_collision' end as reason_code",
+    # PR-Z3: the bounded variant page narrows by the register's own
+    # identifiers in the database, verbatim, on its existing raw-record join,
+    # and stays ONE function.
+    "drop function if exists public.catalog_candidate_variant_page(",
+    "or r.payload->>'degem_cd' = p_register_model_code)",
+    "or r.payload->>'sug_degem' = p_vehicle_type_code)",
 ]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the

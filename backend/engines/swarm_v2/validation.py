@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Collection, Mapping
+from typing import Any, Callable, Collection, Mapping, Sequence
 
 from pydantic import ValidationError
 
@@ -35,6 +35,10 @@ VALIDATION_REASONS = frozenset({
     # PR-V: a task whose every planned call is to an operation that can never
     # produce evidence declared evidence requirements (run aa63369b).
     "EVIDENCE_REQUIRES_EVIDENCE_TOOL",
+    # PR-Z3: a resolve_variant call for a handed queue item that carries its
+    # register codes must state them; codes naming no handed item are refused.
+    "REGISTER_CODES_REQUIRED",
+    "REGISTER_CODE_NOT_IN_BATCH",
     "REQUIRED_OUTPUT_NOT_IN_SCHEMA",
     "OUTPUT_SCHEMA_NESTED_INVALID",
     "TOOL_NOT_ALLOWLISTED",
@@ -287,6 +291,13 @@ def provider_plan_policy(limits: PlanLimits,
     }
 
 
+#: PR-Z3: a SERVER-OWNED rule over one planned call -- the static
+#: `VALIDATION_REASONS` code it is refused with, or None. Built by trusted
+#: wiring from the run's own durable state (never from a plan), so the
+#: firewall can hold a call to what the server handed the run.
+PlannedCallRule = Callable[[PlannedToolCall], "str | None"]
+
+
 class PlanValidator:
     """The deterministic firewall. Commander output is DATA until it passes.
 
@@ -297,7 +308,8 @@ class PlanValidator:
     """
 
     def __init__(self, *, allowed_tools: Collection[ToolDescriptor],
-                 limits: PlanLimits | None = None):
+                 limits: PlanLimits | None = None,
+                 call_rules: Sequence[PlannedCallRule] = ()):
         # Descriptors, not bare names: an operation and its input schema are
         # part of what makes a planned call valid, so a name-only allowlist
         # could never fail closed on an unknown operation or a bad argument
@@ -306,6 +318,7 @@ class PlanValidator:
             raise TypeError("allowed_tools must be registered ToolDescriptor values")
         self._tools = {descriptor.name: descriptor for descriptor in allowed_tools}
         self._limits = limits or PlanLimits()
+        self._call_rules = tuple(call_rules)
 
     @property
     def limits(self) -> PlanLimits:
@@ -461,6 +474,11 @@ class PlanValidator:
                     f"tool operation is not registered: {call.name}.{call.operation}",
                     reason="TOOL_OPERATION_UNKNOWN")
             self._validate_call_arguments(task, call, operation.input_schema)
+            for rule in self._call_rules:
+                reason = rule(call)
+                if reason is not None:
+                    raise PlanValidationError("planned call refused by a server rule",
+                                              reason=reason)
 
     def _validate_evidence_tool(self, task: DynamicTask) -> None:
         """PR-V: evidence can only be required of a task that can produce it.
