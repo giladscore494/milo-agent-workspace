@@ -160,6 +160,17 @@ milo_contains() {
   return 1
 }
 
+# PR-R model contract, worker only (SCOPED_BATCH_PRODUCTION_RUNBOOK.md E.1):
+# the three model names the worker must carry. Boot refuses an unprofiled or
+# unallowlisted model but NOT a worker left on the old values, so the deploy
+# workflow (scripts/ops/deploy.sh) sets and reads back exactly these. Model
+# NAMES, not flags and not secrets.
+MILO_REVIEWED_WORKER_MODEL_ENV=(
+  "MILO_COMMANDER_MODEL=kimi-k3"
+  "MILO_COMMANDER_MODEL_ALLOWLIST=kimi-k3,kimi-k2.6"
+  "MILO_SWARM_WORKER_MODEL=kimi-k2.6"
+)
+
 # ---------------------------------------------------------------------------
 # Government capture job
 # ---------------------------------------------------------------------------

@@ -1,0 +1,80 @@
+name: Replay capture flag
+
+# MILO_CAPTURE_REPLAY on the WORKER JOB ONLY (scripts/ops/capture-flag.sh).
+# `on` is refused unless 0 non-terminal runs exist; the job summary says to turn
+# it off after one run. The API and every other flag are untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "on or off"
+        required: true
+        type: choice
+        options:
+          - "off"
+          - "on"
+      dry_run:
+        description: "Print the commands and change nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  capture-flag:
+    name: Replay capture flag
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 15
+    steps:
+      - name: Refuse anything but main
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: PostgreSQL client
+        run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
+
+      - name: Set the replay capture flag
+        env:
+          STATE_INPUT: ${{ inputs.state }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+        run: |
+          set -euo pipefail
+          args=("${STATE_INPUT}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/capture-flag.sh "${args[@]}"

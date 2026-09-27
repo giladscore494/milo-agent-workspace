@@ -1,0 +1,111 @@
+name: Arm Stage 2
+
+# Arm Stage 2 for ONE prepared plan revision (scripts/ops/arm.sh): the
+# reviewed runtime policy, then website-execution-activate.sh --apply-backend
+# (run starts proved CLOSED, the prepared gate, the worker, then the API), then
+# the armed gate. Reviewer required (the `production` environment). It never
+# opens run starts on the website -- that last step stays a person's, in Vercel
+# -- and never starts a run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      work_scope_id:
+        description: "Mapping Plan id"
+        required: true
+        type: string
+      work_scope_revision:
+        description: "The PREPARED plan revision"
+        required: true
+        type: string
+      work_scope_digest:
+        description: "That revision's 64-character digest"
+        required: true
+        type: string
+      confirm:
+        description: "Type ARM to apply (not needed for a dry run)"
+        required: false
+        type: string
+      dry_run:
+        description: "Print the commands and change nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  arm:
+    name: Arm Stage 2
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Refuse anything but main, and an unconfirmed apply
+        env:
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          if [[ "${DRY_RUN_INPUT}" != "true" && "${CONFIRM_INPUT}" != "ARM" ]]; then
+            echo "Type ARM in confirm to arm Stage 2."
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: Set up Python (the reviewed runtime policy is computed from backend/)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Backend dependencies (runtime policy only)
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: PostgreSQL client
+        run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
+
+      - name: Arm Stage 2
+        env:
+          WS_ID_INPUT: ${{ inputs.work_scope_id }}
+          WS_REVISION_INPUT: ${{ inputs.work_scope_revision }}
+          WS_DIGEST_INPUT: ${{ inputs.work_scope_digest }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+        run: |
+          set -euo pipefail
+          args=(--work-scope-id "${WS_ID_INPUT}" --work-scope-revision "${WS_REVISION_INPUT}"
+                --work-scope-digest "${WS_DIGEST_INPUT}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/arm.sh "${args[@]}"

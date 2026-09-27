@@ -57,7 +57,13 @@ jobs:
             sudo apt-get install -y shellcheck
           fi
           shellcheck --version
-          shellcheck -x -S warning -P scripts/release:scripts/deploy:scripts/catalog scripts/release/*.sh scripts/release/lib/common.sh scripts/deploy/*.sh scripts/catalog/*.sh
+          shellcheck -x -S warning -P scripts/release:scripts/deploy:scripts/catalog:scripts/ops scripts/release/*.sh scripts/release/lib/common.sh scripts/deploy/*.sh scripts/catalog/*.sh scripts/ops/*.sh
+      - name: actionlint (every workflow, with ShellCheck on their run steps)
+        run: |
+          # Pinned. actionlint-py ships the official actionlint binary; it runs
+          # ShellCheck (present above) on every `run:` block too.
+          python -m pip install actionlint-py==1.7.12.25
+          actionlint -color .github/workflows/*.yml
       - name: Release manifest schema validation
         run: python scripts/release/validate_production_manifest.py --manifest config/production.example.yaml --mode plan
       - name: OFFLINE release-tooling self-check (no credentials; does NOT verify live production)

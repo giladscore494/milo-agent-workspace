@@ -378,7 +378,7 @@ def emit(*rows):
 if normalized == "select 1":
     emit("1")
 
-if "table_schema='supabase_migrations'" in normalized:
+if "to_regclass('supabase_migrations.schema_migrations')" in normalized:
     emit(*(["1"] if state["history_exists"] else []))
 
 if "from supabase_migrations.schema_migrations" in normalized:
@@ -387,25 +387,31 @@ if "from supabase_migrations.schema_migrations" in normalized:
         raise SystemExit(1)
     emit(*sorted(state["applied"]))
 
-if normalized.startswith("select count(*) from information_schema.tables"):
+# Every probe below reads pg_catalog, which answers whether an object EXISTS
+# whatever the role may read (O-4). `no_select` lists the relations the role
+# cannot SELECT: they still exist.
+if normalized.startswith("select count(*) from pg_catalog.pg_class"):
     emit(str(len(state["tables"])))
+
+if "has_table_privilege" in normalized:
+    emit(*sorted(state.get("no_select", [])))
 
 if "like 'milo_%'" in normalized:
     emit("")
 
-match = re.search(r"information_schema\.tables .* table_name='([^']+)'", normalized)
+match = re.search(r"to_regclass\('public\.([^']+)'\) and relkind in \('r', 'p'\)", normalized)
 if match:
     emit(*(["1"] if match.group(1) in state["tables"] else []))
 
-match = re.search(r"information_schema\.views .* table_name='([^']+)'", normalized)
+match = re.search(r"to_regclass\('public\.([^']+)'\) and relkind in \('v', 'm'\)", normalized)
 if match:
     emit(*(["1"] if match.group(1) in state["views"] else []))
 
-match = re.search(r"information_schema\.columns .* table_name='([^']+)' and column_name='([^']+)'", normalized)
+match = re.search(r"pg_attribute where attrelid = pg_catalog\.to_regclass\('public\.([^']+)'\) and attname = '([^']+)'", normalized)
 if match:
     emit(*(["1"] if f"{match.group(1)}.{match.group(2)}" in state["columns"] else []))
 
-match = re.search(r"pg_proc .* p\.proname='([^']+)'", normalized)
+match = re.search(r"pg_proc .* p\.proname = '([^']+)'", normalized)
 if match:
     emit(*(["1"] if match.group(1) in state["functions"] else []))
 
@@ -765,7 +771,7 @@ def test_omitting_a_migration_from_the_table_is_actually_detected(local):
 # — the state whose documented remedy is "apply the whole ordered set". A
 # SELECT that merely FAILED must never be able to produce that answer.
 HISTORY_READ = "from supabase_migrations.schema_migrations"
-HISTORY_EXISTS_PROBE = "table_schema='supabase_migrations'"
+HISTORY_EXISTS_PROBE = "to_regclass('supabase_migrations.schema_migrations')"
 CLASSIFICATIONS = ("legacy-baseline", "partially-migrated", "fully-migrated", "empty-schema")
 
 
@@ -839,7 +845,7 @@ def test_a_failed_marker_probe_fails_closed(tmp_path, local):
     """
     complete = [entry["version"] for entry in local]
     state = {"history_exists": True, "applied": complete, **catalog_for(complete)}
-    result, _ = failing_run(tmp_path, state, ["p.proname='claim_run_lease'"])
+    result, _ = failing_run(tmp_path, state, ["p.proname = 'claim_run_lease'"])
 
     assert "[BLOCKED] remote:marker-probe" in result.stdout
     assert "fully-migrated" not in result.stdout
@@ -847,7 +853,7 @@ def test_a_failed_marker_probe_fails_closed(tmp_path, local):
 
 
 def test_a_failed_baseline_table_probe_fails_closed(tmp_path):
-    result, _ = failing_run(tmp_path, legacy_baseline_state(), ["table_name='run_events'"])
+    result, _ = failing_run(tmp_path, legacy_baseline_state(), ["to_regclass('public.run_events')"])
 
     assert "[BLOCKED] remote:baseline-probe" in result.stdout
     assert_refused_to_classify(result)
@@ -891,3 +897,61 @@ def test_the_failure_injection_is_real(tmp_path):
     baseline, _ = failing_run(tmp_path / "baseline", legacy_baseline_state(), [])
     assert baseline.returncode == 0
     assert "classified as legacy-baseline" in baseline.stdout
+
+
+# ---------------------------------------------------------------------------
+# O-4: a privilege problem is its own finding, never a missing migration
+# ---------------------------------------------------------------------------
+# Production, 2026-09-27: the read-only role had no SELECT on the three tables
+# migration 20260927000100 created. The marker probes read
+# information_schema, which hides every relation the role holds no privilege
+# on, so the applied migration's marker read as absent and the database was
+# reported "not 44/44". The probes now read pg_catalog; the missing grant is a
+# BLOCKED `READONLY_ROLE_LACKS_SELECT on <table>` of its own.
+COVERAGE_TABLES = ("catalog_variant_coverage", "catalog_variant_reservations",
+                   "catalog_work_scope_unit_coverage")
+
+
+def test_a_role_without_select_sees_an_applied_migration_as_applied(tmp_path, local):
+    applied = [entry["version"] for entry in local]
+    state = {"history_exists": True, "applied": applied, **catalog_for(applied),
+             "no_select": list(COVERAGE_TABLES)}
+    result = RemoteRun(tmp_path, state).run()
+    # The migration set is complete: classified as such, no drift, no
+    # history/object disagreement for the marker the role cannot read.
+    assert f"classified as fully-migrated ({len(applied)}/{len(applied)}" in result.stdout
+    assert "history-object-disagreement" not in result.stdout
+    assert "is absent" not in result.stdout
+    # ...and the grant is reported, table by table, as its own BLOCKED finding.
+    for table in COVERAGE_TABLES:
+        assert (f"[BLOCKED] remote:privilege:{table} — READONLY_ROLE_LACKS_SELECT on {table}"
+                in result.stdout), result.stdout
+    assert result.returncode != 0
+
+
+def test_a_role_that_may_read_everything_reports_the_privileges_as_passing(tmp_path, local):
+    applied = [entry["version"] for entry in local]
+    result = RemoteRun(tmp_path, {"history_exists": True, "applied": applied,
+                                  **catalog_for(applied)}).run()
+    assert "[PASS] remote:privilege" in result.stdout
+    assert "READONLY_ROLE_LACKS_SELECT" not in result.stdout
+    assert result.returncode == 0
+
+
+def test_a_failed_privilege_probe_fails_closed(tmp_path):
+    result, _ = failing_run(tmp_path, production_like_state(), ["has_table_privilege"])
+    assert "[BLOCKED] remote:privilege-probe" in result.stdout
+    assert_refused_to_classify(result)
+
+
+def test_no_probe_reads_information_schema(tmp_path, local):
+    """information_schema answers per privilege; existence must not."""
+    applied = [entry["version"] for entry in local]
+    run = RemoteRun(tmp_path, {"history_exists": True, "applied": applied, **catalog_for(applied)})
+    run.run()
+    statements = run.statements()
+    assert statements
+    assert not [line for line in statements if "information_schema" in line]
+    script = SCRIPT.read_text(encoding="utf-8")
+    assert "to_regclass('public.${mobj}')" in script
+    assert "pg_catalog.pg_attribute where attrelid = pg_catalog.to_regclass(" in script

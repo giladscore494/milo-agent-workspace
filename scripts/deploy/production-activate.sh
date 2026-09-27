@@ -47,7 +47,7 @@ MILO_REPO_ROOT="$REPO_ROOT"
 source "${SCRIPT_DIR}/operator-config.sh"
 
 DO_PREFLIGHT=0 DO_DB_GATE=0 DO_CAPTURE=0 DO_DEPLOY=0 DO_VERIFY=0 DO_PREPARE=0 DO_WEBSITE=0
-PLAN_ONLY=0 ENABLE_CATALOG=0 ENABLE_PREPARATION=0 FORCE_REDEPLOY=0
+PLAN_ONLY=0 ENABLE_CATALOG=0 ENABLE_PREPARATION=0 FORCE_REDEPLOY=0 PRESERVE_STAGE=0
 MILO_OPERATOR_CONFIG_PATH="" CONFIG_ARG=()
 WS_ARGS=()
 
@@ -78,6 +78,11 @@ Options:
   --enable-work-scope-preparation The scoped-preparation switch, for ONE execution.
   --force-redeploy                Deploy even when this release is deployed
                                   (returns API and worker to Stage A).
+  --preserve-stage                Permanent operating mode (decision 23): the
+                                  deploy replaces the images and release
+                                  identity ONLY and keeps the live stage,
+                                  verified unchanged (DEPLOY_PRESERVE_STAGE=1).
+                                  Only after 2-3 consecutive clean runs.
   --operator-config <path>
   --help
 
@@ -100,6 +105,7 @@ while [[ $# -gt 0 ]]; do
     --enable-catalog-execution) ENABLE_CATALOG=1; shift ;;
     --enable-work-scope-preparation) ENABLE_PREPARATION=1; shift ;;
     --force-redeploy) FORCE_REDEPLOY=1; shift ;;
+    --preserve-stage) PRESERVE_STAGE=1; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; CONFIG_ARG=(--operator-config "${2:?}"); shift 2 ;;
     --help) usage; exit 0 ;;
@@ -224,7 +230,7 @@ if [[ "$DO_DEPLOY" -eq 1 ]]; then
     printf '         Stage A; pass --force-redeploy only if that is what you intend.\n'
   else
     export_deploy_env
-    DEPLOY_MODE=apply bash "${SCRIPT_DIR}/cloud-run.sh"
+    DEPLOY_MODE=apply DEPLOY_PRESERVE_STAGE="$PRESERVE_STAGE" bash "${SCRIPT_DIR}/cloud-run.sh"
   fi
 fi
 

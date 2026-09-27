@@ -10803,3 +10803,77 @@ def test_the_status_facts_are_bounded_durable_state(db):
     assert _rpc_as_service(
         db, f"select coalesce(public.work_scope_preparation_state('{uuid.uuid4()}', 1, "
             f"'{digest}')::text, 'null')") == "null"
+
+
+# =============================================================================
+# O-4: the migration-state probe on a real role that lacks SELECT
+# =============================================================================
+#
+# Production, 2026-09-27: the read-only role had no SELECT on the three tables
+# migration 20260927000100 created, and check-migration-state.sh -- whose
+# marker probes read information_schema, which hides what a role cannot read
+# -- reported the applied migration as missing. The probes now read
+# pg_catalog, and the missing grant is its own BLOCKED finding.
+
+READONLY_ROLE_PG_PORT = "54996"
+LACKS_SELECT = ("catalog_variant_coverage", "catalog_variant_reservations",
+                "catalog_work_scope_unit_coverage")
+
+
+@pytest.fixture(scope="module")
+def fully_migrated_db():
+    """Every migration applied and recorded, and a read-only LOGIN role that
+    may read everything EXCEPT the three tables migration 44 created."""
+    server = EphemeralPostgres(_require_pg_bin(), port=READONLY_ROLE_PG_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
+        for migration in MIGRATIONS:
+            server.psql(file=migration)
+        versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in MIGRATIONS)
+        server.psql("create schema if not exists supabase_migrations; "
+                    "create table supabase_migrations.schema_migrations (version text primary key); "
+                    f"insert into supabase_migrations.schema_migrations (version) values {versions}")
+        server.psql("create role milo_release_readonly_test login; "
+                    "grant usage on schema public, supabase_migrations to milo_release_readonly_test; "
+                    "grant select on all tables in schema public to milo_release_readonly_test; "
+                    "grant select on supabase_migrations.schema_migrations to milo_release_readonly_test; "
+                    + " ".join(f"revoke select on public.{table} from milo_release_readonly_test;"
+                               for table in LACKS_SELECT))
+        yield server
+    finally:
+        server.stop()
+
+
+def test_a_role_without_select_is_a_privilege_finding_not_a_missing_migration(fully_migrated_db):
+    # The role really cannot read them -- and information_schema really hides them.
+    for table in LACKS_SELECT:
+        assert fully_migrated_db.psql(
+            f"select has_table_privilege('milo_release_readonly_test', 'public.{table}', 'select')") == "f"
+    env = {**os.environ,
+           "MILO_TEST_READONLY_DB_URL": _db_url(fully_migrated_db, user="milo_release_readonly_test")}
+    hidden = subprocess.run(["psql", env["MILO_TEST_READONLY_DB_URL"], "-X", "-A", "-t", "-c",
+                             "select count(*) from information_schema.tables where table_schema='public' "
+                             "and table_name='catalog_variant_coverage'"],
+                            capture_output=True, text=True, timeout=60)
+    assert hidden.stdout.strip() == "0"
+    state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
+                            "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
+                           env=env, timeout=300)
+    total = len(MIGRATIONS)
+    assert f"remote schema classified as fully-migrated ({total}/{total}" in state.stdout, state.stdout
+    assert "history-object-disagreement" not in state.stdout
+    for table in LACKS_SELECT:
+        assert f"READONLY_ROLE_LACKS_SELECT on {table}" in state.stdout
+    assert state.returncode != 0
+    # Granted, the same role reads the database as clean.
+    fully_migrated_db.psql(" ".join(f"grant select on public.{table} to milo_release_readonly_test;"
+                                    for table in LACKS_SELECT))
+    clean = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
+                            "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
+                           env=env, timeout=300)
+    assert "READONLY_ROLE_LACKS_SELECT" not in clean.stdout
+    assert clean.returncode == 0, clean.stdout
