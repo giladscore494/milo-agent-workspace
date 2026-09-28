@@ -1,0 +1,165 @@
+name: Website stage
+
+# Turn the website's plan tools back on (scripts/ops/website-stage.sh) -- a
+# Stage A deploy turns them off, and before this only Cloud Shell could turn
+# them on again:
+#   plan-authoring   Stage P: website-execution-activate.sh --apply-plan-authoring
+#   web-preparation  E', the Prepare button: government-production-capture.sh
+#                    --ensure-job --enable-catalog-execution, then
+#                    website-execution-activate.sh --apply-web-preparation
+#   both             the two above, in that order
+# Each canonical tool runs behind its own deployed gate, from the DEPLOYED
+# release (both act on `git rev-parse HEAD`): the sha input, or, left empty,
+# the release the API and the worker run. It never touches Stage 2 -- run
+# creation, paid execution and the provider key stay with arm.yml -- prepares
+# no plan and starts no run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: "Which plan tools to turn on"
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - plan-authoring
+          - web-preparation
+      sha:
+        description: "The deployed release SHA (empty: the release production runs)"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Print the commands and change nothing"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  website-stage:
+    name: Website stage
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 60
+    steps:
+      - name: Refuse anything but main, an unknown stage and a malformed SHA
+        env:
+          STAGE_INPUT: ${{ inputs.stage }}
+          SHA_INPUT: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          case "${STAGE_INPUT}" in
+            plan-authoring | web-preparation | both) ;;
+            *) echo "stage must be plan-authoring, web-preparation or both."; exit 1 ;;
+          esac
+          if [[ -n "${SHA_INPUT}" && ! "${SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "sha must be empty or exactly 40 lowercase hexadecimal characters."
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: The checkout is still clean after authenticating
+        # google-github-actions/auth writes gha-creds-*.json into the workspace.
+        # It must be ignored (.gitignore, .dockerignore, .gcloudignore) so it
+        # is neither a local change nor uploaded by gcloud builds submit.
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [[ -n "${dirty}" ]]; then
+            echo "::error::The checkout changed while authenticating to Google Cloud. Only ignored files may appear (the auth step's gha-creds-*.json credentials file). Not ignored:"
+            printf '%s\n' "${dirty}"
+            exit 1
+          fi
+          if ! grep -qxF 'gha-creds-*.json' .gcloudignore; then
+            echo "::error::.gcloudignore does not exclude gha-creds-*.json: gcloud builds submit would upload the credentials file."
+            exit 1
+          fi
+          echo "Clean: the credentials file is ignored and nothing else changed."
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: The release production runs
+        id: release
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--sha "${SHA_INPUT}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/deployed-release.sh "${args[@]}"
+
+      - name: Check out that release (a commit on main)
+        env:
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor "${RELEASE_SHA}" origin/main
+          git checkout --quiet --detach "${RELEASE_SHA}"
+          test -f scripts/ops/website-stage.sh \
+            || { echo "::error::${RELEASE_SHA} predates the website-stage workflow; deploy a newer release first."; exit 1; }
+          dirty="$(git status --porcelain)"
+          if [[ -n "${dirty}" ]]; then
+            echo "::error::The release checkout is not clean:"
+            printf '%s\n' "${dirty}"
+            exit 1
+          fi
+
+      - name: Set up Python (the gates and the runtime policy import backend/)
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Backend dependencies
+        run: python -m pip install -r backend/requirements.txt
+
+      - name: PostgreSQL client
+        run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
+
+      - name: Turn the website stage on
+        env:
+          STAGE_INPUT: ${{ inputs.stage }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+        run: |
+          set -euo pipefail
+          args=(--stage "${STAGE_INPUT}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/website-stage.sh "${args[@]}"

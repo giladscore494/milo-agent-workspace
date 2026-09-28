@@ -20,6 +20,10 @@
 #   9. worker contract: MILO_CAPTURE_REPLAY=false, and no provider key bound
 #      (permanent mode: the key is expected and reported, never removed)
 #  10. production-verify.sh --gate deployed for that SHA
+#  11. only once 1-10 PASSED, and not in permanent mode: turn the website's
+#      plan tools back on (--restore-website-stage, scripts/ops/website-stage.sh)
+#      -- Stage P and/or E', which the Stage A deploy turned off. A failed
+#      deploy stops before it and restores nothing.
 #
 # It never starts a run, never prepares a plan and never arms Stage 2. Each
 # step writes a SUMMARY| line and a job-summary row. --dry-run prints every
@@ -30,16 +34,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-SHA="" PERMANENT="false" TAB=$'\t'
+SHA="" PERMANENT="false" RESTORE_STAGE="none" RESTORED="none" TAB=$'\t'
 REQUIRED_CI_JOBS=(offline-checks frontend-and-docker postgres-checks e2e)
 
 usage() {
   cat << 'EOF'
 Usage: deploy.sh --sha <40-hex> [--permanent-mode true|false] [--dry-run]
+                 [--restore-website-stage none|plan-authoring|web-preparation|both]
                  [--operator-config <path>]
 
 Deploys the checked-out release after proving CI, migrations, the website and
-quiescence, then verifies the deployed gate. --dry-run calls nothing.
+quiescence, then verifies the deployed gate and, after a successful deploy,
+turns the named website plan tools back on. --dry-run calls nothing.
 EOF
 }
 
@@ -47,6 +53,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --sha) SHA="${2:?}"; shift 2 ;;
     --permanent-mode) PERMANENT="${2:?}"; shift 2 ;;
+    --restore-website-stage) RESTORE_STAGE="${2?}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
     --help) usage; exit 0 ;;
@@ -55,10 +62,14 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { printf 'FAIL: --sha must be a full 40-character lowercase SHA\n' >&2; exit 2; }
 case "$PERMANENT" in true | false) ;; *) printf 'FAIL: --permanent-mode must be true or false\n' >&2; exit 2 ;; esac
+case "$RESTORE_STAGE" in
+  none | plan-authoring | web-preparation | both) ;;
+  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation or both\n' >&2; exit 2 ;;
+esac
 
 ops_load_config
 CONFIG_ARG=(--operator-config "$CONFIG_PATH")
-summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT})"
+summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT}; restore website stage: ${RESTORE_STAGE})"
 
 # 1. The checkout is the release: every tool builds and tags `git rev-parse HEAD`.
 head_sha="$(git -C "$REPO_ROOT" rev-parse HEAD)"
@@ -230,11 +241,30 @@ fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
   ops_run bash "${REPO_ROOT}/scripts/deploy/production-verify.sh" "${CONFIG_ARG[@]}" --gate deployed --expected-sha "$SHA"
   summary "10 deployed-gate" DRY-RUN "would require CODE_DEPLOYED and DATABASE_READY VERIFIED"
+else
+  bash "${REPO_ROOT}/scripts/deploy/production-verify.sh" "${CONFIG_ARG[@]}" --gate deployed \
+    --expected-sha "$SHA" || ops_fail "the deployed gate did not pass (above)" "10 deployed-gate"
+  summary "10 deployed-gate" PASS "CODE_DEPLOYED and DATABASE_READY VERIFIED for ${SHA:0:12}"
+fi
+
+# 11. The website's plan tools, which the Stage A deploy turned off. Reached
+#     only when every step above passed (each failure exits); never Stage 2.
+if [[ "$OPS_FAILED" -ne 0 ]]; then
+  ops_fail "an earlier step failed; the website stage is not restored" "11 website-stage"
+elif [[ "$RESTORE_STAGE" == "none" ]]; then
+  summary "11 website-stage" SKIPPED "restore_website_stage=none: plan authoring and the Prepare button stay off"
+elif [[ "$PERMANENT" == "true" ]]; then
+  summary "11 website-stage" SKIPPED "permanent operating mode: the live stage was kept (--preserve-stage)"
+else
+  restore=(bash "${SCRIPT_DIR}/website-stage.sh" --stage "$RESTORE_STAGE" "${CONFIG_ARG[@]}" --step-prefix 11 --no-header)
+  [[ "$DRY_RUN" -eq 1 ]] && restore+=(--dry-run)
+  "${restore[@]}" || ops_fail "deployed ${SHA:0:12}, but the website stage ${RESTORE_STAGE} was not restored (above); run the website-stage workflow" "11 website-stage"
+  RESTORED="$RESTORE_STAGE"
+fi
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
   summary_note "DRY RUN: nothing was called and nothing was changed."
   exit 0
 fi
-bash "${REPO_ROOT}/scripts/deploy/production-verify.sh" "${CONFIG_ARG[@]}" --gate deployed \
-  --expected-sha "$SHA" || ops_fail "the deployed gate did not pass (above)" "10 deployed-gate"
-summary "10 deployed-gate" PASS "CODE_DEPLOYED and DATABASE_READY VERIFIED for ${SHA:0:12}"
-summary_note "Deployed ${SHA:0:12}. No run was started, nothing was prepared and Stage 2 was not armed."
+summary_note "Deployed ${SHA:0:12}; website plan tools turned back on: ${RESTORED}. No run was started, nothing was prepared and Stage 2 was not armed."
 exit "$OPS_FAILED"

@@ -1,0 +1,16 @@
+# What `gcloud builds submit .` (scripts/deploy/cloud-run.sh) does NOT upload to
+# the Cloud Build source bucket.
+#
+# Before this file existed, gcloud generated its default for a directory that
+# holds .git / .gitignore -- exactly the four lines below. Keeping them keeps
+# the build context unchanged (tests/test_ops_checkout_clean.py compares the
+# upload list with `gcloud meta list-files-for-upload` when gcloud is present).
+.gcloudignore
+.git
+.gitignore
+#!include:.gitignore
+
+# google-github-actions/auth writes its credentials file into the workspace
+# (create_credentials_file). It is also in .gitignore, included above; it is
+# named here too so this file excludes it on its own.
+gha-creds-*.json

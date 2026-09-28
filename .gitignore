@@ -21,6 +21,10 @@ coverage/
 *gcp-key*.json
 *google-key*.json
 *supabase-secret*.json
+# google-github-actions/auth writes its credentials file into the workspace
+# (create_credentials_file). It must never be committed, uploaded to Cloud
+# Build, or count as a local change (release:worktree-clean).
+gha-creds-*.json
 
 .vite/
 *.tsbuildinfo
