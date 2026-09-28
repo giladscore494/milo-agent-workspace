@@ -525,7 +525,12 @@ def test_the_source_first_policy_appears_exactly_when_the_tool_is_registered(rep
     same allowlist the firewall enforces.
     """
     with_tool = provider_plan_policy(PlanLimits(), [GOVERNMENT_TOOL_NAME])
-    assert with_tool["source_policy"] == list(SOURCE_FIRST_TOOL_POLICY[GOVERNMENT_TOOL_NAME])
+    # PR-EV: followed by the ONE line naming resolve_variant's evidence fields,
+    # read from the Government evidence mapper.
+    *static, evidence_fields = with_tool["source_policy"]
+    assert static == list(SOURCE_FIRST_TOOL_POLICY[GOVERNMENT_TOOL_NAME])
+    assert evidence_fields.startswith(f"{GOVERNMENT_TOOL_NAME}.resolve_variant: "
+                                      "evidence.required_fields may name only")
     assert provider_plan_policy(PlanLimits(), [])["source_policy"] == []
     assert provider_plan_policy(PlanLimits(), ["mock.search"])["source_policy"] == []
     # It says which source answers which question. It does NOT hard-code a

@@ -133,6 +133,88 @@ def test_the_broken_plans_now_stop_at_plan_validation(name, reason):
     assert report.catalog_reads == []
 
 
+def test_the_original_29eb076c_plan_is_rejected_at_plan_time():
+    """PR-EV: every T task requires resolve_variant OUTPUT keys as evidence
+    fields, so the recorded plan is refused and the Commander is asked for its
+    ONE repair -- which production never produced. Nothing past the plan is
+    paid for."""
+    report = replay(load_manifest(FIXTURES["29eb076c"]))
+    assert report.terminal == "unrecorded_call"
+    assert report.result is None
+    assert report.model_calls == 1
+    assert report.retry_reasons == [["commander", "planning",
+                                     "EVIDENCE_FIELD_NOT_PRODUCIBLE"]]
+    assert report.divergence == {"role": "commander", "phase": "planning",
+                                 "task_id": None, "index": 1}
+    assert [item["role"] for item in report.served] == ["commander"]
+    assert report.catalog_reads == []
+
+
+def test_without_the_pr_ev_rule_the_t_recording_reproduces_production(monkeypatch):
+    """The control: with ONLY the new firewall check switched off, the same
+    recording ends as production did -- 11 resolved vehicles and yet
+    partial_success, one EVIDENCE_REQUIREMENTS_UNMET per task. The engine's
+    evidence rule itself is unchanged (EV-4)."""
+    from backend.engines.swarm_v2.validation import PlanValidator
+
+    monkeypatch.setattr(PlanValidator, "_validate_evidence_fields", lambda self, task: None)
+    report = replay(load_manifest(FIXTURES["29eb076c"]))
+    result = report.result
+    assert report.terminal == "result" and report.retry_reasons == []
+    assert result["status"] == "partial_success"
+    assert len(result["vehicles"]) == 11
+    assert sorted(item["code"] for item in result["needs_review"]) == \
+        ["EVIDENCE_REQUIREMENTS_UNMET"] * 11
+
+
+def test_the_ev_repair_differs_from_the_original_by_one_reversible_substitution():
+    from replay.reconstruct import (EV_ORIGINAL, EV_PROVENANCE, EV_REPAIRED,
+                                    derive_ev_plan_text, reverse_ev_plan_text)
+
+    original = load_manifest(FIXTURES["29eb076c"])
+    derived = load_manifest(FIXTURES["29eb076c-ev"])
+    recorded = original["commander"][0]["content"]
+    # The refused plan is kept as recorded, then the ONE repair, then the
+    # recorded replan decision.
+    assert derived["commander"] == [original["commander"][0],
+                                    {"phase": "planning",
+                                     "content": derive_ev_plan_text(recorded),
+                                     "finish_reason": "stop"},
+                                    original["commander"][1]]
+    repair = derived["commander"][1]["content"]
+    assert EV_ORIGINAL not in repair
+    assert reverse_ev_plan_text(repair).encode("utf-8") == recorded.encode("utf-8")
+    before, after = (json.loads(text) for text in (recorded, repair))
+    assert {key for key in before if before[key] != after[key]} == {"graph"}
+    for a, b in zip(before["graph"]["tasks"], after["graph"]["tasks"]):
+        assert a["evidence"]["required_fields"] == ["resolved", "ambiguous", "match_count"]
+        assert b["evidence"] == {**a["evidence"],
+                                 "required_fields": ["trim", "official_model_code"]}
+        assert {key: value for key, value in a.items() if key != "evidence"} == \
+            {key: value for key, value in b.items() if key != "evidence"}
+    assert repair.count(EV_REPAIRED) == len(after["graph"]["tasks"]) == 11
+    for key in ("preparation", "workers", "verifier", "tool_results", "snapshot_rows",
+                "models", "objective"):
+        assert derived[key] == original[key], key
+    assert derived["provenance"]["commander[1]"]["source"].startswith(EV_PROVENANCE)
+
+
+def test_the_repaired_t_batch_completes_with_no_unmet_evidence():
+    """EV-4/EV-5: the SAME 11 resolved candidates, now requiring fields their
+    evidence carries, end completed with no EVIDENCE_REQUIREMENTS_UNMET."""
+    report = replay(load_manifest(FIXTURES["29eb076c-ev"]))
+    result = report.result
+    assert report.terminal == "result"
+    assert report.retry_reasons == [["commander", "planning",
+                                     "EVIDENCE_FIELD_NOT_PRODUCIBLE"]]
+    assert result["status"] == "complete"
+    assert result["result_kind"] == "usable_result"
+    assert len(result["vehicles"]) == 11 and result["unresolved_groups"] == []
+    assert result["needs_review"] == []
+    assert report.model_calls == 14
+    assert report.unconsumed_completions == {} and report.unconsumed_tool_results == []
+
+
 # --- the replay is strict ------------------------------------------------------
 
 def _aa() -> dict:

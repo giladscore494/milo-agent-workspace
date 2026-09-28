@@ -318,6 +318,11 @@ class ToolOperationDescriptor:
     #: allowlist governs (`PRODUCTION_EVIDENCE_MAPPER_OPERATIONS`); None -- not
     #: stated, never guessed -- for every other tool.
     produces_evidence: bool | None = None
+    #: PR-EV: the EXACT field names this operation's evidence can carry --
+    #: what `evidence.required_fields` may name for a task that calls it.
+    #: Stated only for an evidence-producing operation whose trusted mapper
+    #: declares them; None -- not stated, never guessed -- otherwise.
+    evidence_fields: tuple[str, ...] | None = None
 
     def as_payload(self) -> dict[str, Any]:
         payload = {"name": self.name, "description": self.description,
@@ -325,6 +330,8 @@ class ToolOperationDescriptor:
                    "output_schema": dict(self.output_schema)}
         if self.produces_evidence is not None:
             payload["produces_evidence"] = self.produces_evidence
+        if self.evidence_fields is not None:
+            payload["evidence_fields"] = list(self.evidence_fields)
         return payload
 
 
@@ -367,8 +374,22 @@ def production_evidence_operations() -> frozenset[tuple[str, str]]:
     return frozenset(PRODUCTION_EVIDENCE_MAPPER_OPERATIONS)
 
 
+def production_evidence_field_names() -> dict[tuple[str, str], frozenset[str]]:
+    """PR-EV: the field names each production evidence operation can carry.
+
+    Read from the production evidence mappers themselves -- each mapper's own
+    declared field table -- and never restated here. Imported lazily for the
+    same reason as `production_evidence_operations`.
+    """
+    from backend.engines.swarm_v2.evidence_mapping import production_evidence_fields
+
+    return production_evidence_fields()
+
+
 def _describe(tool: Tool,
-              evidence_operations: frozenset[tuple[str, str]] = frozenset()) -> ToolDescriptor:
+              evidence_operations: frozenset[tuple[str, str]] = frozenset(),
+              evidence_fields: Mapping[tuple[str, str], frozenset[str]] | None = None,
+              ) -> ToolDescriptor:
     if not TOOL_NAME_PATTERN.fullmatch(str(tool.name or "")):
         raise ValueError(f"invalid tool name: {tool.name!r}")
     if not tool.description or len(tool.description) > MAX_TOOL_DESCRIPTION_CHARS:
@@ -392,11 +413,15 @@ def _describe(tool: Tool,
         # Reject unsafe/ambiguous contracts at registration, not invocation.
         validate_schema(operation.input_schema, f"{tool.name}.{operation.name}.input_schema")
         validate_schema(operation.output_schema, f"{tool.name}.{operation.name}.output_schema")
+        produces = (tool.name, operation.name) in evidence_operations if governed else None
+        fields = (evidence_fields or {}).get((tool.name, operation.name))
         described.append(ToolOperationDescriptor(
             operation.name, operation.description,
             _json_copy(operation.input_schema), _json_copy(operation.output_schema),
-            produces_evidence=((tool.name, operation.name) in evidence_operations
-                               if governed else None)))
+            produces_evidence=produces,
+            # PR-EV: only an operation that produces evidence names its fields.
+            evidence_fields=(tuple(sorted(fields)) if produces and fields is not None
+                             else None)))
     # Deterministic ordering: identical registrations always produce an
     # identical catalog, so a Commander prompt is byte-stable across processes.
     described.sort(key=lambda item: item.name)
@@ -406,19 +431,31 @@ def _describe(tool: Tool,
 
 class ToolRegistry:
     def __init__(self, tools: Iterable[Tool] = (), *,
-                 evidence_operations: Iterable[tuple[str, str]] | None = None):
+                 evidence_operations: Iterable[tuple[str, str]] | None = None,
+                 evidence_fields: Mapping[tuple[str, str], Iterable[str]] | None = None):
         self._tools: dict[str, Tool] = {}
         self._descriptors: dict[str, ToolDescriptor] = {}
         # PR-V: which operations produce evidence comes from the authoritative
         # production allowlist unless trusted wiring states its own.
         evidence = frozenset(production_evidence_operations() if evidence_operations is None
                              else evidence_operations)
+        # PR-EV: and which field names that evidence can carry comes from the
+        # production mappers, unless trusted wiring states its own. Wiring that
+        # states its own operations but no fields states no fields.
+        if evidence_fields is None:
+            evidence_fields = (production_evidence_field_names()
+                               if evidence_operations is None else {})
+        if any(isinstance(names, str) for names in evidence_fields.values()):
+            raise ValueError("evidence fields must be a collection of names")
+        fields = {tuple(key): frozenset(names) for key, names in evidence_fields.items()}
+        if not set(fields) <= evidence:
+            raise ValueError("evidence fields named for an operation that produces no evidence")
         for tool in tools:
             if tool.name in self._tools:
                 raise ValueError(f"duplicate tool: {tool.name}")
             if tool.mode not in (ToolMode.READ, ToolMode.WRITE) or not tool.required_scope:
                 raise ValueError(f"invalid tool contract: {tool.name}")
-            self._descriptors[tool.name] = _describe(tool, evidence)
+            self._descriptors[tool.name] = _describe(tool, evidence, fields)
             self._tools[tool.name] = tool
         catalog = json.dumps(self.descriptor_payload(), sort_keys=True,
                              separators=(",", ":"), ensure_ascii=True)

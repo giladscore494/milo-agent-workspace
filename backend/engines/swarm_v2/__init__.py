@@ -44,7 +44,8 @@ from .evidence_mapping import (EVIDENCE_MAPPING_REASONS, NO_EVIDENCE,
                                PRODUCTION_EVIDENCE_MAPPER_OPERATIONS,
                                AcquiredEvidence, EvidenceMapper, EvidenceMapperRegistry,
                                EvidenceMappingError, RegisteredOperationEvidenceSink,
-                               TrustedEvidenceAcquisition, production_evidence_mappers)
+                               TrustedEvidenceAcquisition, production_evidence_fields,
+                               production_evidence_mappers)
 from .models import CommanderModelError, CommanderModelResolver
 from .validation import (VALIDATION_REASONS, PlanJsonError, PlanLimitError, PlanLimits,
                          PlanSchemaError, PlanValidationError, PlanValidator,
@@ -130,7 +131,7 @@ __all__ += ["EVIDENCE_CONTRACT_REASONS", "EVIDENCE_MAPPING_REASONS", "FRAGMENT_T
             "MAX_SOURCE_VERSION_CHARS", "MAX_SOURCE_VERSION_KEY_CHARS", "MAX_UNIT_CHARS",
             "NO_EVIDENCE", "PRODUCTION_EVIDENCE_MAPPER_OPERATIONS",
             "RegisteredOperationEvidenceSink", "SOURCE_VERSION_KINDS", "AcquiredEvidence",
-            "production_evidence_mappers",
+            "production_evidence_fields", "production_evidence_mappers",
             "EvidenceBundle", "EvidenceContractError", "EvidenceLocator", "EvidenceMapper",
             "EvidenceMapperRegistry", "EvidenceMappingError", "FocusedEvidenceFragment",
             "SourceVersion", "StructuredEvidenceFact", "TrustedEvidenceAcquisition",

@@ -35,6 +35,10 @@ VALIDATION_REASONS = frozenset({
     # PR-V: a task whose every planned call is to an operation that can never
     # produce evidence declared evidence requirements (run aa63369b).
     "EVIDENCE_REQUIRES_EVIDENCE_TOOL",
+    # PR-EV: evidence.required_fields named a field none of the task's
+    # evidence-producing calls can evidence -- run 29eb076c required the
+    # resolve_variant OUTPUT keys resolved/ambiguous/match_count.
+    "EVIDENCE_FIELD_NOT_PRODUCIBLE",
     # PR-Z3: a resolve_variant call for a handed queue item that carries its
     # register codes must state them; codes naming no handed item are refused.
     "REGISTER_CODES_REQUIRED",
@@ -199,6 +203,7 @@ PROVIDER_PLAN_RULES = (
     "Each assignment's context_task_ids must contain the COMPLETE direct and transitive dependency closure of its task.",
     "If a task declares evidence.minimum_sources > 0 or any evidence.required_fields, its completion.evidence_satisfied must be true; completion criteria can never disable evidence requirements.",
     "Only an operation the tool catalog marks \"produces_evidence\": true can produce evidence. A task whose every planned call is to an operation marked \"produces_evidence\": false (for example a listing such as get_variants) must declare evidence.minimum_sources 0 and no evidence.required_fields; put the evidence requirement on a task that calls an evidence-producing operation (resolve_variant).",
+    "evidence.required_fields names CATALOG FIELDS, never tool output keys: every name must appear in the \"evidence_fields\" the tool catalog lists for an evidence-producing operation among that task's planned calls. A tool OUTPUT key (for example resolve_variant's resolved, ambiguous or match_count) is never an evidence field. An ambiguous or not-found register answer explains its own evidence gap; do not add a required field to cover it.",
     "Every output_schema must be a JSON object schema with properties, a non-empty required list of existing properties, and additionalProperties=false.",
     "Every output_schema property must be a scalar (string/integer/number/boolean) or an array of scalars with \"items\". Supported keywords: type, properties, required, additionalProperties, items, description (a string), enum (on a string/integer/number/boolean property: a non-empty list of unique values of that type), minimum/maximum (integer/number), minLength/maxLength (string) and minItems/maxItems (array); enum and the bounds are enforced at run time and every lower bound must not exceed its upper bound. Unsupported annotation keywords (title, default, examples, format, pattern, $schema, $id, $comment, readOnly, writeOnly, deprecated) are removed; any other keyword (oneOf, anyOf, allOf, not, $ref, const, patternProperties, uniqueItems, ...) is rejected. Do not copy raw tool material (variants, provenance) into task output: evidence comes from the tool, not from the worker output.",
     "Every name in a task's completion.required_outputs must appear both in that task's output_schema.required and in its output_schema.properties; completion may only require outputs the task's own output_schema requires.",
@@ -259,10 +264,41 @@ SOURCE_FIRST_TOOL_POLICY: Mapping[str, tuple[str, ...]] = {
 }
 
 
+def evidence_field_rule(tool: str, operation: str, fields: Collection[str]) -> str:
+    """PR-EV: the one line naming the evidence fields ONE operation can carry.
+
+    `fields` is server data -- a descriptor's `evidence_fields`, or the
+    production mapper's own field table -- never model output.
+    """
+    names = ", ".join(sorted(fields))
+    return (f"{tool}.{operation}: evidence.required_fields may name only these catalog fields: "
+            f"{names}; never one of {operation}'s output keys. An answer that evidences "
+            "nothing (for example an ambiguous or not-found register answer) explains its "
+            "own gap.")
+
+
+def _production_evidence_field_rules(name: str) -> list[str]:
+    """The evidence-field lines for one REGISTERED tool name, from production.
+
+    Imported lazily: the production mappers live in the catalog package, which
+    imports this engine package's evidence contracts.
+    """
+    from .evidence_mapping import production_evidence_fields
+
+    return [evidence_field_rule(tool, operation, fields)
+            for (tool, operation), fields in sorted(production_evidence_fields().items())
+            if tool == name]
+
+
 def source_policy_rules(allowed_tools: Collection[str]) -> list[str]:
-    """The source-first rules the REGISTERED tools bring, in a stable order."""
+    """The source-first rules the REGISTERED tools bring, in a stable order.
+
+    PR-EV: followed, per tool, by the evidence fields each of its production
+    evidence operations can carry (EV-3), read from the mapper that emits them.
+    """
     return [rule for name in sorted(set(allowed_tools))
-            for rule in SOURCE_FIRST_TOOL_POLICY.get(name, ())]
+            for rule in (*SOURCE_FIRST_TOOL_POLICY.get(name, ()),
+                         *_production_evidence_field_rules(name))]
 
 
 def provider_plan_policy(limits: PlanLimits,
@@ -415,6 +451,7 @@ class PlanValidator:
             total_tool_calls += len(task.tools)
             self._validate_tool_calls(task)
             self._validate_evidence_tool(task)
+            self._validate_evidence_fields(task)
         if total_tool_calls > limits.max_tool_calls:
             raise PlanLimitError("aggregate tool call limit exceeded",
                                  reason="AGGREGATE_TOOL_CALL_LIMIT")
@@ -502,6 +539,41 @@ class PlanValidator:
             raise PlanValidationError(
                 "evidence requirements need an evidence-producing tool operation",
                 reason="EVIDENCE_REQUIRES_EVIDENCE_TOOL")
+
+    def _validate_evidence_fields(self, task: DynamicTask) -> None:
+        """PR-EV: every required field must be one the task's calls can evidence.
+
+        Run 29eb076c required `resolved`, `ambiguous` and `match_count` -- the
+        resolve_variant OUTPUT keys -- on every task, while its evidence is
+        recorded under catalog field names. The engine requires
+        required_fields <= evidenced fields, so all 11 resolved tasks were paid
+        for and then reported EVIDENCE_REQUIREMENTS_UNMET.
+
+        The producible set is the union of `evidence_fields` over the task's
+        calls to operations that produce evidence. Decided only when every
+        call's operation STATES what it produces: a call to an operation that
+        states nothing (`produces_evidence` None), or an evidence operation
+        whose fields are not stated, leaves the task as it was. A task whose
+        calls produce no evidence at all is `_validate_evidence_tool`'s
+        refusal, which runs first. The plan is refused, never rewritten.
+        """
+        required = set(task.evidence.required_fields)
+        if not required or not task.tools:
+            return
+        producible: set[str] = set()
+        for call in task.tools:
+            operation = self._tools[call.name].operation(call.operation)
+            if operation is None or operation.produces_evidence is None:
+                return
+            if not operation.produces_evidence:
+                continue
+            if operation.evidence_fields is None:
+                return
+            producible.update(operation.evidence_fields)
+        if producible and not required <= producible:
+            raise PlanValidationError(
+                "evidence.required_fields names a field no planned call can evidence",
+                reason="EVIDENCE_FIELD_NOT_PRODUCIBLE")
 
     def _validate_call_arguments(self, task: DynamicTask, call: PlannedToolCall,
                                  input_schema: Any) -> None:

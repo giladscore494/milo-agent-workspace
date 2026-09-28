@@ -31,6 +31,7 @@ from backend.engines.swarm_v2 import (BoundedTaskExecutor, Commander, CommanderM
                                       EvidenceReference, FinalBuilder, GenericWorker,
                                       PlanLimits, PlanValidator, SwarmV2Engine, TaskResult,
                                       Verifier, validate_product_outcome)
+from backend.engines.swarm_v2.evidence_mapping import PRODUCTION_EVIDENCE_MAPPER_OPERATIONS
 from backend.engines.swarm_v2.failures import (EXECUTION_FAILURE_CODES,
                                                EXECUTION_FAILURE_MESSAGES,
                                                SwarmExecutionFailure)
@@ -108,6 +109,18 @@ class ReplayRegister:
                 "variants": [variant(record_id, payload["commercial_model"], code)],
                 "source_record": {"upstream_record_id": record_id},
                 "provenance": dict(PROVENANCE)}
+
+
+#: PR-EV: what the stand-in `EvidenceSink` below records claims under. This
+#: test's trusted wiring states it on the descriptor, exactly as production
+#: states the real mapper's fields, so the plan firewall holds the plan's
+#: required_fields to what THIS sink can evidence.
+STAND_IN_EVIDENCE_FIELDS = {(GOVERNMENT_TOOL_NAME, "resolve_variant"): ["model_code"]}
+
+
+def register_tools(register: "ReplayRegister") -> ToolRegistry:
+    return ToolRegistry([register], evidence_operations=PRODUCTION_EVIDENCE_MAPPER_OPERATIONS,
+                        evidence_fields=STAND_IN_EVIDENCE_FIELDS)
 
 
 class EvidenceSink:
@@ -199,7 +212,7 @@ def build(plan: dict, decisions: list[dict], *, register: ReplayRegister | None 
           checkpoints: list | None = None):
     run_id = str(uuid4())
     register = register or ReplayRegister()
-    tools = ToolRegistry([register])
+    tools = register_tools(register)
     sink = EvidenceSink(run_id)
     context = ToolContext(scopes=frozenset({GOVERNMENT_TOOL_SCOPE}))
 
@@ -548,7 +561,7 @@ def test_the_commander_is_told_to_accept_ambiguity_for_duplicate_verification():
     assert rule not in provider_plan_policy(PlanLimits(), ["search"])["source_policy"]
     # And the firewall admits such a task either way: the typed outcome, not
     # the flag, is what makes an ambiguity satisfy completion.
-    validator = PlanValidator(allowed_tools=ToolRegistry([ReplayRegister()]).descriptors())
+    validator = PlanValidator(allowed_tools=register_tools(ReplayRegister()).descriptors())
     for allow_partial in (True, False):
         validator.validate(gov_plan([gov_task("t04", [
             gov_call("c1", "4RUNNER", AMBIGUOUS_CODE), gov_call("c2", "4RUNNER", AMBIGUOUS_CODE)],

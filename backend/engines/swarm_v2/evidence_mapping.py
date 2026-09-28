@@ -119,6 +119,10 @@ class EvidenceMapper(Protocol):
     registered for, and returns a complete `EvidenceBundle`.  It never
     performs a network call, a database read, a provider call or a tool call,
     and it never consults a model.
+
+    PR-EV: a mapper MAY also declare `evidence_fields`, the exact field keys a
+    bundle it returns can state. One that declares none states nothing, and no
+    plan-time check is derived from it.
     """
 
     tool: str
@@ -152,6 +156,10 @@ class EvidenceMapperRegistry:
 
     def mapper_for(self, tool: str, operation: str) -> EvidenceMapper | None:
         return self._mappers.get((str(tool), str(operation)))
+
+    def evidence_fields(self) -> dict[tuple[str, str], frozenset[str]]:
+        """PR-EV: the field keys each registered mapper DECLARES it can state."""
+        return declared_evidence_fields(self._mappers.values())
 
     def map(self, record: Any) -> EvidenceBundle:
         """Convert ONE validated tool result into a validated evidence bundle.
@@ -213,6 +221,26 @@ class EvidenceMapperRegistry:
         return bundle
 
 
+def declared_evidence_fields(mappers: Iterable[Any]) -> dict[tuple[str, str], frozenset[str]]:
+    """PR-EV: `(tool, operation) -> evidence_fields` as each mapper declares it.
+
+    Works on mapper instances and on mapper classes alike (the three names are
+    class attributes). Only mappers that declare `evidence_fields` appear; one
+    that declares nothing is absent -- not stated, never guessed.
+    """
+    declared: dict[tuple[str, str], frozenset[str]] = {}
+    for mapper in mappers:
+        key = (str(getattr(mapper, "tool", "")), str(getattr(mapper, "operation", "")))
+        fields = getattr(mapper, "evidence_fields", None)
+        if fields is None:
+            continue
+        if isinstance(fields, str) or not all(isinstance(item, str) and item
+                                              for item in fields):
+            raise ValueError(f"invalid evidence fields: {key[0]}.{key[1]}")
+        declared[key] = frozenset(fields)
+    return declared
+
+
 #: The production allowlist, as static data: the exact `(tool, operation)`
 #: pairs whose results may become evidence in a release.
 #:
@@ -226,6 +254,16 @@ class EvidenceMapperRegistry:
 PRODUCTION_EVIDENCE_MAPPER_OPERATIONS = frozenset({
     ("catalog.government_vehicle", "resolve_variant"),
 })
+
+
+def _production_mapper_types() -> tuple[type, ...]:
+    """The production mapper CLASSES -- the one list both functions below read.
+
+    Imported lazily; see `production_evidence_mappers` for why.
+    """
+    from backend.catalog.government.evidence import GovernmentVariantEvidenceMapper
+
+    return (GovernmentVariantEvidenceMapper,)
 
 
 def production_evidence_mappers() -> EvidenceMapperRegistry:
@@ -245,15 +283,31 @@ def production_evidence_mappers() -> EvidenceMapperRegistry:
     registering its tool would be inert; registering the tool without the
     mapper would make its results material that nothing can turn into evidence.
     """
-    from backend.catalog.government.evidence import GovernmentVariantEvidenceMapper
-
-    registry = EvidenceMapperRegistry((GovernmentVariantEvidenceMapper(),))
+    registry = EvidenceMapperRegistry(tuple(mapper() for mapper in _production_mapper_types()))
     if registry.registered != PRODUCTION_EVIDENCE_MAPPER_OPERATIONS:
         # The literal list above is what a reviewer and a test read. If the
         # built registry ever disagrees with it, the documented allowlist is
         # wrong -- which is exactly the drift this check exists to refuse.
         raise ValueError("the production evidence mapper allowlist does not match its declaration")
     return registry
+
+
+def production_evidence_fields() -> dict[tuple[str, str], frozenset[str]]:
+    """PR-EV: the field keys each PRODUCTION evidence operation can state.
+
+    Read from the production mappers themselves -- for
+    `catalog.government_vehicle.resolve_variant`, the Government evidence
+    mapper's own field table -- so the tool descriptor, the Commander's rule
+    and the plan firewall all name exactly what the trusted sink can record.
+
+    Read from the mapper CLASSES, without building the registry: describing a
+    tool is not wiring the trusted sink, which trusted wiring does exactly once
+    (`production_evidence_mappers`).
+    """
+    declared = declared_evidence_fields(_production_mapper_types())
+    if not set(declared) <= PRODUCTION_EVIDENCE_MAPPER_OPERATIONS:
+        raise ValueError("evidence fields declared for an operation outside the allowlist")
+    return declared
 
 
 @dataclass(frozen=True)
@@ -350,4 +404,4 @@ __all__ = ["EVIDENCE_MAPPING_REASONS", "NO_EVIDENCE",
            "PRODUCTION_EVIDENCE_MAPPER_OPERATIONS", "AcquiredEvidence", "EvidenceMapper",
            "EvidenceMapperRegistry", "EvidenceMappingError",
            "RegisteredOperationEvidenceSink", "TrustedEvidenceAcquisition",
-           "production_evidence_mappers"]
+           "declared_evidence_fields", "production_evidence_fields", "production_evidence_mappers"]

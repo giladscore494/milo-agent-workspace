@@ -121,6 +121,16 @@ GOVERNMENT_FIELD_SOURCES: tuple[tuple[str, str, tuple[str, ...], str | None], ..
      ("tozar", "kinuy_mishari", "shnat_yitzur", "delek_nm"), None),
 )
 
+#: PR-EV: the EXACT field names a `resolve_variant` evidence bundle can carry --
+#: the field keys of `GOVERNMENT_FIELD_SOURCES`, read from it rather than
+#: restated, so the descriptor the Commander sees and the plan firewall that
+#: holds `evidence.required_fields` to it can never name a field this mapper
+#: does not emit. Run 29eb076c required `resolved`/`ambiguous`/`match_count` --
+#: the tool's OUTPUT keys, never evidence fields -- and every task was paid for
+#: and then reported EVIDENCE_REQUIREMENTS_UNMET.
+GOVERNMENT_EVIDENCE_FIELDS: tuple[str, ...] = tuple(
+    field_key for field_key, _register, _context, _unit in GOVERNMENT_FIELD_SOURCES)
+
 #: candidate identity dimension -> the evidence identity dimension it states.
 #: Only the dimensions BOTH closed vocabularies name: a dimension one side does
 #: not have is left unstated rather than translated into the nearest word.
@@ -167,6 +177,8 @@ class GovernmentVariantEvidenceMapper:
 
     tool = GOVERNMENT_TOOL_NAME
     operation = RESOLVE_VARIANT_OPERATION
+    #: PR-EV: every field key a bundle from this mapper can state.
+    evidence_fields = GOVERNMENT_EVIDENCE_FIELDS
 
     def map(self, call: Any) -> EvidenceBundle | Any:
         result = call.result
@@ -282,7 +294,8 @@ class GovernmentVariantEvidenceMapper:
             confidence=GOVERNMENT_CONFIDENCE)
 
 
-__all__ = ["GOVERNMENT_AGENT", "GOVERNMENT_CONFIDENCE", "GOVERNMENT_FIELD_SOURCES",
+__all__ = ["GOVERNMENT_AGENT", "GOVERNMENT_CONFIDENCE", "GOVERNMENT_EVIDENCE_FIELDS",
+           "GOVERNMENT_FIELD_SOURCES",
            "GOVERNMENT_SOURCE_STRENGTH", "GOVERNMENT_SOURCE_TYPE", "GOVERNMENT_TOOL_NAME",
            "IDENTITY_DIMENSION_MAP", "RESOLVE_VARIANT_OPERATION",
            "GovernmentVariantEvidenceMapper", "government_entity_key",
