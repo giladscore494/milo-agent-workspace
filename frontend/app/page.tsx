@@ -1,7 +1,7 @@
 'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, api, executionUiEnabled, newIdempotencyKey, type WorkScopeInput } from '@/lib/api';
-import { safeErrorText } from '@/lib/errorText';
+import { preparationRequestErrorText, safeErrorText } from '@/lib/errorText';
 import {
   INITIAL_WORKSPACE_SCOPE,
   PendingRequest,
@@ -1193,7 +1193,7 @@ export default function WorkspacePage() {
       }
     } catch (error) {
       if (!ownsConversation(owner, scope.current)) return;
-      setPlanPreparationError(safeErrorText(error, 'The revision could not be prepared.'));
+      setPlanPreparationError(preparationRequestErrorText(error));
       loadPlanPreparation(state.id, head, owner, true);
     } finally {
       setPreparationBusy(current => settlePending(current, pending));

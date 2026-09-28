@@ -116,6 +116,17 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['WORK_SCOPE_BATCH_NOT_NEXT', 'That batch is no longer the next one, so nothing was started. The progress has been reloaded.'],
   ['WORK_SCOPE_BATCH_IN_PROGRESS', 'Another batch of this plan is still running, so nothing was started.'],
   ['WORK_SCOPE_BATCH_ALREADY_COMPLETED', 'That batch has already finished, so it was not started again.'],
+  // Preparing ONE plan revision from the website (E'). Each is a refusal the
+  // server answered with its own static code
+  // (backend/catalog/scope/web_preparation.py REQUEST_REASONS); the status is
+  // read again after every one. Only the TRIGGER_FAILED refusal comes after
+  // anything was recorded, and it may be retried.
+  ['WORK_SCOPE_PREPARATION_DISABLED', 'Preparing from the website is not enabled on this server, so nothing was started.'],
+  ['WORK_SCOPE_PREPARATION_JOB_NOT_RELEASE', 'The capture job does not run the deployed release, so nothing was started. An operator must update the capture job first.'],
+  ['WORK_SCOPE_PREPARATION_JOB_UNREADABLE', 'The server could not read the capture job or the worker job, so nothing was started. An operator must give the server read access to both jobs.'],
+  ['WORK_SCOPE_PREPARATION_TRIGGER_FAILED', 'The capture job could not be started. Prepare can be tried again.'],
+  ['WORK_SCOPE_PREPARATION_NEEDS_OPERATOR', 'The last preparation stopped part way, so a new one was not started. An operator reconciles it first.'],
+
   // An ordinary task in a project whose runs read the Government catalog:
   // catalog work starts only from a prepared Mapping Plan batch. Nothing was
   // created.
@@ -201,6 +212,27 @@ export function safeErrorText(error: unknown, fallback: string): string {
   if (code === undefined) return fallback;
   const copy = ERROR_COPY.get(code) ?? fallback;
   return codeIsDisplayable(code) ? `${copy} (${code})` : copy;
+}
+
+/**
+ * Every static code the Prepare route refuses with (backend REQUEST_REASONS,
+ * plus the stale plan it shares with the plan editor). Exported for tests.
+ */
+export const PREPARATION_REFUSAL_CODES: readonly string[] = [
+  'WORK_SCOPE_PREPARATION_DISABLED',
+  'WORK_SCOPE_PREPARATION_JOB_NOT_RELEASE',
+  'WORK_SCOPE_PREPARATION_JOB_UNREADABLE',
+  'WORK_SCOPE_PREPARATION_TRIGGER_FAILED',
+  'WORK_SCOPE_PREPARATION_NEEDS_OPERATOR',
+  'WORK_SCOPE_STALE',
+];
+
+/** The Prepare button's own sentence when a refusal carries no code of ours. */
+export const PREPARATION_REQUEST_FALLBACK = 'The revision could not be prepared.';
+
+/** What the website shows when a Prepare is refused: the code's own reason. */
+export function preparationRequestErrorText(error: unknown): string {
+  return safeErrorText(error, PREPARATION_REQUEST_FALLBACK);
 }
 
 /** The classifications this application authors copy for. Exported for tests. */

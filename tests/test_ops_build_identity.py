@@ -333,6 +333,10 @@ elif args[:2] == ["services", "list"]:
     print("\n".join(json.loads(os.environ["OPS_TEST_APIS"])))
 elif args[:3] == ["storage", "buckets", "list"]:
     print("test-project_cloudbuild")
+elif args[:3] == ["run", "jobs", "get-iam-policy"]:
+    # OPS_TEST_POLICIES: {job: {role: [member, ...]}}; absent means no bindings.
+    policy = json.loads(os.environ.get("OPS_TEST_POLICIES") or "{}").get(args[3], {})
+    print(json.dumps({"bindings": [{"role": r, "members": m} for r, m in policy.items()]}))
 elif any(verb in args[:5] for verb in ("describe", "list", "get-iam-policy", "read")):
     print("{}" if "--format=json" in args else "ok")
 else:
@@ -430,6 +434,55 @@ def test_a_clean_preflight_passes_and_changes_nothing(tmp_path):
                    "gcloud builds list", "gcloud logging read",
                    "gcloud run jobs executions list", "gcloud artifacts repositories describe test-repo"):
         assert any(call.startswith(needle) for call in calls), needle
+
+
+def test_the_preflight_expects_the_api_identitys_job_bindings_and_never_makes_them(tmp_path):
+    """PR-E'2: the website's Prepare GETs the capture job and the worker job, so
+    the API identity's roles/run.viewer on each is on the preflight's expected
+    list beside the executor binding. The deployer's run.admin makes them (the
+    website stage, after the deploy); the preflight reads each job's policy,
+    reports each binding and probes run.jobs.setIamPolicy on the job itself."""
+    api = "serviceAccount:api@test-project.iam.gserviceaccount.com"
+    tree = preflight_tree(tmp_path)
+    result = run_preflight(tree, OPS_TEST_POLICIES={
+        "test-worker": {"roles/run.jobsExecutorWithOverrides": [api], "roles/run.viewer": [api]},
+        "test-capture": {"roles/run.jobsExecutorWithOverrides": [api]}})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert_changed_nothing_and_leaked_nothing(tree, result)
+    out = result.stdout
+    assert "SUMMARY|binding:worker-job:roles/run.viewer|PASS|" in out
+    assert "SUMMARY|binding:worker-job:roles/run.jobsExecutorWithOverrides|PASS|" in out
+    assert "SUMMARY|binding:capture-job:roles/run.jobsExecutorWithOverrides|PASS|" in out
+    # Not bound yet: reported, never made -- the website stage binds it.
+    assert re.search(r"^SUMMARY\|binding:capture-job:roles/run\.viewer\|INFO\|not bound yet on test-capture; "
+                     r"website-stage\.sh --stage web-preparation binds it", out, re.M)
+    calls = tree.tool_calls()
+    for job in ("test-worker", "test-capture"):
+        assert f"gcloud run jobs get-iam-policy {job} --region test-region --project test-project --format=json" \
+            in calls
+        probe = next(c for c in calls if f"/locations/test-region/jobs/{job}:testIamPermissions" in c)
+        for permission in ("run.jobs.get", "run.jobs.getIamPolicy", "run.jobs.setIamPolicy"):
+            assert permission in probe
+        assert f"SUMMARY|permissions:job-iam:{job}|PASS|" in out
+
+
+def test_the_preflight_names_a_deployer_that_cannot_bind_on_a_job(tmp_path):
+    tree = preflight_tree(tmp_path)
+    result = run_preflight(tree, OPS_TEST_DENY={"jobs/test-capture:testIamPermissions":
+                                                ["run.jobs.setIamPolicy"]})
+    assert result.returncode == 1
+    report = result.stdout.split("== Preflight report ==", 1)[1]
+    assert "run.jobs.setIamPolicy (permissions:job-iam:test-capture)" in report
+    assert_changed_nothing_and_leaked_nothing(tree, result)
+
+
+def test_the_preflight_does_not_probe_a_capture_job_that_does_not_exist_yet(tmp_path):
+    tree = preflight_tree(tmp_path)
+    result = run_preflight(tree, OPS_TEST_FAIL={"run jobs describe test-capture": [
+        1, "ERROR: (gcloud.run.jobs.describe) Cannot find job [test-capture] NOT_FOUND"]})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not [c for c in tree.tool_calls() if "jobs/test-capture:testIamPermissions" in c]
+    assert any("jobs/test-worker:testIamPermissions" in c for c in tree.tool_calls())
 
 
 def test_the_preflight_reports_every_gap_at_once(tmp_path):

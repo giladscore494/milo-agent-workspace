@@ -21,6 +21,10 @@ import {
   parseWorkScopeState, preparationReasonText,
 } from '../lib/workScope';
 import { isGatewayRequestAllowed, isRunCreationRequest } from '../lib/server/gatewayPolicy';
+import { ApiError } from '../lib/api';
+import {
+  PREPARATION_REFUSAL_CODES, PREPARATION_REQUEST_FALLBACK, preparationRequestErrorText,
+} from '../lib/errorText';
 import { CAPABILITIES, DIGEST, PLAN, stateBody } from './fixtures/workScope';
 
 function preparationBody(overrides: Record<string, unknown> = {}) {
@@ -150,6 +154,45 @@ describe('the Prepare button follows the server', () => {
     renderPreparation(preparationBody({ state: 'failed', attempt: 1, reason_code: 'GOV_TRANSPORT_FAILED' }));
     expect(screen.getByText('GOV_TRANSPORT_FAILED')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Prepare again' })).toBeEnabled();
+  });
+});
+
+describe('a refused Prepare shows its own reason (PR-E\'2)', () => {
+  // What a person must understand from each refusal, in OUR words.
+  const REASONS: Record<string, string> = {
+    WORK_SCOPE_PREPARATION_DISABLED: 'not enabled on this server',
+    WORK_SCOPE_PREPARATION_JOB_NOT_RELEASE: 'does not run the deployed release',
+    WORK_SCOPE_PREPARATION_JOB_UNREADABLE: 'could not read the capture job or the worker job',
+    WORK_SCOPE_PREPARATION_TRIGGER_FAILED: 'could not be started',
+    WORK_SCOPE_PREPARATION_NEEDS_OPERATOR: 'stopped part way',
+    WORK_SCOPE_STALE: 'changed since you opened it',
+  };
+  const UPSTREAM = "Permission 'run.jobs.get' denied on https://run.googleapis.com/v2/projects/p/jobs/x";
+
+  function renderRefusal(error: unknown) {
+    render(<MappingPlanPreparation serverCanPrepare revision={1} preparation={parsePreparation(preparationBody())}
+      loading={false} busy={false} error={preparationRequestErrorText(error)} unitName={(key) => key}
+      onPrepare={() => {}} onRefresh={() => {}} />);
+    return screen.getByRole('alert').textContent ?? '';
+  }
+
+  it('covers every code the Prepare route refuses with', () => {
+    expect([...PREPARATION_REFUSAL_CODES].sort()).toEqual(Object.keys(REASONS).sort());
+  });
+
+  for (const code of Object.keys(REASONS)) {
+    it(`renders the reason for ${code}, never the generic sentence or upstream text`, () => {
+      const shown = renderRefusal(new ApiError(code === 'WORK_SCOPE_PREPARATION_DISABLED' ? 503 : 409, code, UPSTREAM));
+      expect(shown).toContain(REASONS[code]);
+      expect(shown).toContain(`(${code})`);
+      expect(shown).not.toContain(PREPARATION_REQUEST_FALLBACK);
+      expect(shown).not.toContain('run.googleapis.com');
+      expect(shown).not.toContain('run.jobs.get');
+    });
+  }
+
+  it('falls back to the generic sentence only for a code that is not ours', () => {
+    expect(renderRefusal(new ApiError(502, 'REPOSITORY_ERROR', UPSTREAM))).toBe(PREPARATION_REQUEST_FALLBACK);
   });
 });
 

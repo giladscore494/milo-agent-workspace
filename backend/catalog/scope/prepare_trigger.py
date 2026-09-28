@@ -19,7 +19,10 @@ Identity: Application Default Credentials on the API's own service account --
 no key file is read, stored or accepted. That account holds
 `roles/run.jobsExecutorWithOverrides` on THIS one job only (granted by
 `government-production-capture.sh --ensure-job`), plus the same role it
-already holds on the product worker job.
+already holds on the product worker job, and `roles/run.viewer` on those two
+jobs only (`website-execution-activate.sh --apply-web-preparation`): the
+executor role does not carry `run.jobs.get`, and `release_refusal` GETs both
+jobs. Without the read, every Prepare is refused `JOB_UNREADABLE`.
 
 Fail closed on the image
 ------------------------

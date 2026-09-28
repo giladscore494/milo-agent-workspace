@@ -312,13 +312,37 @@ if [[ -n "$(milo_op SECRET_PROVIDER_API_KEY)" ]]; then
 fi
 check "api-service" required gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" --format=json
 check "worker-job" required gcloud run jobs describe "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --format=json
+CAPTURE_JOB_EXISTS=0
 if [[ -n "$CAPTURE_JOB" ]]; then
   check "capture-job" optional gcloud run jobs describe "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --format=json
+  CAPTURE_JOB_EXISTS="$CHECK_OK"
 fi
 check "api-service-policy" required \
   gcloud run services get-iam-policy "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" --format=json
-check "worker-job-policy" required \
-  gcloud run jobs get-iam-policy "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --format=json
+# The expected job-level bindings for the API identity, each on that job only:
+# the executor binding (cloud-run.sh on the worker, the website stage on the
+# capture job) and the READ binding the website's Prepare route needs on both
+# jobs (MILO_API_JOB_READ_ROLE, bound by website-execution-activate.sh
+# --apply-web-preparation). The deployer makes them with run.admin; here each
+# job's policy is read and each binding reported, never made. One not there
+# yet is INFO: the deploy's website stage binds it and reads it back.
+API_MEMBER="serviceAccount:$(milo_op API_SERVICE_ACCOUNT)"
+API_JOB_ROLES=("roles/run.jobsExecutorWithOverrides" "$MILO_API_JOB_READ_ROLE")
+BINDING_JOBS=("worker:${WORKER_JOB}:required")
+[[ -n "$CAPTURE_JOB" ]] && BINDING_JOBS+=("capture:${CAPTURE_JOB}:optional")
+for entry in "${BINDING_JOBS[@]}"; do
+  IFS=: read -r which job mode <<< "$entry"
+  check "${which}-job-policy" "$mode" \
+    gcloud run jobs get-iam-policy "$job" --region "$REGION" --project "$PROJECT_ID" --format=json
+  [[ "$CHECK_OK" -eq 1 ]] || continue
+  for role in "${API_JOB_ROLES[@]}"; do
+    if milo_policy_has_member "$role" "$API_MEMBER" < "$OUT"; then
+      summary "binding:${which}-job:${role}" PASS "${API_MEMBER#serviceAccount:} holds ${role} on ${job}"
+    else
+      summary "binding:${which}-job:${role}" INFO "not bound yet on ${job}; website-stage.sh --stage web-preparation binds it and reads it back"
+    fi
+  done
+done
 check "worker-executions" required \
   gcloud run jobs executions list --job "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --limit 1 \
   --format='value(metadata.name)'
@@ -356,6 +380,15 @@ for account in "${RUNTIME_ACCOUNTS[@]}"; do
   probe "act-as:${account%@*}" \
     "https://iam.googleapis.com/v1/projects/-/serviceAccounts/${account}:testIamPermissions" POST held \
     iam.serviceAccounts.actAs
+done
+# The deployer may read and set each job's IAM policy (the bindings above),
+# on the job itself. A capture job that does not exist yet has nothing to probe.
+PROBE_JOBS=("$WORKER_JOB")
+[[ -n "$CAPTURE_JOB" && ( "$CAPTURE_JOB_EXISTS" -eq 1 || "$DRY_RUN" -eq 1 ) ]] && PROBE_JOBS+=("$CAPTURE_JOB")
+for job in "${PROBE_JOBS[@]}"; do
+  probe "permissions:job-iam:${job}" \
+    "https://run.googleapis.com/v2/projects/${PROJECT_ID}/locations/${REGION}/jobs/${job}:testIamPermissions" \
+    POST held run.jobs.get run.jobs.getIamPolicy run.jobs.setIamPolicy
 done
 probe "build-source-bucket-upload" \
   "https://storage.googleapis.com/storage/v1/b/${BUILD_BUCKET_NAME}/iam/testPermissions?permissions=storage.buckets.get&permissions=storage.objects.create" \

@@ -160,6 +160,35 @@ milo_contains() {
   return 1
 }
 
+# ---------------------------------------------------------------------------
+# The API identity's READ binding on the jobs its Prepare route GETs (PR-E'2)
+# ---------------------------------------------------------------------------
+# Before the website's Prepare starts anything, the API reads BOTH the capture
+# job and the product worker job (backend/catalog/scope/prepare_trigger.py,
+# release_refusal) to prove the capture job runs the deployed release image.
+# roles/run.jobsExecutorWithOverrides does NOT carry run.jobs.get, so without
+# this binding every Prepare is refused 409
+# WORK_SCOPE_PREPARATION_JOB_UNREADABLE before anything is written.
+# roles/run.viewer, bound on those two JOBS only -- never project-wide.
+# website-execution-activate.sh --apply-web-preparation binds and reads it back;
+# the deployer's roles/run.admin (run.jobs.setIamPolicy) covers the binding.
+MILO_API_JOB_READ_ROLE="roles/run.viewer"
+
+# milo_policy_has_member ROLE MEMBER < POLICY_JSON — success when the IAM
+# policy on stdin binds MEMBER to ROLE unconditionally.
+milo_policy_has_member() {
+  python3 -c '
+import json, sys
+try:
+    policy = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    sys.exit(1)
+bindings = policy.get("bindings") if isinstance(policy, dict) else None
+sys.exit(0 if any(isinstance(b, dict) and b.get("role") == sys.argv[1] and not b.get("condition")
+                  and sys.argv[2] in (b.get("members") or []) for b in bindings or []) else 1)
+' "$1" "$2"
+}
+
 # PR-R model contract, worker only (SCOPED_BATCH_PRODUCTION_RUNBOOK.md E.1):
 # the three model names the worker must carry. Boot refuses an unprofiled or
 # unallowlisted model but NOT a worker left on the old values, so the deploy

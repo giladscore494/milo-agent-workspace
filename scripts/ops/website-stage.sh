@@ -8,9 +8,12 @@
 #   web-preparation  E', the Prepare button: the capture job on the release
 #                    image (government-production-capture.sh --ensure-job
 #                    --enable-catalog-execution), then
-#                    MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API and
+#                    MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API,
 #                    the API identity's run-with-overrides binding on that job
-#                    only (website-execution-activate.sh --apply-web-preparation)
+#                    only, and its roles/run.viewer binding on the capture and
+#                    worker jobs only, read back -- the Prepare route reads
+#                    both before it starts anything
+#                    (website-execution-activate.sh --apply-web-preparation)
 #   both             the two above, in that order
 #   none             nothing
 #
@@ -108,7 +111,7 @@ if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" ]]; then
     "the capture job was not ensured (above); the Prepare button stays off" \
     "${capture[@]}" --ensure-job --enable-catalog-execution
   run_step "$(step_name 3 c web-preparation)" \
-    "E' (the Prepare button): MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API; paid execution and preparation read back OFF" \
+    "E' (the Prepare button): the API identity reads the capture and worker jobs (${MILO_API_JOB_READ_ROLE}, read back); MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API; paid execution and preparation read back OFF" \
     "E' was not applied (above); the Prepare button stays off" \
     "${activate[@]}" --apply-web-preparation
 fi
