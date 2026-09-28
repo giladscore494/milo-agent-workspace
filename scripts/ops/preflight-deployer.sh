@@ -16,7 +16,9 @@
 #     MISSING RESOURCE;
 #   * testIamPermissions probes -- read-only by definition -- for what no
 #     read-only call can prove: cloudbuild.builds.create and the rest of the
-#     project permissions the deploy uses, iam.serviceAccounts.actAs on the
+#     project permissions the deploy uses, the async build path's own
+#     (cloudbuild.builds.get to poll a build, logging.logEntries.list to read
+#     a failed build's log, artifactregistry.dockerimages.get for its image), iam.serviceAccounts.actAs on the
 #     build identity and each runtime identity, uploads to the build source
 #     bucket, and that the deployer can NOT act as the Compute Engine default
 #     service account.
@@ -325,9 +327,10 @@ if [[ "$CHECK_OK" -eq 1 ]] && ! grep -qF "$BUILD_BUCKET_NAME" "$OUT"; then
 fi
 check "cloud-build-list" required \
   gcloud builds list --project "$PROJECT_ID" --region "$REGION" --limit 1 --format='value(id)'
+# The same read cloud-run.sh makes for a build that did not succeed.
 check "build-logs-read" required \
-  gcloud logging read 'resource.type="build"' --project "$PROJECT_ID" --limit 1 --freshness 1d \
-  --format='value(timestamp)'
+  gcloud logging read "resource.type=build" --project "$PROJECT_ID" --order=desc --limit 1 --freshness 1d \
+  --format='value(textPayload)'
 
 # --- testIamPermissions: what no read-only call can prove ---------------------
 if [[ "$DRY_RUN" -eq 0 ]]; then
@@ -336,6 +339,11 @@ fi
 probe "permissions:project" \
   "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
   "${PROJECT_PERMISSIONS[@]}"
+# The async build path (cloud-run.sh): submit, poll `gcloud builds describe`,
+# read the log of a build that did not succeed, prove the image exists.
+probe "permissions:build-wait" \
+  "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
+  cloudbuild.builds.create cloudbuild.builds.get logging.logEntries.list artifactregistry.dockerimages.get
 probe "act-as:${BUILD_SA%@*} (build identity)" \
   "https://iam.googleapis.com/v1/projects/-/serviceAccounts/${BUILD_SA}:testIamPermissions" POST held \
   iam.serviceAccounts.actAs
