@@ -293,6 +293,10 @@ MILO_TEST_GCLOUD_FAIL names a substring: an update whose arguments contain it
 fails WITHOUT applying (a partial gcloud failure). After every applied update a
 snapshot of the whole state is appended to MILO_TEST_GCLOUD_SNAPSHOTS, so a
 test can inspect every intermediate posture the sequence passed through.
+
+Job IAM policies live in state["policies"][job][role] = [member, ...]:
+`add-iam-policy-binding` adds to them (unless MILO_TEST_GCLOUD_IAM_DROP names
+a role: the call succeeds and nothing sticks), `get-iam-policy` prints them.
 """
 import json, os, sys
 state_path = os.environ["MILO_TEST_GCLOUD_STATE"]
@@ -325,6 +329,23 @@ if kind and args[2] == "update":
     if snapshots:
         with open(snapshots, "a") as handle:
             handle.write(json.dumps(state) + "\n")
+    sys.exit(0)
+if kind == "job" and args[2] == "add-iam-policy-binding":
+    fail = os.environ.get("MILO_TEST_GCLOUD_FAIL")
+    if fail and fail in " ".join(args):
+        sys.stderr.write("ERROR: (gcloud.run) simulated failure\n"); sys.exit(1)
+    role = args[args.index("--role") + 1]
+    member = args[args.index("--member") + 1]
+    if role != os.environ.get("MILO_TEST_GCLOUD_IAM_DROP"):
+        members = state.setdefault("policies", {}).setdefault(args[3], {}).setdefault(role, [])
+        if member not in members:
+            members.append(member)
+        json.dump(state, open(state_path, "w"))
+    sys.exit(0)
+if kind == "job" and args[2] == "get-iam-policy":
+    policy = state.get("policies", {}).get(args[3], {})
+    print(json.dumps({"bindings": [{"role": role, "members": members}
+                                   for role, members in policy.items()], "etag": "BwX"}))
     sys.exit(0)
 if kind and args[2] == "describe":
     if "--format=json" in args:
@@ -546,16 +567,21 @@ def test_web_preparation_needs_the_release_image_and_opens_only_the_prepare_rout
     refused = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
     assert refused.returncode == 1 and "Nothing was changed" in refused.stderr
     assert not [c for c in tree.calls() if " update " in c or "add-iam-policy-binding" in c]
-    # On the release image: the binding on the capture job only, then the API.
+    # On the release image: the executor binding on the capture job only, the
+    # read binding on the capture and worker jobs only, then the API.
     state.write_text(json.dumps({"service": dict(closed), "job": {},
                                  "images": {"test-worker": release, "test-capture": release}}))
     applied = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert "--gate deployed" in next(c for c in tree.calls() if c.startswith("production-verify.sh"))
-    (binding,) = [c for c in tree.calls() if "add-iam-policy-binding" in c]
-    assert binding.startswith("gcloud run jobs add-iam-policy-binding test-capture ")
-    assert "--member serviceAccount:api@test.iam.gserviceaccount.com" in binding
-    assert "--role roles/run.jobsExecutorWithOverrides" in binding
+    executor, *readers = [c for c in tree.calls() if "add-iam-policy-binding" in c]
+    assert executor.startswith("gcloud run jobs add-iam-policy-binding test-capture ")
+    assert "--member serviceAccount:api@test.iam.gserviceaccount.com" in executor
+    assert "--role roles/run.jobsExecutorWithOverrides" in executor
+    assert [c.split()[4] for c in readers] == ["test-capture", "test-worker"]
+    for reader in readers:
+        assert "--member serviceAccount:api@test.iam.gserviceaccount.com" in reader
+        assert "--role roles/run.viewer" in reader
     updates = [c for c in tree.calls() if " update " in c]
     assert len(updates) == 1 and updates[0].startswith("gcloud run services update test-api")
     after = json.loads(state.read_text())
@@ -566,6 +592,89 @@ def test_web_preparation_needs_the_release_image_and_opens_only_the_prepare_rout
     assert after["service"]["MILO_ENABLE_PAID_EXECUTION"] == "false"
     assert after["service"]["MILO_ENABLE_WORK_SCOPE_PREPARATION"] == "false"
     assert after["job"] == {}
+    api = "serviceAccount:api@test.iam.gserviceaccount.com"
+    assert after["policies"] == {
+        "test-capture": {"roles/run.jobsExecutorWithOverrides": [api], "roles/run.viewer": [api]},
+        "test-worker": {"roles/run.viewer": [api]}}
+
+
+def _web_preparation_state(tmp_path, **extra) -> Path:
+    release = "test-region-docker.pkg.dev/test-project/test-repo/worker:" + "a" * 40
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "service": {"MILO_ENABLE_PAID_EXECUTION": "false",
+                    "MILO_ENABLE_WORK_SCOPE_PREPARATION": "false"},
+        "job": {}, "images": {"test-worker": release, "test-capture": release}, **extra}))
+    return state
+
+
+def test_web_preparation_binds_run_viewer_on_both_jobs_and_reads_each_back(tmp_path):
+    """PR-E'2: the Prepare route GETs the capture job AND the worker job before
+    it starts anything; the executor role does not carry run.jobs.get. The
+    activation binds roles/run.viewer for the API identity on exactly those two
+    jobs, reads each back, and only then opens the API."""
+    tree, env = _stage2_tree(tmp_path)
+    _web_preparation_state(tmp_path)
+    applied = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    calls = tree.calls()
+    iam = [c for c in calls if " get-iam-policy " in c or "add-iam-policy-binding" in c]
+    viewer = [c for c in iam if "add-iam-policy-binding" in c and "roles/run.viewer" in c]
+    assert [c.split()[4] for c in viewer] == ["test-capture", "test-worker"]
+    # Each job: read the policy, bind, read it back -- all before the API update.
+    for job in ("test-capture", "test-worker"):
+        reads = [i for i, c in enumerate(calls) if c.startswith(f"gcloud run jobs get-iam-policy {job} ")]
+        bind = next(i for i, c in enumerate(calls) if c in viewer and f" {job} " in c)
+        assert len(reads) == 2 and reads[0] < bind < reads[1]
+    update = next(i for i, c in enumerate(calls) if c.startswith("gcloud run services update"))
+    assert all(i < update for i, c in enumerate(calls) if c in iam)
+    assert "job test-capture: serviceAccount:api@test.iam.gserviceaccount.com holds roles/run.viewer (read back)" \
+        in applied.stdout
+    assert "job test-worker: serviceAccount:api@test.iam.gserviceaccount.com holds roles/run.viewer (read back)" \
+        in applied.stdout
+    # The binding is never project-wide.
+    assert not [c for c in calls if "projects add-iam-policy-binding" in c]
+
+
+def test_web_preparation_read_binding_is_idempotent(tmp_path):
+    tree, env = _stage2_tree(tmp_path)
+    api = "serviceAccount:api@test.iam.gserviceaccount.com"
+    _web_preparation_state(tmp_path, policies={"test-capture": {"roles/run.viewer": [api]},
+                                               "test-worker": {"roles/run.viewer": [api]}})
+    applied = tree.run("website-execution-activate.sh", "--apply-web-preparation", env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert not [c for c in tree.calls() if "add-iam-policy-binding" in c and "roles/run.viewer" in c]
+    assert f"job test-worker: {api} already holds roles/run.viewer" in applied.stdout
+    assert f"job test-worker: {api} holds roles/run.viewer (read back)" in applied.stdout
+    after = json.loads((tmp_path / "state.json").read_text())
+    assert after["policies"]["test-worker"] == {"roles/run.viewer": [api]}
+
+
+@pytest.mark.parametrize("failure", [
+    {"MILO_TEST_GCLOUD_IAM_DROP": "roles/run.viewer"},      # bound, but never reads back
+    {"MILO_TEST_GCLOUD_FAIL": "add-iam-policy-binding test-worker"},  # the bind itself fails
+])
+def test_web_preparation_never_opens_the_api_without_the_read_binding(tmp_path, failure):
+    tree, env = _stage2_tree(tmp_path)
+    _web_preparation_state(tmp_path)
+    refused = tree.run("website-execution-activate.sh", "--apply-web-preparation",
+                       env={**env, **failure})
+    assert refused.returncode == 1
+    assert "the API was NOT changed" in refused.stderr
+    assert not [c for c in tree.calls() if c.startswith("gcloud run services update")]
+    after = json.loads((tmp_path / "state.json").read_text())
+    assert "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS" not in after["service"]
+
+
+def test_the_web_preparation_plan_prints_the_read_binding_on_both_jobs(tmp_path):
+    tree = Tree(tmp_path, ("website-execution-activate.sh",))
+    tree.tool("gcloud", LOGGING_STUB.format(extra="exit 0"))
+    result = tree.run("website-execution-activate.sh", "--plan", "--skip-stage1-check")
+    assert result.returncode == 0, result.stdout + result.stderr
+    section = result.stdout.split("== E'", 1)[1].split("== Stage 2", 1)[0]
+    assert section.count("--role roles/run.viewer") == 2
+    assert "gcloud run jobs add-iam-policy-binding test-capture" in section
+    assert "gcloud run jobs add-iam-policy-binding test-worker" in section
 
 
 # =============================================================================

@@ -103,13 +103,16 @@ MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,
 # --ensure-job is `gcloud run jobs create|update` of the capture job AS the
 # capture identity (run.admin + actAs below) after the worker image's exact
 # tag is read with docker tags list (artifactregistry.reader); the
-# capture-job binding is `gcloud run jobs add-iam-policy-binding`
-# (run.jobs.setIamPolicy, in run.admin); Stage P / E'
+# capture-job binding, and E''s roles/run.viewer binding for the API identity
+# on the capture and worker jobs (read back with get-iam-policy), are
+# `gcloud run jobs add-iam-policy-binding` / `get-iam-policy`
+# (run.jobs.setIamPolicy / getIamPolicy, in run.admin; preflight-deployer.sh
+# probes both on each job); Stage P / E'
 # are `gcloud run services update` of the API AS its identity (run.admin +
 # actAs). The deployer never reads a secret value: the capture job's secrets
 # are read by the capture identity at run time.
 PROJECT_ROLES=(
-  "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag; website stage (capture job ensure + its run-with-overrides binding)
+  "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag; website stage (capture job ensure + its run-with-overrides binding + the API identity's run.viewer on the capture and worker jobs)
   "roles/cloudbuild.builds.editor"         # cloud-run.sh: gcloud builds submit (both images)
   "roles/artifactregistry.reader"          # docker tags list: a release image's exact tag (cloud-run.sh, preflight, production-verify, capture script --ensure-job). No Container Analysis role, ever
   "roles/secretmanager.viewer"             # preflight: secrets describe / get-iam-policy (metadata only, never a value)

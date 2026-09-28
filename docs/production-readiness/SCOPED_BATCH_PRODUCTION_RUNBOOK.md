@@ -770,7 +770,9 @@ bash scripts/deploy/website-execution-activate.sh --apply-web-preparation
 ```
 
 It stops unless `production-verify.sh --gate deployed` passes and the capture
-job runs the image the worker runs; then it re-applies the job binding, sets
+job runs the image the worker runs; then it re-applies the job binding, binds
+`roles/run.viewer` for the API identity on **the capture job and the worker
+job only** (only when absent) and reads each back, and only then sets
 `MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=true` and
 `CLOUD_RUN_CAPTURE_JOB=<CLOUD_RUN_CAPTURE_JOB>` on the API, and reads back that
 paid execution and scoped preparation are still off on the API. The website
@@ -791,7 +793,16 @@ status, `catalog_work_scope_preparations`), never from an exit code or a log:
 A second click, a second member or two concurrent requests are answered with
 the preparation in flight: the database claims ONE request per revision under
 the plan's row lock. The API refuses (`WORK_SCOPE_PREPARATION_JOB_NOT_RELEASE`)
-if the capture job does not run the deployed release image.
+if the capture job does not run the deployed release image, and
+(`WORK_SCOPE_PREPARATION_JOB_UNREADABLE`) if it cannot READ the capture job or
+the worker job: it GETs both before anything is written, and
+`roles/run.jobsExecutorWithOverrides` does not carry `run.jobs.get` -- hence the
+`roles/run.viewer` binding above. Every refusal writes ONE API log line,
+`event=work_scope_preparation_refused work_scope_id=<uuid> revision=<n>
+code=<STATIC_CODE>` (logger `milo.work_scope.preparation`; never a URL, token
+or SQL value), and the 409 body carries the same code, whose reason the website
+shows. To find them: `gcloud logging read
+'resource.type="cloud_run_revision" AND textPayload:"event=work_scope_preparation_refused"'`.
 
 The prepared gate is unchanged: `production-verify.sh --gate prepared
 $WS_ARGS` (or the `gates` workflow) still decides readiness for Stage E.

@@ -16,10 +16,14 @@
 #   --apply-web-preparation E'. The website's Prepare button: the API may
 #                           execute the EXISTING capture job once per plan
 #                           revision (MILO_WEB_PREPARATION_API_ENABLE_FLAGS
-#                           and CLOUD_RUN_CAPTURE_JOB on the API, and the API
+#                           and CLOUD_RUN_CAPTURE_JOB on the API, the API
 #                           identity's run-with-overrides binding on THAT job
-#                           only). Starts nothing, creates no product run and
-#                           enables no paid execution or promotion.
+#                           only, and its roles/run.viewer binding on the
+#                           capture job and the worker job only -- the two
+#                           jobs the Prepare route READS before it starts
+#                           anything -- each read back). Starts nothing,
+#                           creates no product run and enables no paid
+#                           execution or promotion.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -91,10 +95,12 @@ Modes:
                           its caps (API). Enables nothing; no gate.
   --apply-plan-authoring  Stage P: MILO_ENABLE_WORK_SCOPE_MUTATIONS on the API
                           only. Gate: production-verify.sh --gate deployed.
-  --apply-web-preparation E': the website's Prepare button (API only), and the
+  --apply-web-preparation E': the website's Prepare button (API only), the
                           API identity's run-with-overrides binding on the
-                          capture job only. Gate: production-verify.sh --gate
-                          deployed, and the capture job on the release image.
+                          capture job only, and its roles/run.viewer binding
+                          on the capture and worker jobs only (read back).
+                          Gate: production-verify.sh --gate deployed, and the
+                          capture job on the release image.
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
                           production-verify.sh --gate prepared for the named
                           plan revision. The Vercel half is printed, never
@@ -263,6 +269,16 @@ print_web_preparation_commands() {
 gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role roles/run.jobsExecutorWithOverrides
+# --- E', both jobs: the API identity may READ them (run.jobs.get). The Prepare
+# route reads the capture job and the worker job to prove the release image
+# before it starts anything; the executor role above does not carry that read.
+# Bound only when absent, then read back.
+gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role ${MILO_API_JOB_READ_ROLE}
+gcloud run jobs add-iam-policy-binding ${WORKER_JOB} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role ${MILO_API_JOB_READ_ROLE}
 # --- E', API only: the Prepare route and the job it executes. Run creation,
 # batches, paid execution and promotion stay exactly as they are.
 gcloud run services update ${API_SERVICE} \\
@@ -379,6 +395,35 @@ readback() {
   python3 -c "$READBACK_PY" "$@" <<< "$json"
 }
 split_pairs() { local IFS="$MILO_ENV_VAR_DELIMITER"; read -r -a SPLIT <<< "$1"; }
+
+# job_policy JOB — the job's IAM policy (JSON), or a failure.
+job_policy() {
+  gcloud run jobs get-iam-policy "$1" --region "$REGION" --project "$PROJECT_ID" --format=json
+}
+
+# ensure_job_binding JOB ROLE MEMBER — MEMBER holds ROLE on THAT job, read
+# back. Bound only when the policy does not already carry it (idempotent: a
+# second run changes nothing). A policy that cannot be read, a binding that
+# fails, or one that does not read back is a failure.
+ensure_job_binding() {
+  local job="$1" role="$2" member="$3" policy
+  if ! policy="$(job_policy "$job")"; then
+    printf 'FAIL: the IAM policy of job %s could not be read.\n' "$job" >&2
+    return 1
+  fi
+  if milo_policy_has_member "$role" "$member" <<< "$policy"; then
+    printf 'job %s: %s already holds %s\n' "$job" "$member" "$role"
+  elif ! gcloud run jobs add-iam-policy-binding "$job" --region "$REGION" --project "$PROJECT_ID" \
+         --member "$member" --role "$role" > /dev/null; then
+    printf 'FAIL: %s could not be bound to %s on job %s.\n' "$role" "$member" "$job" >&2
+    return 1
+  fi
+  if ! policy="$(job_policy "$job")" || ! milo_policy_has_member "$role" "$member" <<< "$policy"; then
+    printf 'FAIL: %s on job %s did not read back for %s.\n' "$role" "$job" "$member" >&2
+    return 1
+  fi
+  printf 'job %s: %s holds %s (read back)\n' "$job" "$member" "$role"
+}
 
 # readback_secret KIND NAME ENV_NAME SECRET — the env name is bound to exactly
 # that Secret Manager secret. Only the binding is read, never the value.
@@ -520,6 +565,14 @@ if [[ "$MODE" == "apply-web-preparation" ]]; then
   print_web_preparation_commands
   gcloud run jobs add-iam-policy-binding "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
     --member "serviceAccount:${API_SA}" --role roles/run.jobsExecutorWithOverrides > /dev/null
+  # The Prepare route READS both jobs before it starts anything. Without this
+  # every Prepare is refused WORK_SCOPE_PREPARATION_JOB_UNREADABLE, so the API
+  # is not opened until both read bindings read back.
+  if ! ensure_job_binding "$CAPTURE_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" \
+     || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}"; then
+    printf 'FAIL: the API identity cannot read both jobs (above); the API was NOT changed.\n' >&2
+    exit 1
+  fi
   gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
     --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${WEB_PREP_API_VARS}"
   split_pairs "$WEB_PREP_API_VARS"

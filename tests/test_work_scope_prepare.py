@@ -621,6 +621,122 @@ def test_an_unreadable_job_refuses():
     assert _trigger(session).release_refusal() == trig.JOB_UNREADABLE
 
 
+# =============================================================================
+# 6b. PR-E'2: every refusal is ONE static log line, and the body names the code
+# =============================================================================
+
+PREPARATION_LOGGER = "milo.work_scope.preparation"
+
+
+def refusal_lines(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records if record.name == PREPARATION_LOGGER]
+
+
+def expected_line(plan: dict[str, Any], code: str, revision: int = 1) -> str:
+    return (f"event=work_scope_preparation_refused work_scope_id={plan['id']} "
+            f"revision={revision} code={code}")
+
+
+@pytest.mark.parametrize("unreadable", ["milo-catalog-capture", "milo-agent-worker"])
+def test_a_403_on_a_job_get_refuses_job_unreadable_logs_one_line_and_writes_nothing(
+        caplog, unreadable):
+    """The production incident: the API identity held the executor role on
+    both jobs but could not READ them, so release_refusal's GET answered 403.
+    The real trigger turns that into JOB_UNREADABLE; the route answers 409 with
+    that static code and its reason, writes nothing, and logs ONE line."""
+    caplog.set_level("INFO", logger=PREPARATION_LOGGER)
+    repo, plan = world()
+    readable = FakeResponse(200, _job(RELEASE_IMAGE))
+    denied = FakeResponse(403, {"error": {"code": 403, "status": "PERMISSION_DENIED", "message":
+        "Permission 'run.jobs.get' denied on resource 'namespaces/p/jobs/x' secret-token-abc"}})
+    session = FakeSession(gets={"milo-catalog-capture": readable, "milo-agent-worker": readable,
+                                unreadable: denied}, post=AssertionError("must never run"))
+    trigger = _trigger(session)
+    assert trigger.release_refusal() == trig.JOB_UNREADABLE
+    response = prepare(client(repo, trigger), plan)
+    assert response.status_code == 409
+    assert response.json() == {"error": {"code": trig.JOB_UNREADABLE,
+                                         "message": wp.REQUEST_REASONS[trig.JOB_UNREADABLE]}}
+    assert session.posts == [] and requests(repo) == [] and capture_runs(repo) == []
+    assert refusal_lines(caplog) == [expected_line(plan, trig.JOB_UNREADABLE)]
+    logged = caplog.text
+    for leak in ("https://", "run.googleapis.com", "secret-token-abc", "PERMISSION_DENIED",
+                 "run.jobs.get", "milo-catalog-capture", "milo-agent-worker", plan["head_digest"]):
+        assert leak not in logged, leak
+
+
+def _needs_operator(api: TestClient, repo: MemoryRepository, plan: dict[str, Any]) -> None:
+    prepare(api, plan)
+    (run,) = capture_runs(repo)
+    repo.claim_run(UUID(run["id"]), "capture-worker")
+    repo.runs[run["id"]]["lease_expires_at"] = (
+        datetime.now(UTC) - timedelta(seconds=wp.START_GRACE_SECONDS + 60)).isoformat()
+
+
+@pytest.mark.parametrize("case,status_code,code", [
+    ("disabled", 503, "WORK_SCOPE_PREPARATION_DISABLED"),
+    ("not_release", 409, trig.JOB_NOT_RELEASE),
+    ("unreadable", 409, trig.JOB_UNREADABLE),
+    ("stale", 409, "WORK_SCOPE_STALE"),
+    ("trigger_failed", 502, "WORK_SCOPE_PREPARATION_TRIGGER_FAILED"),
+    ("needs_operator", 409, "WORK_SCOPE_PREPARATION_NEEDS_OPERATOR"),
+    ("outsider", 404, "WORK_SCOPE_NOT_FOUND"),
+])
+def test_every_refusal_is_logged_once_with_its_static_code(caplog, case, status_code, code):
+    repo, plan = world()
+    trigger: Any = {
+        "disabled": None,
+        "not_release": FakeTrigger(refusal=trig.JOB_NOT_RELEASE),
+        "unreadable": FakeTrigger(refusal=trig.JOB_UNREADABLE),
+        "trigger_failed": FakeTrigger(outcomes=[trig.TriggerOutcome(trig.TRIGGER_FAILED)]),
+    }.get(case, FakeTrigger())
+    api = client(repo, trigger)
+    if case == "needs_operator":
+        _needs_operator(api, repo, plan)
+    caplog.clear()
+    caplog.set_level("INFO", logger=PREPARATION_LOGGER)
+    response = prepare(api, plan, user=OUTSIDER if case == "outsider" else USER,
+                       digest="0" * 64 if case == "stale" else None)
+    assert response.status_code == status_code, response.text
+    assert response.json()["error"]["code"] == code
+    assert refusal_lines(caplog) == [expected_line(plan, code)]
+
+
+def test_a_started_or_answered_preparation_logs_no_refusal(caplog):
+    caplog.set_level("INFO", logger=PREPARATION_LOGGER)
+    repo, plan = world()
+    api = client(repo, FakeTrigger())
+    assert prepare(api, plan).status_code == 202
+    assert prepare(api, plan).status_code == 200
+    assert refusal_lines(caplog) == []
+
+
+def test_the_log_line_keeps_only_static_fields(caplog):
+    caplog.set_level("INFO", logger=PREPARATION_LOGGER)
+    wp._log_refusal("not-a-uuid", "7; DROP TABLE", "https://run.googleapis.com/?token=abc")
+    wp._log_refusal(uuid4(), True, "lower_case_code")
+    (first, second) = refusal_lines(caplog)
+    assert first == ("event=work_scope_preparation_refused work_scope_id=invalid revision=-1 "
+                     "code=UNCLASSIFIED")
+    assert second.endswith("revision=-1 code=UNCLASSIFIED")
+
+
+def test_the_website_has_reason_text_for_every_refusal_code():
+    """Every static code the Prepare route refuses with is on the website's
+    allowlist with its own copy, so a refusal never shows the generic sentence."""
+    import re as _re
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "frontend" / "lib" / "errorText.ts").read_text(
+        encoding="utf-8")
+    listed = _re.search(r"PREPARATION_REFUSAL_CODES: readonly string\[\] = \[(.*?)\];", source, _re.S)
+    assert listed is not None
+    codes = set(_re.findall(r"'([A-Z_]+)'", listed.group(1)))
+    assert codes == set(wp.REQUEST_REASONS) | {"WORK_SCOPE_STALE"}
+    for code in codes:
+        assert f"['{code}', '" in source, code
+
+
 def test_no_capture_job_configured_means_no_trigger():
     from backend.config import Settings
 

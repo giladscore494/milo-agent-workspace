@@ -38,11 +38,23 @@ request row and the capture run's durable status. Never from an exit code, an
 execution document or a log (plan 7.1.5: a capture is judged by the database
 and the prepared gate, never by what a process printed). A failure is shown as
 a static reason code.
+
+Every refusal is logged, once
+-----------------------------
+
+A Prepare the server refuses -- the release-image check, a disabled route, a
+stale revision, a failed trigger, anything answered with an `AppError` --
+writes ONE server-log line (`_log_refusal`): the event name, the plan id, the
+revision asked for and the static refusal code. Never a URL, a token, an SQL
+value or an upstream message. The response body carries the same static code,
+so the website shows that code's own reason text.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -53,6 +65,14 @@ from backend.execution_guard import is_stage_enabled
 from . import batches as work_scope_batches
 from . import prepare_trigger as trig
 from . import service as work_scopes
+
+_LOG = logging.getLogger("milo.work_scope.preparation")
+
+#: The event every refused Prepare logs, once.
+REFUSAL_EVENT = "work_scope_preparation_refused"
+
+#: A code is logged only in its static shape; anything else is `UNCLASSIFIED`.
+_STATIC_CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 
 #: The server flag behind the Prepare route. Default off, pinned off at Stage
 #: A, and enforced by `ExecutionSurfaceGuardMiddleware` before a body is read.
@@ -102,6 +122,21 @@ _TERMINAL = frozenset({"completed", "partial_success", "failed", "cancelled", "t
 
 def _refusal(code: str, status: int) -> AppError:
     return AppError(code, REQUEST_REASONS[code], status)
+
+
+def _log_refusal(work_scope_id: Any, revision: Any, code: Any) -> None:
+    """ONE line for a refused Prepare. Static fields only: the event, the plan
+    id (a UUID), the revision asked for (a whole number) and the refusal code
+    (a static SCREAMING_SNAKE code). Never a message, a URL, a token or a value
+    read from the database or from Cloud Run."""
+    try:
+        plan = str(UUID(str(work_scope_id)))
+    except ValueError:
+        plan = "invalid"
+    number = revision if isinstance(revision, int) and not isinstance(revision, bool) else -1
+    static = code if isinstance(code, str) and _STATIC_CODE.fullmatch(code) else "UNCLASSIFIED"
+    _LOG.warning("event=%s work_scope_id=%s revision=%d code=%s", REFUSAL_EVENT, plan, number,
+                 static)
 
 
 def _capture_reason(code: Any) -> str | None:
@@ -274,8 +309,21 @@ def request_preparation(repo: Any, user_id: UUID, work_scope_id: UUID, *, expect
     """Prepare ONE revision, or answer with the preparation that exists.
 
     Returns (status view, started) -- `started` is True only for the ONE
-    caller whose claim executed the capture job.
+    caller whose claim executed the capture job. Every refusal is logged once
+    (`_log_refusal`) and re-raised unchanged.
     """
+    try:
+        return _request_preparation(repo, user_id, work_scope_id,
+                                    expected_revision=expected_revision,
+                                    expected_digest=expected_digest, trigger=trigger, env=env)
+    except AppError as refused:
+        _log_refusal(work_scope_id, expected_revision, refused.code)
+        raise
+
+
+def _request_preparation(repo: Any, user_id: UUID, work_scope_id: UUID, *,
+                         expected_revision: int, expected_digest: str, trigger: Any,
+                         env: Mapping[str, str] | None) -> tuple[dict[str, Any], bool]:
     environment = os.environ if env is None else env
     plan = work_scopes._authorized(repo, user_id, work_scope_id)
     work_scopes._require_supported(repo.get_project(UUID(str(plan["project_id"]))))
@@ -343,6 +391,6 @@ def request_preparation(repo: Any, user_id: UUID, work_scope_id: UUID, *, expect
     return current(), True
 
 
-__all__ = ["BLOCKERS", "FAILURE_REASONS", "PREPARATION_REQUESTS_FLAG", "REQUEST_REASONS",
-           "START_GRACE_SECONDS", "STATES", "derive_status", "request_preparation",
+__all__ = ["BLOCKERS", "FAILURE_REASONS", "PREPARATION_REQUESTS_FLAG", "REFUSAL_EVENT",
+           "REQUEST_REASONS", "START_GRACE_SECONDS", "STATES", "derive_status", "request_preparation",
            "server_can_prepare", "status"]
