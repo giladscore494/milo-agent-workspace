@@ -17,6 +17,13 @@ WORKER_SERVICE_ACCOUNT=${WORKER_SERVICE_ACCOUNT:-milo-worker-runtime@big-cabinet
 # (CLOUD_BUILD_SERVICE_ACCOUNT) and refuses a configuration without it; this
 # default keeps a direct Cloud Shell invocation aimed at the same account.
 CLOUD_BUILD_SERVICE_ACCOUNT=${CLOUD_BUILD_SERVICE_ACCOUNT:-milo-cloudbuild@big-cabinet-457321-t7.iam.gserviceaccount.com}
+# Each build is submitted with --async and its status is POLLED (never read
+# from the streamed log): at most BUILD_DEADLINE_SECONDS per build, one
+# `gcloud builds describe` every BUILD_POLL_SECONDS. The last BUILD_LOG_LINES
+# lines of a build that did not succeed are shown, redacted.
+BUILD_DEADLINE_SECONDS=${BUILD_DEADLINE_SECONDS:-1800}
+BUILD_POLL_SECONDS=${BUILD_POLL_SECONDS:-15}
+BUILD_LOG_LINES=80
 DEPLOY_MODE=${DEPLOY_MODE:-check}
 JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}
 # Permanent operating mode (plan decision 23; scripts/ops/deploy.sh with the
@@ -760,6 +767,11 @@ case "$DEPLOY_PRESERVE_STAGE" in
   *) fail "DEPLOY_PRESERVE_STAGE must be 0 or 1. Default is 0 (the Stage A deploy)." ;;
 esac
 
+[[ "$BUILD_DEADLINE_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+  fail "BUILD_DEADLINE_SECONDS must be a positive number of seconds (default 1800, per build)."
+[[ "$BUILD_POLL_SECONDS" =~ ^[1-9][0-9]*$ ]] || \
+  fail "BUILD_POLL_SECONDS must be a positive number of seconds (default 15)."
+
 # stage_flag_pairs REPORT -> "NAME=VALUE" per line for JOB_LAUNCHER and every
 # execution flag the resource carries, sorted. Values, never secrets.
 stage_flag_pairs() {
@@ -822,8 +834,93 @@ WORKER_EXECUTIONS_BEFORE=$(worker_execution_count)
 # account's resource name); each config logs to Cloud Logging only, which a
 # user-specified build service account requires.
 BUILD_SERVICE_ACCOUNT_RESOURCE="projects/$PROJECT_ID/serviceAccounts/$CLOUD_BUILD_SERVICE_ACCOUNT"
-gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
-gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE" --config scripts/deploy/cloudbuild-api.yaml --substitutions "_API_IMAGE=$API_IMAGE" .
+
+# A build's RESULT is its status, never its log stream. A foreground submit
+# streams the log, and a stream that fails (a keyless identity, Cloud
+# Logging only) exits non-zero while the build itself may have succeeded or
+# still be running -- the deploy would stop, or misreport, for a reason that
+# has nothing to do with the build. So each build is submitted --async, its id
+# read from stdout alone, its status polled to a terminal value within a
+# deadline, and its image proved to exist before anything deploys it.
+BUILD_ID=""
+BUILD_ID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+BUILD_LIST_COMMAND="gcloud builds list --project=$PROJECT_ID --region=$REGION --limit=5 --format='table(id,status,createTime,images)'"
+
+# submit_build LABEL CONFIG SUBSTITUTION -> BUILD_ID. stderr (the source upload)
+# passes through; stdout must be exactly one well-formed build id.
+submit_build() {
+  local label="$1" config="$2" substitution="$3" output="" status=0 ids
+  output=$(gcloud builds submit --async --format='value(id)' --project "$PROJECT_ID" --region "$REGION" --service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE" --config "$config" --substitutions "$substitution" .) || status=$?
+  ids=$(printf '%s\n' "$output" | awk 'NF')
+  if [[ "$status" -ne 0 || "$(printf '%s\n' "$ids" | awk 'NF { n++ } END { print n+0 }')" -ne 1 \
+        || ! "$ids" =~ $BUILD_ID_PATTERN ]]; then
+    fail "The $label build submit (exit $status) did not return exactly one well-formed build id on stdout. A build MAY have started and may still be running -- nothing was deployed. Inspect it before retrying: $BUILD_LIST_COMMAND"
+  fi
+  BUILD_ID="$ids"
+  echo "$label build submitted: $BUILD_ID (as $CLOUD_BUILD_SERVICE_ACCOUNT)"
+}
+
+# print_build_log_tail ID — the last BUILD_LOG_LINES lines of that build's log,
+# oldest first, redacted and bounded. Informational only: it never changes the
+# outcome, and a log that cannot be read is said so.
+print_build_log_tail() {
+  local id="$1" log="" status=0
+  log=$(gcloud logging read "resource.type=build AND resource.labels.build_id=$id" --project "$PROJECT_ID" \
+    --order=desc --limit "$BUILD_LOG_LINES" --format='value(textPayload)' 2>/dev/null) || status=$?
+  if [[ "$status" -ne 0 || -z "${log//[[:space:]]/}" ]]; then
+    echo "  (the log of build $id could not be read$([[ "$status" -ne 0 ]] && printf ' (gcloud logging read exit %s)' "$status" || printf ': no entries yet'); the deploy stops regardless. Console: https://console.cloud.google.com/cloud-build/builds;region=$REGION/$id?project=$PROJECT_ID)" >&2
+    return 0
+  fi
+  echo "  the last log lines (up to $BUILD_LOG_LINES) of build $id, redacted:" >&2
+  # Newest first from the API: keep the first N lines (awk reads to the end, so
+  # nothing upstream is cut off under pipefail), then put them in order.
+  printf '%s\n' "$log" | awk -v n="$BUILD_LOG_LINES" 'NF && kept < n { print; kept++ }' | tac \
+    | milo_redact_stream | sed 's/^/    | /' >&2
+}
+
+# wait_for_build LABEL ID — poll until a terminal status, within the deadline.
+# SUCCESS returns; anything else stops the deploy after showing the log tail.
+wait_for_build() {
+  local label="$1" id="$2" state="" deadline=$((SECONDS + BUILD_DEADLINE_SECONDS))
+  while :; do
+    # A describe that fails is not a result: keep polling until the deadline.
+    state=$(gcloud builds describe "$id" --project "$PROJECT_ID" --region "$REGION" --format='value(status)' 2>/dev/null || true)
+    case "$state" in
+      SUCCESS)
+        echo "$label build $id: SUCCESS"
+        return 0 ;;
+      FAILURE | INTERNAL_ERROR | TIMEOUT | CANCELLED | EXPIRED)
+        print_build_log_tail "$id"
+        fail "The $label build $id ended $state. Nothing was deployed." ;;
+    esac
+    if (( SECONDS >= deadline )); then
+      print_build_log_tail "$id"
+      fail "The $label build $id is still ${state:-unreadable} after the ${BUILD_DEADLINE_SECONDS}s deadline. Nothing was deployed; the build may still be running: gcloud builds describe $id --project=$PROJECT_ID --region=$REGION"
+    fi
+    sleep "$BUILD_POLL_SECONDS"
+  done
+}
+
+# verify_built_image LABEL ID IMAGE — the exact tag exists before it is deployed.
+verify_built_image() {
+  local label="$1" id="$2" image="$3" digest
+  digest=$(gcloud artifacts docker images describe "$image" --project "$PROJECT_ID" \
+    --format='value(image_summary.digest)' 2>/dev/null || true)
+  [[ -n "$digest" ]] || \
+    fail "The $label build $id reported SUCCESS, but $image is not in Artifact Registry. Nothing was deployed."
+  echo "$label image: $image ($digest)"
+}
+
+# run_build LABEL CONFIG SUBSTITUTION IMAGE
+run_build() {
+  submit_build "$1" "$2" "$3"
+  wait_for_build "$1" "$BUILD_ID"
+  verify_built_image "$1" "$BUILD_ID" "$4"
+}
+
+# Worker first, then the API -- as always.
+run_build "Worker" scripts/deploy/cloudbuild-worker.yaml "_WORKER_IMAGE=$WORKER_IMAGE" "$WORKER_IMAGE"
+run_build "API" scripts/deploy/cloudbuild-api.yaml "_API_IMAGE=$API_IMAGE" "$API_IMAGE"
 
 # The worker job is deployed BEFORE the API and is never executed here.
 gcloud run jobs deploy "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" --image "$WORKER_IMAGE" \

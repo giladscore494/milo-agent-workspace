@@ -30,7 +30,9 @@ the script prints every command and calls nothing.
   bucket list, builds list, logging read);
 - probes, with `testIamPermissions` (read-only), what no read-only call can
   prove: `cloudbuild.builds.create` and the other project permissions the
-  deploy uses, `iam.serviceAccounts.actAs` on the build identity and on each
+  deploy uses, the async build path's own (`cloudbuild.builds.get` to poll,
+  `logging.logEntries.list` to read a failed build's log,
+  `artifactregistry.dockerimages.get` for the image), `iam.serviceAccounts.actAs` on the build identity and on each
   runtime identity, uploads to `gs://<project>_cloudbuild`, and that the
   deployer can **not** act as the Compute Engine default service account;
 - reports **every** disabled API, missing permission and missing resource at
@@ -52,6 +54,20 @@ repository, `roles/storage.objectViewer` on `gs://<project>_cloudbuild` and
 `roles/logging.logWriter` on the project. Cloud Build's default identity in
 this project is the Compute Engine default service account, which is broad:
 the deployer never acts as it, and the deploy refuses it as the build identity.
+A build's result is its **status, never its log stream** (PR-Ops3b). Each
+build is submitted with `--async`; the build id is read from stdout alone
+(anything but exactly one well-formed id stops the deploy and prints the
+`gcloud builds list` command to find a build that may have started).
+`gcloud builds describe` is polled until the status is terminal, within
+`BUILD_DEADLINE_SECONDS` (default 1800, per build; `BUILD_POLL_SECONDS`
+default 15). Only `SUCCESS` continues, and only once the image exists at the
+exact tag in Artifact Registry. `FAILURE`, `INTERNAL_ERROR`, `TIMEOUT`,
+`CANCELLED`, `EXPIRED` or the deadline stops the deploy before either
+surface is touched, after printing the last 80 lines of that build's log
+(`gcloud logging read`, redacted, each line at most 500 characters). A log
+that cannot be read is reported and changes nothing. A stopped build is never
+cancelled; the message names the build so you can inspect it.
+
 A missing `CLOUD_BUILD_SERVICE_ACCOUNT` stops `deploy.sh` and
 `production-activate.sh` before anything runs. The Cloud Shell path is the
 same command as before; with your owner account the builds run as the same

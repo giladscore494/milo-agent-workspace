@@ -204,6 +204,22 @@ milo_build_service_account_problem() {
   return 1
 }
 
+# milo_redact_stream < TEXT — the redaction every operator-facing tool applies
+# (scripts/release/lib/common.sh redact_line), for a stream of lines, plus the
+# bare credential shapes a build log can carry (Supabase secret keys, Google
+# access tokens, private-key blocks). Each line is also cut at 500 characters:
+# a log excerpt is bounded in width as well as in length.
+milo_redact_stream() {
+  sed -E \
+    -e 's#(://)[^/@[:space:]]+(:[^/@[:space:]]*)?@#\1[REDACTED]@#g' \
+    -e 's#([A-Za-z_]*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Za-z_]*[[:space:]]*[=:][[:space:]]*)[^[:space:]]+#\1[REDACTED]#Ig' \
+    -e 's#([Bb]earer[[:space:]]+)[A-Za-z0-9._-]+#\1[REDACTED]#g' \
+    -e 's#sb_secret_[A-Za-z0-9_-]+#[REDACTED]#g' \
+    -e 's#ya29\.[A-Za-z0-9._-]+#[REDACTED]#g' \
+    -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----.*#[REDACTED PRIVATE KEY]#' \
+    -e 's#^(.{500}).+#\1 [...]#'
+}
+
 # ---------------------------------------------------------------------------
 # Government capture job
 # ---------------------------------------------------------------------------

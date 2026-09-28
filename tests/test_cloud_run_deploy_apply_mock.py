@@ -122,11 +122,33 @@ case "$args" in
   "artifacts repositories describe"*)
     echo "$MOCK_REPOSITORY" ;;
   "artifacts docker images describe"*)
+    # An image named in missing-images was never pushed.
+    if [[ -f "$MOCK_DIR/missing-images" ]] && grep -qF "$5" "$MOCK_DIR/missing-images"; then
+      printf 'ERROR: (gcloud.artifacts.docker.images.describe) NOT_FOUND: image not found\n' >&2
+      exit 1
+    fi
     echo "$MOCK_DIGEST" ;;
   "secrets describe"*)
     echo "$3" ;;
   "builds submit"*)
-    echo "build submitted (mock)" ;;
+    # Async submit: the build id on stdout (a build log would stream to
+    # stderr only in the foreground). submit-output / submit-status override.
+    printf 'Uploading tarball (mock)\n' >&2
+    case "$args" in
+      *cloudbuild-worker.yaml*) id="11111111-1111-4111-8111-111111111111" ;;
+      *) id="22222222-2222-4222-8222-222222222222" ;;
+    esac
+    if [[ -f "$MOCK_DIR/submit-output" ]]; then cat "$MOCK_DIR/submit-output"; else echo "$id"; fi
+    exit "$(cat "$MOCK_DIR/submit-status" 2>/dev/null || echo 0)" ;;
+  "builds describe"*)
+    # build-status-<id> holds the status; SUCCESS by default.
+    cat "$MOCK_DIR/build-status-$3" 2>/dev/null || echo SUCCESS ;;
+  "logging read"*)
+    if [[ -f "$MOCK_DIR/build-log-unreadable" ]]; then
+      printf 'ERROR: (gcloud.logging.read) PERMISSION_DENIED: logging.logEntries.list\n' >&2
+      exit 1
+    fi
+    cat "$MOCK_DIR/build-log" 2>/dev/null || true ;;
   "run jobs executions list"*)
     if deployed; then
       if [[ "${MOCK_EXECUTIONS_AFTER_ERROR:-}" == "1" ]]; then

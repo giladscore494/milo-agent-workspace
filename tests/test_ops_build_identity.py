@@ -72,9 +72,11 @@ def test_every_cloud_build_config_logs_to_cloud_logging_only(config):
 
 
 def test_both_build_submits_name_the_build_identity():
-    builds = [line for line in CLOUD_RUN.splitlines() if line.startswith("gcloud builds submit")]
-    assert len(builds) == 2
-    assert all('--service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE"' in line for line in builds)
+    submits = [line for line in CLOUD_RUN.splitlines() if "gcloud builds submit" in line]
+    assert len(submits) == 1, "one submit helper, called for the worker and then the API"
+    assert '--service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE"' in submits[0]
+    assert [line.split()[1] for line in CLOUD_RUN.splitlines() if line.startswith("run_build ")] == \
+        ['"Worker"', '"API"']
     assert 'BUILD_SERVICE_ACCOUNT_RESOURCE="projects/$PROJECT_ID/serviceAccounts/$CLOUD_BUILD_SERVICE_ACCOUNT"' \
         in CLOUD_RUN
     # Validated with the other configuration guards, before anything is contacted.
@@ -457,8 +459,9 @@ def test_the_preflight_reports_every_gap_at_once(tmp_path):
     assert result.returncode == 1, result.stdout + result.stderr
     report = result.stdout.split("== Preflight report ==", 1)[1]
     for needle in ("MISSING API (2):", "cloudresourcemanager.googleapis.com", "run.googleapis.com",
-                   "MISSING PERMISSION (3):", "storage.buckets.list (build-source-bucket-list)",
+                   "MISSING PERMISSION (4):", "storage.buckets.list (build-source-bucket-list)",
                    "cloudbuild.builds.create (permissions:project)",
+                   "cloudbuild.builds.create (permissions:build-wait)",
                    "iam.serviceAccounts.actAs (act-as:milo-cloudbuild (build identity))",
                    "MISSING RESOURCE (1):", "api-service",
                    "MUST NOT HOLD (1):", "act-as:compute-default (must be refused): holds iam.serviceAccounts.actAs"):

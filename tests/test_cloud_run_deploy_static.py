@@ -189,10 +189,14 @@ def test_the_delimiter_cannot_be_a_character_that_appears_in_an_identity():
 
 def test_worker_job_is_deployed_before_the_api_service():
     assert SCRIPT.index("gcloud run jobs deploy ") < SCRIPT.index("gcloud run deploy ")
-    builds = [line for line in SCRIPT.splitlines() if line.startswith("gcloud builds submit")]
+    # One submit helper; the builds run worker first, then API, and both
+    # finish (and their images are proved) before either deploy.
+    builds = [line for line in SCRIPT.splitlines() if line.startswith("run_build ")]
     assert len(builds) == 2
     assert "cloudbuild-worker.yaml" in builds[0]
     assert "cloudbuild-api.yaml" in builds[1]
+    assert SCRIPT.index(builds[1]) < SCRIPT.index("gcloud run jobs deploy ")
+    assert SCRIPT.count("gcloud builds submit") == 1
 
 
 def test_deployment_never_executes_the_worker_job():
