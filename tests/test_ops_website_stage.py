@@ -441,14 +441,16 @@ def test_setup_wif_covers_the_capture_job_identity_with_or_without_its_own_accou
     """--ensure-job deploys the capture job AS CAPTURE_SERVICE_ACCOUNT, or the
     worker identity when none is configured; both are in the actAs list, and
     run.admin (jobs create/update, jobs setIamPolicy) and artifactregistry.reader
-    (images describe) are the only project roles it uses."""
+    (the worker image's exact tag, docker tags list) are the only project roles it uses."""
     capture = (Path(__file__).resolve().parents[1] / "scripts" / "catalog"
                / "government-production-capture.sh").read_text(encoding="utf-8")
     assert '[[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"' in capture
-    gcloud_verbs = set(re.findall(r"gcloud ((?:run jobs|artifacts docker images|run services) [a-z-]+)", capture))
+    gcloud_verbs = set(re.findall(r"gcloud ((?:run jobs|artifacts docker [a-z]+|run services) [a-z-]+)", capture))
     assert gcloud_verbs <= {"run jobs create", "run jobs update", "run jobs describe", "run jobs execute",
                             "run jobs add-iam-policy-binding", "run jobs executions",
-                            "artifacts docker images describe"}, gcloud_verbs
+                            "artifacts docker tags list"}, gcloud_verbs
+    # The image check is the shared tags-list lookup (artifactregistry.reader).
+    assert 'milo_image_digest_lookup "$WORKER_IMAGE"' in capture
     wif = (OPS / "setup-wif.sh").read_text(encoding="utf-8")
     assert 'ACT_AS=("$(milo_op API_SERVICE_ACCOUNT)" "$(milo_op WORKER_SERVICE_ACCOUNT)")' in wif
     assert '[[ -n "$CAPTURE_SA" ]] && ACT_AS+=("$CAPTURE_SA")' in wif

@@ -117,9 +117,13 @@ def test_mutable_tags_are_rejected(tmp_path):
 
 
 def image_references(plan_text: str) -> list[str]:
+    """Every tagged image reference. The exact-tag lookup names the path
+    untagged, the tag in its filter; it is checked on its own
+    (test_the_plan_reads_the_release_digest_by_the_exact_tag_never_by_describe)."""
     return [
         token
         for line in plan_text.splitlines()
+        if "docker tags list " not in line
         for token in line.split()
         if "docker.pkg.dev/" in token
     ]
@@ -314,7 +318,7 @@ def test_plan_never_executes_the_worker(plan):
 @pytest.mark.parametrize(
     "expected",
     [
-        "image_summary.digest",  # release digest
+        "gcloud artifacts docker tags list ",  # release digest, by the exact tag
         "spec.template.spec.serviceAccountName",  # API identity
         "spec.template.spec.template.spec.serviceAccountName",  # worker identity
         "containers[0].env",  # variable NAMES
@@ -379,4 +383,43 @@ def test_generator_blocks_a_plan_containing_a_destructive_flag(tmp_path):
     )
     assert result.returncode != 0
     assert "destructive" in result.stdout
+    assert not output.exists()
+
+
+def test_the_plan_reads_the_release_digest_by_the_exact_tag_never_by_describe(plan):
+    """The printed command is the shared tags-list call (deployment-contract.sh)."""
+    commands = command_lines(plan)
+    assert "images describe" not in commands and "image_summary.digest" not in commands
+    lines = [line.strip() for line in commands.splitlines() if "docker tags list" in line]
+    assert len(lines) == 2
+    for line, image in zip(lines, ("api", "worker")):
+        path, rest = line.split("gcloud artifacts docker tags list ", 1)[1].split(" ", 1)
+        assert path.endswith(f"/{image}") and ":" not in path.rsplit("/", 1)[1], line
+        assert rest == f"--filter='tag:{FULL_SHA}' --format='value(tag,version)'", line
+    assert "use only the row whose tag ends in exactly" in plan
+
+
+@pytest.mark.parametrize("replacement,check", [
+    ('$(milo_tags_list_command_line "${WORKER_IMAGE_REF%/*}/other:${SHA}")', "image-repository"),
+    ('$(milo_tags_list_command_line "${WORKER_IMAGE_REF%:*}:${SHA:0:12}")', "image-tags"),
+])
+def test_the_self_check_holds_the_tag_lookup_to_the_canonical_path_and_full_sha(
+        tmp_path, replacement, check):
+    """The tags-list line names the path untagged; it is still checked."""
+    root = tmp_path / "repo"
+    shutil.copytree(GENERATOR.parent, root / "scripts" / "release")
+    shutil.copytree(REPO / "scripts" / "deploy", root / "scripts" / "deploy")
+    (root / "Dockerfile.api").write_text("FROM scratch\n")
+    (root / "Dockerfile.worker").write_text("FROM scratch\n")
+    original = '$(milo_tags_list_command_line "${WORKER_IMAGE_REF}")'
+    assert original in GENERATOR.read_text()
+    patched = root / "scripts" / "release" / "generate-deployment-plan.sh"
+    patched.write_text(GENERATOR.read_text().replace(original, replacement, 1))
+    output = tmp_path / "plan.md"
+    result = subprocess.run(
+        ["bash", str(patched), "--release-sha", FULL_SHA, "--output", str(output)],
+        cwd=REPO, capture_output=True, text=True, timeout=120,
+    )
+    assert result.returncode != 0
+    assert f"[BLOCKED] {check}" in result.stdout
     assert not output.exists()

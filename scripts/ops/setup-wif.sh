@@ -101,16 +101,17 @@ MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,
 # The minimum project roles, and the command in this repository that needs each.
 # website-stage.sh (and deploy.sh step 11) needs nothing beyond them:
 # --ensure-job is `gcloud run jobs create|update` of the capture job AS the
-# capture identity (run.admin + actAs below) after an images describe
-# (artifactregistry.reader); the capture-job binding is `gcloud run jobs
-# add-iam-policy-binding` (run.jobs.setIamPolicy, in run.admin); Stage P / E'
+# capture identity (run.admin + actAs below) after the worker image's exact
+# tag is read with docker tags list (artifactregistry.reader); the
+# capture-job binding is `gcloud run jobs add-iam-policy-binding`
+# (run.jobs.setIamPolicy, in run.admin); Stage P / E'
 # are `gcloud run services update` of the API AS its identity (run.admin +
 # actAs). The deployer never reads a secret value: the capture job's secrets
 # are read by the capture identity at run time.
 PROJECT_ROLES=(
   "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag; website stage (capture job ensure + its run-with-overrides binding)
   "roles/cloudbuild.builds.editor"         # cloud-run.sh: gcloud builds submit (both images)
-  "roles/artifactregistry.reader"          # images describe (capture script --ensure-job, verify, preflight)
+  "roles/artifactregistry.reader"          # docker tags list: a release image's exact tag (cloud-run.sh, preflight, production-verify, capture script --ensure-job). No Container Analysis role, ever
   "roles/secretmanager.viewer"             # preflight: secrets describe / get-iam-policy (metadata only, never a value)
   "roles/iam.serviceAccountViewer"         # preflight / cloud-run.sh: service-accounts describe
   "roles/serviceusage.serviceUsageConsumer" # gcloud builds submit / services list against the project

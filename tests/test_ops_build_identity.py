@@ -368,7 +368,7 @@ print("200", end="")
 
 READ_ONLY_CALL = re.compile(
     r"^gcloud (auth list|auth print-access-token|config get-value|projects describe|services list"
-    r"|iam service-accounts describe|artifacts (repositories|docker images) describe"
+    r"|iam service-accounts describe|artifacts repositories describe|artifacts docker tags list"
     r"|secrets (describe|versions list|get-iam-policy)|run (services|jobs) (describe|get-iam-policy)"
     r"|run jobs executions list|storage buckets list|builds list|logging read) ")
 

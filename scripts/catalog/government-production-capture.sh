@@ -156,12 +156,30 @@ fi
 # Creating the job first would point it at an image that is not there, and
 # executing it would fail on the pull -- or, for a job ensured by an earlier
 # release, silently run THAT release's code. Both are refused here instead.
+#
+# Existence is read with the exact tag lookup (deployment-contract.sh, "Image
+# tag lookup"), never `images describe`, which also reads Container Analysis
+# -- a permission the deployer does not hold. A lookup that FAILS is shown and
+# refused as unknown, never reported as a missing image.
 require_worker_image() {
-  if ! gcloud artifacts docker images describe "$WORKER_IMAGE" --project "$PROJECT_ID" \
-       > /dev/null 2>&1; then
-    fail "the release worker image ${WORKER_IMAGE} does not exist (or cannot be read) in Artifact Registry. Build and deploy this commit first: DEPLOY_MODE=apply scripts/deploy/cloud-run.sh (or scripts/deploy/production-activate.sh --deploy). Nothing was created or executed." 1
-  fi
-  printf 'Worker image present: %s\n' "$WORKER_IMAGE"
+  local lookup=0 error_file
+  error_file="$(mktemp)"
+  milo_image_digest_lookup "$WORKER_IMAGE" "$error_file" || lookup=$?
+  case "$lookup" in
+    0)
+      rm -f "$error_file"
+      printf 'Worker image present: %s (%s)\n' "$WORKER_IMAGE" "$MILO_IMAGE_DIGEST" ;;
+    1)
+      rm -f "$error_file"
+      fail "the release worker image ${WORKER_IMAGE} does not exist in Artifact Registry (no tag is exactly ${RELEASE_SHA}). Build and deploy this commit first: DEPLOY_MODE=apply scripts/deploy/cloud-run.sh (or scripts/deploy/production-activate.sh --deploy). Nothing was created or executed." 1 ;;
+    2)
+      milo_show_gcloud_error "gcloud artifacts docker tags list (exit ${MILO_IMAGE_LOOKUP_STATUS})" < "$error_file"
+      rm -f "$error_file"
+      fail "the Artifact Registry tag lookup for the release worker image ${WORKER_IMAGE} FAILED (exit ${MILO_IMAGE_LOOKUP_STATUS}). This is NOT a missing image: whether it exists is unknown (the lookup needs artifactregistry.tags.list). Nothing was created or executed." 1 ;;
+    *)
+      rm -f "$error_file"
+      fail "the tag ${RELEASE_SHA} of ${WORKER_IMAGE%:*} did not resolve to exactly one sha256 digest (it resolved to: $(milo_image_lookup_digests_shown)). Nothing was created or executed." 1 ;;
+  esac
 }
 
 # The capture job must run EXACTLY the release image before it is executed.

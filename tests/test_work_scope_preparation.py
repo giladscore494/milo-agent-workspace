@@ -819,6 +819,8 @@ def _release_worker_image() -> str:
 
 #: The image `government-production-capture.sh` requires the capture job to run.
 RELEASE_WORKER_IMAGE = _release_worker_image()
+#: The digest its tag resolves to in the mock registry.
+RELEASE_WORKER_DIGEST = "sha256:" + "4" * 64
 
 #: What the mock `gcloud logging read` answers unless a test says otherwise.
 SUCCEEDED_DOCUMENT = {"entrypoint": "catalog.government.capture", "status": "succeeded",
@@ -836,7 +838,8 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
                     execution_exit: int = 0, document: dict | None = None,
                     psql: str | None = None, env: dict[str, str] | None = None,
                     job_image: str | None = None, image_exit: int = 0,
-                    execution_result: str = "succeeded"):
+                    execution_result: str = "succeeded", image_tags: str | None = None,
+                    image_stderr: str = "ERROR: (gcloud.artifacts.docker.tags.list) failed"):
     """Run the capture script as an operator would, with stand-ins on PATH.
 
     `gcloud` puts the mock gcloud first on PATH. `psql`, when given, is the
@@ -914,7 +917,24 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
             "elif sys.argv[1:4] == ['run', 'jobs', 'describe']:\n"
             "    print(os.environ['MOCK_GCLOUD_JOB_IMAGE'])\n"
             "elif sys.argv[1:5] == ['artifacts', 'docker', 'images', 'describe']:\n"
-            "    sys.exit(int(os.environ['MOCK_GCLOUD_IMAGE_EXIT']))\n",
+            "    # As in production: Container Analysis is enabled and the deployer\n"
+            "    # holds no permission on it, so a describe fails for an image that exists.\n"
+            "    sys.stderr.write(\"ERROR: (gcloud.artifacts.docker.images.describe) PERMISSION_DENIED: \"\n"
+            "                     \"Permission 'containeranalysis.occurrences.list' denied\\n\")\n"
+            "    sys.exit(1)\n"
+            "elif sys.argv[1:5] == ['artifacts', 'docker', 'tags', 'list']:\n"
+            "    # The exact-tag lookup: fails with MOCK_GCLOUD_IMAGE_EXIT, answers\n"
+            "    # MOCK_GCLOUD_TAGS_OUTPUT when set, else one row for the asked tag.\n"
+            "    status = int(os.environ['MOCK_GCLOUD_IMAGE_EXIT'])\n"
+            "    if status:\n"
+            "        sys.stderr.write(os.environ['MOCK_GCLOUD_TAGS_STDERR'] + '\\n')\n"
+            "        sys.exit(status)\n"
+            "    if 'MOCK_GCLOUD_TAGS_OUTPUT' in os.environ:\n"
+            "        sys.stdout.write(os.environ['MOCK_GCLOUD_TAGS_OUTPUT'])\n"
+            "    else:\n"
+            "        package = 'projects/p/locations/l/repositories/r/packages/' + argv[4].rsplit('/', 1)[1]\n"
+            "        tag = argv[5].split('tag:', 1)[1]\n"
+            "        print(package + '/tags/' + tag + '\\t' + package + '/versions/' + os.environ['MOCK_GCLOUD_DIGEST'])\n",
             encoding="utf-8")
         mock.chmod(0o755)
         env["MOCK_GCLOUD_LOG"] = str(log)
@@ -929,7 +949,13 @@ def _capture_script(tmp_path: Path, *extra: str, gcloud: bool = False,
         # The capture job runs the RELEASE worker image unless a test says
         # otherwise, and that image exists unless a test says it does not.
         env["MOCK_GCLOUD_JOB_IMAGE"] = RELEASE_WORKER_IMAGE if job_image is None else job_image
+        # `image_exit` makes the tag lookup FAIL; `image_tags` replaces its
+        # answer ("" = the tag is absent).
         env["MOCK_GCLOUD_IMAGE_EXIT"] = str(image_exit)
+        env["MOCK_GCLOUD_TAGS_STDERR"] = image_stderr
+        env["MOCK_GCLOUD_DIGEST"] = RELEASE_WORKER_DIGEST
+        if image_tags is not None:
+            env["MOCK_GCLOUD_TAGS_OUTPUT"] = image_tags
     env.update(overrides)
     result = subprocess.run(
         ["bash", str(REPO / "scripts/catalog/government-production-capture.sh"),
@@ -1112,13 +1138,14 @@ def test_the_capture_job_is_never_created_before_the_release_worker_image_exists
     builds the image the capture job runs. Every job-creating mode now refuses
     first, and creates, updates and executes nothing."""
     result, log = _capture_script(tmp_path, "--enable-catalog-execution", *extra, gcloud=True,
-                                  mode=mode, image_exit=1)
+                                  mode=mode, image_tags="")
     assert result.returncode != 0
     assert f"the release worker image {RELEASE_WORKER_IMAGE} does not exist" in result.stderr
     assert "DEPLOY_MODE=apply scripts/deploy/cloud-run.sh" in result.stderr
     calls = _gcloud_calls(log)
-    assert calls and calls[0][:4] == ["artifacts", "docker", "images", "describe"]
-    assert calls[0][4] == RELEASE_WORKER_IMAGE
+    path, sha = RELEASE_WORKER_IMAGE.rsplit(":", 1)
+    assert calls and calls[0] == ["artifacts", "docker", "tags", "list", path, f"--filter=tag:{sha}",
+                                  "--format=value(tag,version)"]
     assert not any(call[:3] in (["run", "jobs", "create"], ["run", "jobs", "update"],
                                 ["run", "jobs", "execute"]) for call in calls)
 
@@ -1150,8 +1177,59 @@ def test_ensure_job_points_the_job_at_the_release_image(tmp_path):
     # form gcloud's parser accepts for a value that starts with "-".
     assert "--args" not in create
     assert _flag_value(create, "--args") == "-m,backend.catalog.operator_capture"
-    image_check = calls.index(next(c for c in calls if c[:4] == ["artifacts", "docker", "images", "describe"]))
+    image_check = calls.index(next(c for c in calls if c[:4] == ["artifacts", "docker", "tags", "list"]))
     assert image_check < calls.index(create)
+    assert f"Worker image present: {RELEASE_WORKER_IMAGE} ({RELEASE_WORKER_DIGEST})" in result.stdout
+    # The mock describes as production does (Container Analysis denied); it is never asked.
+    assert not any(call[:4] == ["artifacts", "docker", "images", "describe"] for call in calls)
+
+
+def _tag_row(tag: str, digest: str) -> str:
+    package = "projects/p/locations/l/repositories/r/packages/worker"
+    return f"{package}/tags/{tag}\t{package}/versions/{digest}\n"
+
+
+RELEASE_SHA_TAG = RELEASE_WORKER_IMAGE.rsplit(":", 1)[1]
+JOB_MUTATIONS = (["run", "jobs", "create"], ["run", "jobs", "update"], ["run", "jobs", "execute"])
+
+
+@pytest.mark.parametrize("tags", [
+    [f"release-{RELEASE_SHA_TAG}", f"{RELEASE_SHA_TAG}-rc1"],   # the filter's substring matches
+    [RELEASE_SHA_TAG[:-1]],
+])
+def test_ensure_job_refuses_when_only_a_tag_containing_the_sha_exists(tmp_path, tags):
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", gcloud=True, mode="--ensure-job",
+                                  image_tags="".join(_tag_row(tag, "sha256:" + "5" * 64) for tag in tags))
+    assert result.returncode != 0
+    assert f"the release worker image {RELEASE_WORKER_IMAGE} does not exist in Artifact Registry " \
+           f"(no tag is exactly {RELEASE_SHA_TAG})" in result.stderr
+    assert not any(call[:3] in JOB_MUTATIONS for call in _gcloud_calls(log))
+
+
+def test_ensure_job_shows_a_failed_lookup_and_does_not_call_the_image_missing(tmp_path):
+    stderr = ("ERROR: (gcloud.artifacts.docker.tags.list) PERMISSION_DENIED: Permission "
+              "'artifactregistry.tags.list' denied\nAuthorization: Bearer ya29.CAPTURESENTINEL8")
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", gcloud=True, mode="--ensure-job",
+                                  image_exit=1, image_stderr=stderr)
+    assert result.returncode != 0
+    assert "does not exist" not in result.stderr
+    assert f"the Artifact Registry tag lookup for the release worker image {RELEASE_WORKER_IMAGE} " \
+           "FAILED (exit 1). This is NOT a missing image" in result.stderr
+    assert "gcloud artifacts docker tags list (exit 1) said (redacted, at most 20 lines):" in result.stderr
+    assert "    | ERROR: (gcloud.artifacts.docker.tags.list) PERMISSION_DENIED: Permission " \
+           "'artifactregistry.tags.list' denied" in result.stderr
+    assert "ya29.CAPTURESENTINEL8" not in result.stdout + result.stderr
+    assert "Authorization: Bearer [REDACTED]" in result.stderr
+    assert not any(call[:3] in JOB_MUTATIONS for call in _gcloud_calls(log))
+
+
+def test_ensure_job_refuses_a_tag_that_is_not_exactly_one_sha256_digest(tmp_path):
+    rows = _tag_row(RELEASE_SHA_TAG, RELEASE_WORKER_DIGEST) + _tag_row(RELEASE_SHA_TAG, "sha256:" + "6" * 64)
+    result, log = _capture_script(tmp_path, "--enable-catalog-execution", gcloud=True, mode="--ensure-job",
+                                  image_tags=rows)
+    assert result.returncode != 0
+    assert "did not resolve to exactly one sha256 digest" in result.stderr
+    assert not any(call[:3] in JOB_MUTATIONS for call in _gcloud_calls(log))
 
 
 @pytest.mark.parametrize("reason", ["GOV_TRANSPORT_FAILED", "GOV_HTTP_STATUS_UNEXPECTED"])

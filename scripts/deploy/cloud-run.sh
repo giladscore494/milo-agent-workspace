@@ -596,10 +596,14 @@ assert_bindings_preserved() {
 }
 
 verify_image_digest() {
-  local label="$1" report="$2" expected_image="$3" deployed digest
+  local label="$1" report="$2" expected_image="$3" deployed digest="" lookup=0
   deployed=$(report_field "$report" image)
-  digest=$(gcloud artifacts docker images describe "$expected_image" --project "$PROJECT_ID" \
-    --format='value(image_summary.digest)' 2>/dev/null || true)
+  milo_image_digest_lookup "$expected_image" "$GCLOUD_ERROR_FILE" || lookup=$?
+  case "$lookup" in
+    0) digest="$MILO_IMAGE_DIGEST" ;;
+    2) milo_show_gcloud_error "the registry digest lookup (gcloud artifacts docker tags list, exit $MILO_IMAGE_LOOKUP_STATUS)" \
+         < "$GCLOUD_ERROR_FILE" ;;
+  esac
   if [[ "$deployed" == *"@"* ]]; then
     [[ -n "$digest" && "$deployed" == "${expected_image%:*}@$digest" ]] || \
       fail "$label runs image '$deployed', which does not resolve to the release digest of '$expected_image'."
@@ -846,6 +850,12 @@ BUILD_ID=""
 BUILD_ID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 BUILD_LIST_COMMAND="gcloud builds list --project=$PROJECT_ID --region=$REGION --limit=5 --format='table(id,status,createTime,images)'"
 
+# Every gcloud call on the build path keeps its stderr: a call that fails is
+# said so, with what it said (milo_show_gcloud_error: redacted and bounded),
+# and is never mistaken for an answer.
+GCLOUD_ERROR_FILE=$(mktemp)
+trap 'rm -f "$GCLOUD_ERROR_FILE"' EXIT
+
 # submit_build LABEL CONFIG SUBSTITUTION -> BUILD_ID. stderr (the source upload)
 # passes through; stdout must be exactly one well-formed build id.
 submit_build() {
@@ -862,13 +872,14 @@ submit_build() {
 
 # print_build_log_tail ID — the last BUILD_LOG_LINES lines of that build's log,
 # oldest first, redacted and bounded. Informational only: it never changes the
-# outcome, and a log that cannot be read is said so.
+# outcome, and a log that cannot be read is said so, with the read's error.
 print_build_log_tail() {
   local id="$1" log="" status=0
   log=$(gcloud logging read "resource.type=build AND resource.labels.build_id=$id" --project "$PROJECT_ID" \
-    --order=desc --limit "$BUILD_LOG_LINES" --format='value(textPayload)' 2>/dev/null) || status=$?
+    --order=desc --limit "$BUILD_LOG_LINES" --format='value(textPayload)' 2>"$GCLOUD_ERROR_FILE") || status=$?
   if [[ "$status" -ne 0 || -z "${log//[[:space:]]/}" ]]; then
     echo "  (the log of build $id could not be read$([[ "$status" -ne 0 ]] && printf ' (gcloud logging read exit %s)' "$status" || printf ': no entries yet'); the deploy stops regardless. Console: https://console.cloud.google.com/cloud-build/builds;region=$REGION/$id?project=$PROJECT_ID)" >&2
+    [[ "$status" -eq 0 ]] || milo_show_gcloud_error "gcloud logging read" < "$GCLOUD_ERROR_FILE"
     return 0
   fi
   echo "  the last log lines (up to $BUILD_LOG_LINES) of build $id, redacted:" >&2
@@ -881,10 +892,21 @@ print_build_log_tail() {
 # wait_for_build LABEL ID — poll until a terminal status, within the deadline.
 # SUCCESS returns; anything else stops the deploy after showing the log tail.
 wait_for_build() {
-  local label="$1" id="$2" state="" deadline=$((SECONDS + BUILD_DEADLINE_SECONDS))
+  local label="$1" id="$2" state="" status polls=0 failed=0 last_status=0 last_error=""
+  local deadline=$((SECONDS + BUILD_DEADLINE_SECONDS))
   while :; do
-    # A describe that fails is not a result: keep polling until the deadline.
-    state=$(gcloud builds describe "$id" --project "$PROJECT_ID" --region "$REGION" --format='value(status)' 2>/dev/null || true)
+    # A describe that fails is not a result: keep polling until the deadline,
+    # keeping what the last failed one said.
+    status=0
+    polls=$((polls + 1))
+    state=$(gcloud builds describe "$id" --project "$PROJECT_ID" --region "$REGION" --format='value(status)' \
+      2>"$GCLOUD_ERROR_FILE") || status=$?
+    if [[ "$status" -ne 0 ]]; then
+      state=""
+      failed=$((failed + 1))
+      last_status="$status"
+      last_error=$(<"$GCLOUD_ERROR_FILE")
+    fi
     case "$state" in
       SUCCESS)
         echo "$label build $id: SUCCESS"
@@ -895,20 +917,33 @@ wait_for_build() {
     esac
     if (( SECONDS >= deadline )); then
       print_build_log_tail "$id"
+      if (( failed > 0 )); then
+        echo "  $failed of $polls status reads of build $id FAILED (a failed read is not a status)." >&2
+        printf '%s\n' "$last_error" \
+          | milo_show_gcloud_error "the last failed status read (gcloud builds describe, exit $last_status)"
+      fi
       fail "The $label build $id is still ${state:-unreadable} after the ${BUILD_DEADLINE_SECONDS}s deadline. Nothing was deployed; the build may still be running: gcloud builds describe $id --project=$PROJECT_ID --region=$REGION"
     fi
     sleep "$BUILD_POLL_SECONDS"
   done
 }
 
-# verify_built_image LABEL ID IMAGE — the exact tag exists before it is deployed.
+# verify_built_image LABEL ID IMAGE — the exact tag exists, at exactly one
+# digest, before it is deployed. A lookup that fails is never "missing".
 verify_built_image() {
-  local label="$1" id="$2" image="$3" digest
-  digest=$(gcloud artifacts docker images describe "$image" --project "$PROJECT_ID" \
-    --format='value(image_summary.digest)' 2>/dev/null || true)
-  [[ -n "$digest" ]] || \
-    fail "The $label build $id reported SUCCESS, but $image is not in Artifact Registry. Nothing was deployed."
-  echo "$label image: $image ($digest)"
+  local label="$1" id="$2" image="$3" lookup=0
+  milo_image_digest_lookup "$image" "$GCLOUD_ERROR_FILE" || lookup=$?
+  case "$lookup" in
+    0)
+      echo "$label image: $image ($MILO_IMAGE_DIGEST)" ;;
+    1)
+      fail "The $label build $id reported SUCCESS, but $image is not in Artifact Registry: the tag lookup succeeded and lists no tag exactly '${image##*:}' on ${image%:*}. Nothing was deployed." ;;
+    2)
+      milo_show_gcloud_error "gcloud artifacts docker tags list (exit $MILO_IMAGE_LOOKUP_STATUS)" < "$GCLOUD_ERROR_FILE"
+      fail "The $label build $id reported SUCCESS, but the Artifact Registry tag lookup for $image FAILED (exit $MILO_IMAGE_LOOKUP_STATUS). This is NOT a missing image: whether it exists is unknown. The lookup needs artifactregistry.tags.list (artifactregistry.reader) on the repository. Nothing was deployed." ;;
+    *)
+      fail "The $label build $id reported SUCCESS, but the tag '${image##*:}' on ${image%:*} did not resolve to exactly one sha256 digest (it resolved to: $(milo_image_lookup_digests_shown)). Nothing was deployed." ;;
+  esac
 }
 
 # run_build LABEL CONFIG SUBSTITUTION IMAGE

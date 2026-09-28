@@ -25,14 +25,15 @@ the script prints every command and calls nothing.
 `deploy.sh` it runs `scripts/ops/preflight-deployer.sh`, AS the deployer, which
 
 - makes every read-only gcloud call the deploy makes (projects describe,
-  services list, service-account / repository / image / secret / Cloud Run
-  describes, the IAM policy reads, executions list, the Cloud Build source
+  services list, service-account / repository / secret / Cloud Run
+  describes, the release images' exact-tag lookup (`gcloud artifacts docker
+  tags list`, the call the deploy makes after each build), the IAM policy reads, executions list, the Cloud Build source
   bucket list, builds list, logging read);
 - probes, with `testIamPermissions` (read-only), what no read-only call can
   prove: `cloudbuild.builds.create` and the other project permissions the
   deploy uses, the async build path's own (`cloudbuild.builds.get` to poll,
   `logging.logEntries.list` to read a failed build's log,
-  `artifactregistry.dockerimages.get` for the image), `iam.serviceAccounts.actAs` on the build identity and on each
+  `artifactregistry.tags.list` to read the built image's exact tag), `iam.serviceAccounts.actAs` on the build identity and on each
   runtime identity, uploads to `gs://<project>_cloudbuild`, and that the
   deployer can **not** act as the Compute Engine default service account;
 - reports **every** disabled API, missing permission and missing resource at
@@ -139,7 +140,7 @@ nothing else:
 |---|---|---|
 | `roles/run.admin` | project | deploy / update the API service and jobs, their IAM bindings, kill switch, capture flag, arm, website stage (capture job `--ensure-job` and its run-with-overrides binding) |
 | `roles/cloudbuild.builds.editor` | project | `gcloud builds submit` (both images) |
-| `roles/artifactregistry.reader` | project | image describes (capture script `--ensure-job`, verify, preflight) |
+| `roles/artifactregistry.reader` | project | a release image's exact-tag lookup, `gcloud artifacts docker tags list` (deploy, preflight, `production-verify.sh` CODE_DEPLOYED, capture script `--ensure-job`). The deployer holds **no** Container Analysis role, so no script uses `images describe` |
 | `roles/secretmanager.viewer` | project | preflight: secret metadata and IAM policy, never a value |
 | `roles/iam.serviceAccountViewer` | project | preflight: service-account describes |
 | `roles/serviceusage.serviceUsageConsumer` | project | builds submit / services list |

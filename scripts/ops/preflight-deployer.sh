@@ -9,16 +9,17 @@
 # there; each fix costs another run. This answers all of it in one run:
 #
 #   * the read-only calls themselves (projects describe, services list,
-#     service-accounts / repositories / images / secrets / Cloud Run
-#     describes, IAM policy reads, executions list, the Cloud Build source
-#     bucket list, builds list, logging read), each classified on failure as
-#     a DISABLED API, a MISSING PERMISSION (named when gcloud names it) or a
-#     MISSING RESOURCE;
+#     service-accounts / repositories / secrets / Cloud Run describes, the
+#     release images' exact-tag lookups, IAM policy reads, executions list,
+#     the Cloud Build source bucket list, builds list, logging read), each
+#     classified on failure as a DISABLED API, a MISSING PERMISSION (named
+#     when gcloud names it) or a MISSING RESOURCE;
 #   * testIamPermissions probes -- read-only by definition -- for what no
 #     read-only call can prove: cloudbuild.builds.create and the rest of the
 #     project permissions the deploy uses, the async build path's own
 #     (cloudbuild.builds.get to poll a build, logging.logEntries.list to read
-#     a failed build's log, artifactregistry.dockerimages.get for its image), iam.serviceAccounts.actAs on the
+#     a failed build's log, artifactregistry.tags.list to read its image's
+#     exact tag -- never Container Analysis), iam.serviceAccounts.actAs on the
 #     build identity and each runtime identity, uploads to the build source
 #     bucket, and that the deployer can NOT act as the Compute Engine default
 #     service account.
@@ -285,10 +286,14 @@ for account in "${RUNTIME_ACCOUNTS[@]}" "$BUILD_SA"; do
 done
 check "artifact-repository" required \
   gcloud artifacts repositories describe "$REPOSITORY" --location "$REGION" --project "$PROJECT_ID"
-check "api-image" optional \
-  gcloud artifacts docker images describe "$API_IMAGE" --project "$PROJECT_ID" --format='value(image_summary.digest)'
-check "worker-image" optional \
-  gcloud artifacts docker images describe "$WORKER_IMAGE" --project "$PROJECT_ID" --format='value(image_summary.digest)'
+# The exact tag lookup cloud-run.sh makes after each build
+# (deployment-contract.sh, "Image tag lookup"): artifactregistry.tags.list
+# only. Not `images describe`, which also reads Container Analysis. Before a
+# build the tag need not exist; the call proves the deployer may look.
+milo_tags_list_command "$API_IMAGE"
+check "api-image-tag" optional "${MILO_TAGS_LIST_COMMAND[@]}"
+milo_tags_list_command "$WORKER_IMAGE"
+check "worker-image-tag" optional "${MILO_TAGS_LIST_COMMAND[@]}"
 for key in SECRET_SUPABASE_URL SECRET_SUPABASE_SERVICE_KEY SECRET_REDIS_URL SECRET_REDIS_TOKEN; do
   secret="$(milo_op "$key")"
   [[ -n "$secret" ]] || continue
@@ -340,10 +345,10 @@ probe "permissions:project" \
   "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
   "${PROJECT_PERMISSIONS[@]}"
 # The async build path (cloud-run.sh): submit, poll `gcloud builds describe`,
-# read the log of a build that did not succeed, prove the image exists.
+# read the log of a build that did not succeed, read the image's exact tag.
 probe "permissions:build-wait" \
   "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
-  cloudbuild.builds.create cloudbuild.builds.get logging.logEntries.list artifactregistry.dockerimages.get
+  cloudbuild.builds.create cloudbuild.builds.get logging.logEntries.list artifactregistry.tags.list
 probe "act-as:${BUILD_SA%@*} (build identity)" \
   "https://iam.googleapis.com/v1/projects/-/serviceAccounts/${BUILD_SA}:testIamPermissions" POST held \
   iam.serviceAccounts.actAs

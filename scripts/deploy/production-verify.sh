@@ -168,11 +168,26 @@ else
     || problems+="MILO_RELEASE_SHA is not ${EXPECTED_SHA} on both surfaces; "
   if [[ -n "$problems" ]]; then
     fact CODE_DEPLOYED NO "${problems%; }"
-  elif ! gcloud artifacts docker images describe "$WORKER_IMAGE_EXPECTED" --project "$PROJECT_ID" \
-         > /dev/null 2>&1; then
-    fact CODE_DEPLOYED UNVERIFIED "the worker image ${WORKER_IMAGE_EXPECTED} could not be described in Artifact Registry"
   else
-    fact CODE_DEPLOYED VERIFIED "API and worker run ${EXPECTED_SHA}; the worker image exists"
+    # The worker image must exist at its exact tag, read with the tag lookup
+    # (deployment-contract.sh, "Image tag lookup") -- never `images describe`,
+    # which also reads Container Analysis. A lookup that FAILS proves nothing
+    # either way and is shown, never read as absent.
+    lookup=0
+    milo_image_digest_lookup "$WORKER_IMAGE_EXPECTED" "${_MILO_VERIFY_TMP}/tags-list.err" || lookup=$?
+    case "$lookup" in
+      0)
+        printf 'WORKER_IMAGE_DIGEST=%s\n' "$MILO_IMAGE_DIGEST"
+        fact CODE_DEPLOYED VERIFIED "API and worker run ${EXPECTED_SHA}; the worker image exists (${MILO_IMAGE_DIGEST})" ;;
+      1)
+        fact CODE_DEPLOYED NO "the worker image ${WORKER_IMAGE_EXPECTED} is not in Artifact Registry: no tag is exactly ${EXPECTED_SHA}" ;;
+      2)
+        milo_show_gcloud_error "gcloud artifacts docker tags list (exit ${MILO_IMAGE_LOOKUP_STATUS})" \
+          < "${_MILO_VERIFY_TMP}/tags-list.err"
+        fact CODE_DEPLOYED UNVERIFIED "the Artifact Registry tag lookup for ${WORKER_IMAGE_EXPECTED} FAILED (exit ${MILO_IMAGE_LOOKUP_STATUS}); whether it exists is unknown (it needs artifactregistry.tags.list)" ;;
+      *)
+        fact CODE_DEPLOYED UNVERIFIED "the tag ${EXPECTED_SHA} of ${WORKER_IMAGE_EXPECTED%:*} did not resolve to exactly one sha256 digest (it resolved to: $(milo_image_lookup_digests_shown))" ;;
+    esac
   fi
 fi
 

@@ -221,6 +221,91 @@ milo_redact_stream() {
 }
 
 # ---------------------------------------------------------------------------
+# Image tag lookup
+# ---------------------------------------------------------------------------
+# The digest a release tag points at is read with `gcloud artifacts docker
+# tags list`, which needs artifactregistry.tags.list (artifactregistry.reader)
+# and nothing else. `gcloud artifacts docker images describe` is NOT used:
+# where containeranalysis.googleapis.com is enabled it also reads the image's
+# build provenance from Container Analysis, a permission the deployer does not
+# hold and is never granted, so it fails for an image that exists.
+#
+# milo_tags_list_command IMAGE_REF — sets MILO_TAGS_LIST_COMMAND to the exact
+# call for REGISTRY/PROJECT/REPO/IMAGE:TAG: that image path, that tag. The
+# filter's ':' is a substring match, so the answer is never trusted as it
+# stands: milo_exact_tag_digests keeps only the rows whose tag IS the tag.
+# Every script that asks whether a release image exists runs this call
+# (milo_image_digest_lookup) or prints it (milo_tags_list_command_line).
+milo_tags_list_command() {
+  local ref="$1"
+  MILO_TAGS_LIST_COMMAND=(gcloud artifacts docker tags list "${ref%:*}"
+    "--filter=tag:${ref##*:}" "--format=value(tag,version)")
+}
+
+# milo_tags_list_command_line IMAGE_REF — the same call as one line an
+# operator can paste (the filter and format single-quoted).
+milo_tags_list_command_line() {
+  milo_tags_list_command "$1"
+  printf "%s %s %s %s %s %s --filter='%s' --format='%s'" "${MILO_TAGS_LIST_COMMAND[@]:0:6}" \
+    "${MILO_TAGS_LIST_COMMAND[6]#--filter=}" "${MILO_TAGS_LIST_COMMAND[7]#--format=}"
+}
+
+# milo_exact_tag_digests TAG < TAGS_LIST_OUTPUT — the version (digest) of
+# every row whose tag's last path segment is exactly TAG, one per line,
+# de-duplicated ("<none>" for a row without one). gcloud names both as
+# resource paths (.../tags/<TAG>, .../versions/sha256:<hex>); only the last
+# segment counts.
+milo_exact_tag_digests() {
+  awk -F'\t' -v tag="$1" '
+    { t = $1; sub(/.*\//, "", t); v = $2; sub(/.*\//, "", v); if (v == "") v = "<none>" }
+    t == tag && !seen[v]++ { print v }'
+}
+
+# milo_image_digest_lookup IMAGE_REF ERROR_FILE — the ONE digest the exact tag
+# of IMAGE_REF points at. Three outcomes, never confused:
+#   0  present: MILO_IMAGE_DIGEST is its sha256:<64 hex> digest;
+#   1  absent: the call succeeded and lists no tag exactly that tag;
+#   2  the call FAILED (exit in MILO_IMAGE_LOOKUP_STATUS, stderr in
+#      ERROR_FILE): whether the image exists is unknown -- show it with
+#      milo_show_gcloud_error, never call it missing;
+#   3  the exact tag did not yield exactly one sha256 digest
+#      (MILO_IMAGE_LOOKUP_DIGESTS holds what it yielded).
+# Called directly, never in $( ): it answers through those variables.
+MILO_IMAGE_DIGEST="" MILO_IMAGE_LOOKUP_STATUS=0 MILO_IMAGE_LOOKUP_DIGESTS=""
+milo_image_digest_lookup() {
+  local image="$1" error_file="$2" output=""
+  MILO_IMAGE_DIGEST="" MILO_IMAGE_LOOKUP_STATUS=0 MILO_IMAGE_LOOKUP_DIGESTS=""
+  milo_tags_list_command "$image"
+  output=$("${MILO_TAGS_LIST_COMMAND[@]}" 2>"$error_file") || MILO_IMAGE_LOOKUP_STATUS=$?
+  [[ "$MILO_IMAGE_LOOKUP_STATUS" -eq 0 ]] || return 2
+  MILO_IMAGE_LOOKUP_DIGESTS=$(printf '%s\n' "$output" | milo_exact_tag_digests "${image##*:}")
+  [[ -n "$MILO_IMAGE_LOOKUP_DIGESTS" ]] || return 1
+  [[ "$MILO_IMAGE_LOOKUP_DIGESTS" =~ ^sha256:[0-9a-f]{64}$ ]] || return 3
+  MILO_IMAGE_DIGEST="$MILO_IMAGE_LOOKUP_DIGESTS"
+}
+
+# milo_image_lookup_digests_shown — outcome 3's digests on one line (at most
+# five, redacted), for a message.
+milo_image_lookup_digests_shown() {
+  printf '%s\n' "$MILO_IMAGE_LOOKUP_DIGESTS" | awk 'NR <= 5' | milo_redact_stream | paste -sd ' ' -
+}
+
+# milo_show_gcloud_error WHAT < STDERR — what a failed gcloud call said, on
+# stderr: redacted, at most MILO_GCLOUD_ERROR_LINES lines of at most 500
+# characters. A failed call is shown, never swallowed.
+MILO_GCLOUD_ERROR_LINES=20
+milo_show_gcloud_error() {
+  local text
+  text=$(awk -v n="$MILO_GCLOUD_ERROR_LINES" 'NF && kept < n { print; kept++ }')
+  echo "  $1 said (redacted, at most $MILO_GCLOUD_ERROR_LINES lines):" >&2
+  if [[ -z "$text" ]]; then
+    echo "    | (nothing on stderr)" >&2
+  else
+    printf '%s\n' "$text" | milo_redact_stream | sed 's/^/    | /' >&2
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Government capture job
 # ---------------------------------------------------------------------------
 # The operator capture runs the EXISTING entrypoint
