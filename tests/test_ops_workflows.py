@@ -39,9 +39,11 @@ import yaml
 REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
 OPS = REPO / "scripts" / "ops"
-PRODUCTION_WORKFLOWS = ("deploy.yml", "kill-switch.yml", "capture-flag.yml", "gates.yml", "arm.yml")
+PRODUCTION_WORKFLOWS = ("deploy.yml", "kill-switch.yml", "capture-flag.yml", "gates.yml", "arm.yml",
+                        "website-stage.yml")
 OPS_SCRIPTS = ("common.sh", "deploy.sh", "kill-switch.sh", "capture-flag.sh", "gates.sh", "arm.sh",
-               "setup-wif.sh", "write-operator-config.sh", "link-vercel.sh")
+               "setup-wif.sh", "write-operator-config.sh", "link-vercel.sh", "website-stage.sh",
+               "deployed-release.sh")
 
 #: Sentinel secrets: if one of these ever reaches stdout, stderr or the job
 #: summary, a script printed a secret.
@@ -64,7 +66,10 @@ OPERATOR_ENV = (
     "SUPABASE_PROJECT_REF=abcdefghijklmnopqrst\n"
     "SECRET_SUPABASE_URL=SUPABASE_URL\nSECRET_SUPABASE_SERVICE_KEY=SUPABASE_SECRET_KEY\n"
     "SECRET_PROVIDER_API_KEY=KIMI_API_KEY\nPRODUCTION_ORIGIN=https://site.test\n"
-    "READONLY_DATABASE_URL_ENV=MILO_READONLY_DB_URL\n")
+    "READONLY_DATABASE_URL_ENV=MILO_READONLY_DB_URL\n"
+    "MILO_GATEWAY_AUDIENCE=https://test-api.example.test\n"
+    "MILO_APPROVED_GATEWAY_IDENTITIES=gateway@test-project.iam.gserviceaccount.com\n"
+    "MILO_WORKER_AUDIENCE=https://test-api.example.test/worker\n")
 
 
 def workflow(name: str) -> dict:
@@ -197,7 +202,7 @@ class OpsTree:
 
     def __init__(self, tmp_path: Path) -> None:
         self.root = tmp_path / "repo"
-        for relative in ("scripts/ops", "scripts/deploy", "scripts/release", "backend"):
+        for relative in ("scripts/ops", "scripts/deploy", "scripts/release", "scripts/catalog", "backend"):
             shutil.copytree(REPO / relative, self.root / relative,
                             ignore=shutil.ignore_patterns("__pycache__"))
         (self.root / "frontend").mkdir()
@@ -275,7 +280,7 @@ def test_the_deploy_dry_run_states_every_step_of_the_r_block_in_order(tmp_path):
     tree = OpsTree(tmp_path)
     result = tree.run("deploy.sh", "--sha", tree.sha, "--dry-run")
     steps_seen = re.findall(r"^SUMMARY\|(\d+) ", result.stdout, re.M)
-    assert steps_seen == [str(n) for n in range(1, 11)]
+    assert steps_seen == [str(n) for n in range(1, 12)]
     for needle in ("check-migration-state.sh", "website-execution-check.sh",
                    "--remove-secrets KIMI_API_KEY", "production-activate.sh --all",
                    "--force-redeploy", "MILO_COMMANDER_MODEL=kimi-k3",

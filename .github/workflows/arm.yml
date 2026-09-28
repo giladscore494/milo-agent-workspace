@@ -73,6 +73,24 @@ jobs:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
 
+      - name: The checkout is still clean after authenticating
+        # google-github-actions/auth writes gha-creds-*.json into the workspace.
+        # It must be ignored (.gitignore, .dockerignore, .gcloudignore) so it
+        # is neither a local change nor uploaded by gcloud builds submit.
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [[ -n "${dirty}" ]]; then
+            echo "::error::The checkout changed while authenticating to Google Cloud. Only ignored files may appear (the auth step's gha-creds-*.json credentials file). Not ignored:"
+            printf '%s\n' "${dirty}"
+            exit 1
+          fi
+          if ! grep -qxF 'gha-creds-*.json' .gcloudignore; then
+            echo "::error::.gcloudignore does not exclude gha-creds-*.json: gcloud builds submit would upload the credentials file."
+            exit 1
+          fi
+          echo "Clean: the credentials file is ignored and nothing else changed."
+
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:

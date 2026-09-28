@@ -1,13 +1,14 @@
 # Operating production without Cloud Shell (plan decision 23)
 
-Five GitHub Actions workflows replace the Cloud Shell operator steps. Each one
+Six GitHub Actions workflows replace the Cloud Shell operator steps. Each one
 wraps the canonical script for its step, unchanged, and writes a
 `SUMMARY|<step>|<result>|<detail>` line per step to the job summary, so the
 GitHub mobile app shows what happened without opening a log.
 
 | Workflow | Script | Environment | What it does |
 |---|---|---|---|
-| `deploy.yml` (input `sha`) | `scripts/ops/deploy.sh` | `production` (reviewer) | the R block: CI green on that exact SHA, migrations fully applied, Vercel built that SHA with run starts closed, 0 live runs, Stage 2 reset, `production-activate.sh --all`, worker model env, worker contract (`MILO_CAPTURE_REPLAY=false`, no `KIMI_API_KEY`), deployed gate |
+| `deploy.yml` (inputs `sha`, `restore_website_stage`) | `scripts/ops/deploy.sh` | `production` (reviewer) | the R block: CI green on that exact SHA, migrations fully applied, Vercel built that SHA with run starts closed, 0 live runs, Stage 2 reset, `production-activate.sh --all`, worker model env, worker contract (`MILO_CAPTURE_REPLAY=false`, no `KIMI_API_KEY`), deployed gate; then, only after all of that passed, step 11 turns the website's plan tools back on (below) |
+| `website-stage.yml` (input `stage`, optional `sha`) | `scripts/ops/website-stage.sh` | `production` (reviewer) | the website's plan tools without a deploy: `plan-authoring` (Stage P), `web-preparation` (E', the Prepare button) or `both`; never Stage 2 |
 | `kill-switch.yml` | `scripts/ops/kill-switch.sh` → `scripts/deploy/kill-switch.sh` | `production-kill-switch` (**no** reviewer) | the canonical emergency order; confirm with `KILL` |
 | `capture-flag.yml` (input `on`/`off`) | `scripts/ops/capture-flag.sh` | `production` | `MILO_CAPTURE_REPLAY` on the worker job only; `on` refused unless 0 live runs; turn it off after one run |
 | `gates.yml` (input `gate`, optional revision) | `scripts/ops/gates.sh` | `production` | read-only `production-verify.sh --gate <gate>` |
@@ -17,6 +18,41 @@ Every workflow is `workflow_dispatch` only, refuses to run from anything but
 `main`, and is serialized (`milo-production-operations`; the kill switch has its
 own group so it never waits behind a deploy). Every one has a `dry_run` input:
 the script prints every command and calls nothing.
+
+## The website's plan tools after a deploy
+
+A Stage A deploy (`MILO_PERMANENT_MODE=false`) turns off
+`MILO_ENABLE_WORK_SCOPE_MUTATIONS` (Stage P, editing a plan) and
+`MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS` (E', the Prepare button).
+`deploy.yml`'s `restore_website_stage` (default `both`) turns them back on as
+step 11, reached only when steps 1-10 passed -- a failed deploy restores
+nothing:
+
+| Value | Canonical tools, in order |
+|---|---|
+| `plan-authoring` | `website-execution-activate.sh --apply-plan-authoring` |
+| `web-preparation` | `government-production-capture.sh --ensure-job --enable-catalog-execution`, then `website-execution-activate.sh --apply-web-preparation` |
+| `both` | the two above, in that order |
+| `none` | nothing |
+
+Each runs behind its own deployed gate and reads back that run creation, paid
+execution and scoped preparation stay OFF on the API. Stage 2 is never touched:
+paid execution stays with `arm.yml`. In permanent mode step 11 is skipped (the
+live stage was kept). `website-stage.yml` runs the same steps on their own; it
+checks out the release production runs (MILO_RELEASE_SHA on the API and the
+worker, or the `sha` input), because both tools act on `git rev-parse HEAD`.
+The Vercel half of Stage P is not changed by a deploy, so it needs nothing here.
+
+## The credentials file of the auth step
+
+`google-github-actions/auth` writes `gha-creds-<hash>.json` into the checkout.
+`.gitignore`, `.dockerignore` and `.gcloudignore` exclude `gha-creds-*.json`, so
+it neither makes `release:worktree-clean` dirty nor reaches the Cloud Build
+source bucket (`.gcloudignore` is otherwise exactly gcloud's generated default:
+`.gcloudignore`, `.git`, `.gitignore`, `#!include:.gitignore`). Every workflow
+runs `git status --porcelain` right after authenticating and stops if anything
+but an ignored file appeared. A release older than this change has none of
+that, so `deploy.yml` cannot deploy it.
 
 **Opening run starts on the website stays a person's step in Vercel**
 (`GATEWAY_ALLOW_RUN_START_ROUTES`), after `arm.yml` passes the armed gate.
@@ -43,9 +79,9 @@ nothing else:
 
 | Role | Where | Needed by |
 |---|---|---|
-| `roles/run.admin` | project | deploy / update the API service and jobs, their IAM bindings, kill switch, capture flag, arm |
+| `roles/run.admin` | project | deploy / update the API service and jobs, their IAM bindings, kill switch, capture flag, arm, website stage (capture job `--ensure-job` and its run-with-overrides binding) |
 | `roles/cloudbuild.builds.editor` | project | `gcloud builds submit` (both images) |
-| `roles/artifactregistry.reader` | project | image describes (capture script, verify, preflight) |
+| `roles/artifactregistry.reader` | project | image describes (capture script `--ensure-job`, verify, preflight) |
 | `roles/secretmanager.viewer` | project | preflight: secret metadata and IAM policy, never a value |
 | `roles/iam.serviceAccountViewer` | project | preflight: service-account describes |
 | `roles/serviceusage.serviceUsageConsumer` | project | builds submit / services list |

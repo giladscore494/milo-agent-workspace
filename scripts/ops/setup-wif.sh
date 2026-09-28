@@ -73,17 +73,27 @@ CONDITION="assertion.repository == '${GITHUB_REPOSITORY_NAME}' && assertion.ref 
 MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.environment=assertion.environment"
 
 # The minimum project roles, and the command in this repository that needs each.
+# website-stage.sh (and deploy.sh step 11) needs nothing beyond them:
+# --ensure-job is `gcloud run jobs create|update` of the capture job AS the
+# capture identity (run.admin + actAs below) after an images describe
+# (artifactregistry.reader); the capture-job binding is `gcloud run jobs
+# add-iam-policy-binding` (run.jobs.setIamPolicy, in run.admin); Stage P / E'
+# are `gcloud run services update` of the API AS its identity (run.admin +
+# actAs). The deployer never reads a secret value: the capture job's secrets
+# are read by the capture identity at run time.
 PROJECT_ROLES=(
-  "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag
+  "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag; website stage (capture job ensure + its run-with-overrides binding)
   "roles/cloudbuild.builds.editor"         # cloud-run.sh: gcloud builds submit (both images)
-  "roles/artifactregistry.reader"          # images describe (capture script, verify, preflight)
+  "roles/artifactregistry.reader"          # images describe (capture script --ensure-job, verify, preflight)
   "roles/secretmanager.viewer"             # preflight: secrets describe / get-iam-policy (metadata only, never a value)
   "roles/iam.serviceAccountViewer"         # preflight / cloud-run.sh: service-accounts describe
   "roles/serviceusage.serviceUsageConsumer" # gcloud builds submit / services list against the project
   "roles/logging.viewer"                   # builds submit log streaming; capture execution documents
 )
 # Runtime identities the deployer deploys AS (iam.serviceAccounts.actAs), each
-# bound on that account only -- never project-wide.
+# bound on that account only -- never project-wide. The capture job runs as
+# CAPTURE_SERVICE_ACCOUNT, or, when none is configured, as the worker identity
+# (government-production-capture.sh), which is already in this list.
 ACT_AS=("$(milo_op API_SERVICE_ACCOUNT)" "$(milo_op WORKER_SERVICE_ACCOUNT)")
 [[ -n "$CAPTURE_SA" ]] && ACT_AS+=("$CAPTURE_SA")
 
