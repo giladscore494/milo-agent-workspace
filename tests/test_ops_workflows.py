@@ -43,7 +43,7 @@ PRODUCTION_WORKFLOWS = ("deploy.yml", "kill-switch.yml", "capture-flag.yml", "ga
                         "website-stage.yml")
 OPS_SCRIPTS = ("common.sh", "deploy.sh", "kill-switch.sh", "capture-flag.sh", "gates.sh", "arm.sh",
                "setup-wif.sh", "write-operator-config.sh", "link-vercel.sh", "website-stage.sh",
-               "deployed-release.sh")
+               "deployed-release.sh", "preflight-deployer.sh")
 
 #: Sentinel secrets: if one of these ever reaches stdout, stderr or the job
 #: summary, a script printed a secret.
@@ -63,6 +63,7 @@ OPERATOR_ENV = (
     "API_SERVICE_ACCOUNT=api@test-project.iam.gserviceaccount.com\n"
     "WORKER_SERVICE_ACCOUNT=worker@test-project.iam.gserviceaccount.com\n"
     "CAPTURE_SERVICE_ACCOUNT=capture@test-project.iam.gserviceaccount.com\n"
+    "CLOUD_BUILD_SERVICE_ACCOUNT=milo-cloudbuild@test-project.iam.gserviceaccount.com\n"
     "SUPABASE_PROJECT_REF=abcdefghijklmnopqrst\n"
     "SECRET_SUPABASE_URL=SUPABASE_URL\nSECRET_SUPABASE_SERVICE_KEY=SUPABASE_SECRET_KEY\n"
     "SECRET_PROVIDER_API_KEY=KIMI_API_KEY\nPRODUCTION_ORIGIN=https://site.test\n"
@@ -257,12 +258,13 @@ def dry_runs(tree: OpsTree) -> dict[str, tuple[str, ...]]:
         "capture-flag.sh off": ("off", "--dry-run"),
         "gates.sh": ("--gate", "prepared", *WS, "--dry-run"),
         "arm.sh": (*WS, "--dry-run"),
+        "preflight-deployer.sh": ("--sha", tree.sha, "--dry-run"),
     }
 
 
 @pytest.mark.parametrize("label", ["deploy.sh", "deploy.sh (permanent)", "kill-switch.sh",
                                    "capture-flag.sh on", "capture-flag.sh off", "gates.sh",
-                                   "arm.sh"])
+                                   "arm.sh", "preflight-deployer.sh"])
 def test_every_dry_run_calls_nothing_and_prints_no_secret(tmp_path, label):
     tree = OpsTree(tmp_path)
     args = dry_runs(tree)[label]
@@ -405,9 +407,12 @@ WIF_GCLOUD = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
 path = os.environ["OPS_TEST_WIF_STATE"]
-state = json.load(open(path)) if os.path.exists(path) else {
-    "apis": [], "pools": [], "providers": {}, "accounts": [], "project_bindings": [],
-    "sa_bindings": {}, "bucket_bindings": []}
+state = {"apis": [], "pools": [], "providers": {}, "accounts": [], "project_bindings": [],
+         "sa_bindings": {}, "buckets": [], "bucket_bindings": [], "repositories": ["test-repo"],
+         "repo_bindings": []}
+state.update(json.loads(os.environ.get("OPS_TEST_WIF_INITIAL") or "{}"))
+if os.path.exists(path):
+    state = json.load(open(path))
 with open(os.environ["OPS_TEST_CALLS"], "a") as log:
     log.write("gcloud " + " ".join(args) + "\n")
 def save():
@@ -419,6 +424,14 @@ def flag(name):
         if arg.startswith(name + "="):
             return arg.split("=", 1)[1]
     raise SystemExit(3)
+def policy(bindings):
+    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]}))
+    sys.exit(0)
+def remove(bindings):
+    pair = [flag("--role"), flag("--member")]
+    if pair not in bindings:
+        sys.stderr.write("binding not found\n"); sys.exit(1)
+    bindings.remove(pair); save(); sys.exit(0)
 joined = " ".join(args)
 if args[:2] == ["auth", "list"]:
     print("owner@example.test"); sys.exit(0)
@@ -447,27 +460,48 @@ if args[:3] == ["iam", "service-accounts", "describe"]:
 if args[:3] == ["iam", "service-accounts", "create"]:
     state["accounts"].append(args[3]); save(); sys.exit(0)
 if args[:2] == ["projects", "get-iam-policy"]:
-    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in state["project_bindings"]]}))
-    sys.exit(0)
+    policy(state["project_bindings"])
 if args[:2] == ["projects", "add-iam-policy-binding"]:
     state["project_bindings"].append([flag("--role"), flag("--member")]); save(); sys.exit(0)
+if args[:2] == ["projects", "remove-iam-policy-binding"]:
+    remove(state["project_bindings"])
 if args[:3] == ["iam", "service-accounts", "get-iam-policy"]:
-    bindings = state["sa_bindings"].get(args[3], [])
-    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]})); sys.exit(0)
+    policy(state["sa_bindings"].get(args[3], []))
 if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:
     state["sa_bindings"].setdefault(args[3], []).append([flag("--role"), flag("--member")]); save()
     sys.exit(0)
+if args[:3] == ["iam", "service-accounts", "remove-iam-policy-binding"]:
+    remove(state["sa_bindings"].setdefault(args[3], []))
 if args[:3] == ["storage", "buckets", "describe"]:
-    sys.exit(0)
+    sys.exit(0 if args[3] in state["buckets"] else 1)
+if args[:3] == ["storage", "buckets", "create"]:
+    state["buckets"].append(args[3]); save(); sys.exit(0)
 if args[:3] == ["storage", "buckets", "get-iam-policy"]:
-    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in state["bucket_bindings"]]}))
-    sys.exit(0)
+    if args[3] not in state["buckets"]:
+        sys.exit(1)
+    policy(state["bucket_bindings"])
 if args[:3] == ["storage", "buckets", "add-iam-policy-binding"]:
+    if args[3] not in state["buckets"]:
+        sys.stderr.write("NOT_FOUND bucket\n"); sys.exit(1)
     state["bucket_bindings"].append([flag("--role"), flag("--member")]); save(); sys.exit(0)
+if args[:3] == ["artifacts", "repositories", "describe"]:
+    sys.exit(0 if args[3] in state["repositories"] else 1)
+if args[:3] == ["artifacts", "repositories", "get-iam-policy"]:
+    if args[3] not in state["repositories"]:
+        sys.exit(1)
+    policy(state["repo_bindings"])
+if args[:3] == ["artifacts", "repositories", "add-iam-policy-binding"]:
+    state["repo_bindings"].append([flag("--role"), flag("--member")]); save(); sys.exit(0)
 sys.stderr.write("unmocked gcloud " + joined + "\n"); sys.exit(2)
 '''
 
 READ_ONLY_VERBS = ("describe", "list", "get-iam-policy", "get-value")
+
+
+DEPLOYER = "serviceAccount:milo-github-deployer@test-project.iam.gserviceaccount.com"
+BUILD_SA = "milo-cloudbuild@test-project.iam.gserviceaccount.com"
+COMPUTE_SA = "123456789-compute@developer.gserviceaccount.com"
+CHANGE_LINE = re.compile(r"^(CREATE|UPDATE|BIND|UNBIND) ", re.M)
 
 
 def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
@@ -485,34 +519,56 @@ def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
                  "assertion.ref == 'refs/heads/main' && "
                  "assertion.environment in ['production', 'production-kill-switch']")
     assert condition in plan.stdout
-    planned = len(re.findall(r"^(CREATE|UPDATE|BIND) ", plan.stdout, re.M))
+    planned = len(CHANGE_LINE.findall(plan.stdout))
     assert planned > 0
     assert "GCP_WORKLOAD_IDENTITY_PROVIDER=projects/123456789/locations/global/" \
            "workloadIdentityPools/milo-github/providers/github-actions" in plan.stdout
+    assert f"CLOUD_BUILD_SERVICE_ACCOUNT={BUILD_SA}" in plan.stdout
 
     tree.calls.write_text("", encoding="utf-8")
     applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
     assert applied.returncode == 0, applied.stdout + applied.stderr
-    assert len(re.findall(r"^(CREATE|UPDATE|BIND) ", applied.stdout, re.M)) == planned
+    assert len(CHANGE_LINE.findall(applied.stdout)) == planned
     calls = tree.tool_calls()
     assert not [call for call in calls if "keys create" in call], "no key is ever created"
     wif_user = [call for call in calls if "roles/iam.workloadIdentityUser" in call]
     assert wif_user and all("attribute.repository/giladscore494/milo-agent-workspace" in call
                             for call in wif_user)
-    project_roles = {call.split("--role ")[1].split()[0] for call in calls
-                     if call.startswith("gcloud projects add-iam-policy-binding")}
-    assert project_roles == {"roles/run.admin", "roles/cloudbuild.builds.editor",
-                             "roles/artifactregistry.reader", "roles/secretmanager.viewer",
-                             "roles/iam.serviceAccountViewer",
-                             "roles/serviceusage.serviceUsageConsumer", "roles/logging.viewer"}
-    assert not {"roles/owner", "roles/editor", "roles/iam.serviceAccountUser"} & project_roles
+    state = json.loads((tmp_path / "wif.json").read_text())
+    deployer_roles = {role for role, member in state["project_bindings"] if member == DEPLOYER}
+    assert deployer_roles == {"roles/run.admin", "roles/cloudbuild.builds.editor",
+                              "roles/artifactregistry.reader", "roles/secretmanager.viewer",
+                              "roles/iam.serviceAccountViewer",
+                              "roles/serviceusage.serviceUsageConsumer", "roles/logging.viewer",
+                              "roles/storage.bucketViewer"}
+    assert not {"roles/owner", "roles/editor", "roles/iam.serviceAccountUser"} & deployer_roles
+    # The build identity: exactly three bindings, each on the narrowest resource.
+    build = f"serviceAccount:{BUILD_SA}"
+    assert "milo-cloudbuild" in state["accounts"]
+    assert [role for role, member in state["project_bindings"] if member == build] == \
+        ["roles/logging.logWriter"]
+    assert state["repo_bindings"] == [["roles/artifactregistry.writer", build]]
+    assert [role for role, member in state["bucket_bindings"] if member == build] == \
+        ["roles/storage.objectViewer"]
+    assert "gs://test-project_cloudbuild" in state["buckets"]
+    # actAs: the three runtime identities and the build identity, each on that
+    # account only -- never the Compute default service account.
     act_as = [call for call in calls if "roles/iam.serviceAccountUser" in call]
-    assert len(act_as) == 3 and all(call.startswith("gcloud iam service-accounts add-iam-policy-binding")
+    assert len(act_as) == 4 and all(call.startswith("gcloud iam service-accounts add-iam-policy-binding")
                                     for call in act_as)
+    assert sorted(account for account, bindings in state["sa_bindings"].items()
+                  if ["roles/iam.serviceAccountUser", DEPLOYER] in bindings) == sorted([
+        "api@test-project.iam.gserviceaccount.com", "worker@test-project.iam.gserviceaccount.com",
+        "capture@test-project.iam.gserviceaccount.com", BUILD_SA])
+    assert not [call for call in calls if COMPUTE_SA in call and "add-iam-policy-binding" in call]
+    assert set(state["apis"]) == {
+        "cloudresourcemanager.googleapis.com", "iam.googleapis.com", "iamcredentials.googleapis.com",
+        "sts.googleapis.com", "run.googleapis.com", "cloudbuild.googleapis.com",
+        "artifactregistry.googleapis.com", "serviceusage.googleapis.com", "logging.googleapis.com"}
 
     again = tree.run("setup-wif.sh", "--plan", extra_env=env)
     assert again.returncode == 0
-    assert re.findall(r"^(CREATE|UPDATE|BIND) ", again.stdout, re.M) == []
+    assert CHANGE_LINE.findall(again.stdout) == []
     assert "PLAN: 0 change(s)" in again.stdout
 
 

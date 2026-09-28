@@ -68,6 +68,12 @@ case "$RESTORE_STAGE" in
 esac
 
 ops_load_config
+# Both image builds run as the dedicated build identity (PR-Ops3). Refused up
+# front, before any step, rather than half-way through the R block.
+if ! build_sa_problem="$(milo_build_service_account_problem "$(milo_op CLOUD_BUILD_SERVICE_ACCOUNT)")"; then
+  printf 'FAIL: %s\n' "$build_sa_problem" >&2
+  exit 2
+fi
 CONFIG_ARG=(--operator-config "$CONFIG_PATH")
 summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT}; restore website stage: ${RESTORE_STAGE})"
 

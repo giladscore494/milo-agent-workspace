@@ -12,6 +12,11 @@ REGION=${REGION:-us-central1}
 REPOSITORY=${REPOSITORY:-milo-agent}
 API_SERVICE_ACCOUNT=${API_SERVICE_ACCOUNT:-milo-api-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com}
 WORKER_SERVICE_ACCOUNT=${WORKER_SERVICE_ACCOUNT:-milo-worker-runtime@big-cabinet-457321-t7.iam.gserviceaccount.com}
+# The identity BOTH image builds run as (deployment-contract.sh, "Build
+# identity"). production-activate.sh exports it from the operator configuration
+# (CLOUD_BUILD_SERVICE_ACCOUNT) and refuses a configuration without it; this
+# default keeps a direct Cloud Shell invocation aimed at the same account.
+CLOUD_BUILD_SERVICE_ACCOUNT=${CLOUD_BUILD_SERVICE_ACCOUNT:-milo-cloudbuild@big-cabinet-457321-t7.iam.gserviceaccount.com}
 DEPLOY_MODE=${DEPLOY_MODE:-check}
 JOB_LAUNCHER_MODE=${JOB_LAUNCHER_MODE:-disabled}
 # Permanent operating mode (plan decision 23; scripts/ops/deploy.sh with the
@@ -231,10 +236,19 @@ require_no_provider_key_bindings() {
   done
 }
 
+# Builds run as the dedicated build identity, never as Cloud Build's default
+# (here: the Compute Engine default service account). Checked before anything
+# is contacted, like the other configuration guards.
+require_build_service_account() {
+  local problem
+  problem=$(milo_build_service_account_problem "$CLOUD_BUILD_SERVICE_ACCOUNT") || fail "$problem"
+}
+
 preflight() {
   require_command git
   require_command gcloud
   require_full_release_sha
+  require_build_service_account
   require_allowed_cors_origins
   require_gateway_identity_config
   require_supabase_project_ref_pin
@@ -262,6 +276,9 @@ preflight() {
 
   gcloud iam service-accounts describe "$WORKER_SERVICE_ACCOUNT" --project "$PROJECT_ID" --format='value(email)' >/dev/null || \
     fail "Worker runtime service account '$WORKER_SERVICE_ACCOUNT' does not exist or is not accessible."
+
+  gcloud iam service-accounts describe "$CLOUD_BUILD_SERVICE_ACCOUNT" --project "$PROJECT_ID" --format='value(email)' >/dev/null || \
+    fail "Cloud Build service account '$CLOUD_BUILD_SERVICE_ACCOUNT' does not exist or is not accessible. Create it with scripts/ops/setup-wif.sh --apply."
 
   gcloud artifacts repositories describe "$REPOSITORY" --location "$REGION" --project "$PROJECT_ID" >/dev/null || \
     fail "Artifact Registry repository '$REPOSITORY' does not exist in region '$REGION'. Create it before deployment."
@@ -292,6 +309,7 @@ API service: $API_SERVICE
 Worker job: $WORKER_JOB
 API runtime service account: $API_SERVICE_ACCOUNT
 Worker runtime service account: $WORKER_SERVICE_ACCOUNT
+Cloud Build service account: $CLOUD_BUILD_SERVICE_ACCOUNT (both builds; logging $MILO_CLOUD_BUILD_LOGGING)
 API image: $API_IMAGE
 Worker image: $WORKER_IMAGE
 Stage A execution flags: ${STAGE_A_FLAG_NAMES[*]} ($([[ "$DEPLOY_PRESERVE_STAGE" == "1" ]] && printf 'PRESERVED as they are: permanent operating mode' || printf 'all false'))
@@ -800,8 +818,12 @@ if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
 fi
 WORKER_EXECUTIONS_BEFORE=$(worker_execution_count)
 
-gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
-gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --config scripts/deploy/cloudbuild-api.yaml --substitutions "_API_IMAGE=$API_IMAGE" .
+# Both builds run AS the dedicated build identity (--service-account takes the
+# account's resource name); each config logs to Cloud Logging only, which a
+# user-specified build service account requires.
+BUILD_SERVICE_ACCOUNT_RESOURCE="projects/$PROJECT_ID/serviceAccounts/$CLOUD_BUILD_SERVICE_ACCOUNT"
+gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE" --config scripts/deploy/cloudbuild-worker.yaml --substitutions "_WORKER_IMAGE=$WORKER_IMAGE" .
+gcloud builds submit --project "$PROJECT_ID" --region "$REGION" --service-account "$BUILD_SERVICE_ACCOUNT_RESOURCE" --config scripts/deploy/cloudbuild-api.yaml --substitutions "_API_IMAGE=$API_IMAGE" .
 
 # The worker job is deployed BEFORE the API and is never executed here.
 gcloud run jobs deploy "$WORKER_JOB" --project "$PROJECT_ID" --region "$REGION" --image "$WORKER_IMAGE" \

@@ -7,7 +7,7 @@ GitHub mobile app shows what happened without opening a log.
 
 | Workflow | Script | Environment | What it does |
 |---|---|---|---|
-| `deploy.yml` (inputs `sha`, `restore_website_stage`) | `scripts/ops/deploy.sh` | `production` (reviewer) | the R block: CI green on that exact SHA, migrations fully applied, Vercel built that SHA with run starts closed, 0 live runs, Stage 2 reset, `production-activate.sh --all`, worker model env, worker contract (`MILO_CAPTURE_REPLAY=false`, no `KIMI_API_KEY`), deployed gate; then, only after all of that passed, step 11 turns the website's plan tools back on (below) |
+| `deploy.yml` (inputs `sha`, `restore_website_stage`, `preflight_as_deployer`) | `scripts/ops/deploy.sh` (or, with `preflight_as_deployer`, `scripts/ops/preflight-deployer.sh`) | `production` (reviewer) | the R block: CI green on that exact SHA, migrations fully applied, Vercel built that SHA with run starts closed, 0 live runs, Stage 2 reset, `production-activate.sh --all`, worker model env, worker contract (`MILO_CAPTURE_REPLAY=false`, no `KIMI_API_KEY`), deployed gate; then, only after all of that passed, step 11 turns the website's plan tools back on (below) |
 | `website-stage.yml` (input `stage`, optional `sha`) | `scripts/ops/website-stage.sh` | `production` (reviewer) | the website's plan tools without a deploy: `plan-authoring` (Stage P), `web-preparation` (E', the Prepare button) or `both`; never Stage 2 |
 | `kill-switch.yml` | `scripts/ops/kill-switch.sh` → `scripts/deploy/kill-switch.sh` | `production-kill-switch` (**no** reviewer) | the canonical emergency order; confirm with `KILL` |
 | `capture-flag.yml` (input `on`/`off`) | `scripts/ops/capture-flag.sh` | `production` | `MILO_CAPTURE_REPLAY` on the worker job only; `on` refused unless 0 live runs; turn it off after one run |
@@ -18,6 +18,44 @@ Every workflow is `workflow_dispatch` only, refuses to run from anything but
 `main`, and is serialized (`milo-production-operations`; the kill switch has its
 own group so it never waits behind a deploy). Every one has a `dry_run` input:
 the script prints every command and calls nothing.
+
+## Preflight as the deployer (`preflight_as_deployer`)
+
+`deploy.yml` with `preflight_as_deployer=true` deploys nothing: instead of
+`deploy.sh` it runs `scripts/ops/preflight-deployer.sh`, AS the deployer, which
+
+- makes every read-only gcloud call the deploy makes (projects describe,
+  services list, service-account / repository / image / secret / Cloud Run
+  describes, the IAM policy reads, executions list, the Cloud Build source
+  bucket list, builds list, logging read);
+- probes, with `testIamPermissions` (read-only), what no read-only call can
+  prove: `cloudbuild.builds.create` and the other project permissions the
+  deploy uses, `iam.serviceAccounts.actAs` on the build identity and on each
+  runtime identity, uploads to `gs://<project>_cloudbuild`, and that the
+  deployer can **not** act as the Compute Engine default service account;
+- reports **every** disabled API, missing permission and missing resource at
+  once, then exits 1 if there is any (fix: `setup-wif.sh --plan`, `--apply`).
+
+It never builds, deploys, binds or enables anything and never reads a secret
+value; the access token for the probes reaches curl on stdin only. Run it after
+any IAM change, before the next real deploy.
+
+## The build identity
+
+Both images are built by Cloud Build AS `CLOUD_BUILD_SERVICE_ACCOUNT` (operator
+configuration; `milo-cloudbuild@<project>.iam.gserviceaccount.com`):
+`cloud-run.sh` passes `--service-account projects/<project>/serviceAccounts/<it>`
+to both `gcloud builds submit` calls, and both `cloudbuild-*.yaml` set
+`options.logging: CLOUD_LOGGING_ONLY`, which a user-specified build account
+requires. It holds exactly `roles/artifactregistry.writer` on the image
+repository, `roles/storage.objectViewer` on `gs://<project>_cloudbuild` and
+`roles/logging.logWriter` on the project. Cloud Build's default identity in
+this project is the Compute Engine default service account, which is broad:
+the deployer never acts as it, and the deploy refuses it as the build identity.
+A missing `CLOUD_BUILD_SERVICE_ACCOUNT` stops `deploy.sh` and
+`production-activate.sh` before anything runs. The Cloud Shell path is the
+same command as before; with your owner account the builds run as the same
+build identity.
 
 ## The website's plan tools after a deploy
 
@@ -65,11 +103,15 @@ that, so `deploy.yml` cannot deploy it.
 git clone https://github.com/giladscore494/milo-agent-workspace.git && cd milo-agent-workspace
 cp config/production-operator.env.example config/production-operator.env   # fill in, as today
 gcloud auth login && gcloud config set project big-cabinet-457321-t7
-bash scripts/ops/setup-wif.sh --plan     # read-only: lists every CREATE / UPDATE / BIND
+bash scripts/ops/setup-wif.sh --plan     # read-only: lists every CREATE / UPDATE / BIND / UNBIND
 bash scripts/ops/setup-wif.sh --apply    # makes exactly those changes; re-run --plan: 0 changes
 ```
 
-It creates the workload identity pool `milo-github`, the OIDC provider
+It enables the APIs the keyless deploy reaches (Cloud Resource Manager -- a
+service account's `gcloud projects describe` needs it, a user account does not
+-- IAM, IAM Credentials, STS, Cloud Run, Cloud Build, Artifact Registry, Service
+Usage and Cloud Logging), creates the build source bucket `gs://<project>_cloudbuild`
+if the project has none yet, and the workload identity pool `milo-github`, the OIDC provider
 `github-actions` whose attribute condition admits **only**
 `assertion.repository == 'giladscore494/milo-agent-workspace' && assertion.ref ==
 'refs/heads/main' && assertion.environment in ['production',
@@ -86,15 +128,27 @@ nothing else:
 | `roles/iam.serviceAccountViewer` | project | preflight: service-account describes |
 | `roles/serviceusage.serviceUsageConsumer` | project | builds submit / services list |
 | `roles/logging.viewer` | project | build log streaming, capture execution documents |
+| `roles/storage.bucketViewer` | project | `gcloud builds submit` proves the default source bucket belongs to the project (`storage.buckets.list`) |
 | `roles/storage.admin` | the `gs://<project>_cloudbuild` bucket only | Cloud Build source upload |
-| `roles/iam.serviceAccountUser` | the API, worker and capture service accounts only | deploying AS those identities |
+| `roles/iam.serviceAccountUser` | the API, worker, capture **and build** service accounts only | deploying AS those identities; starting builds AS the build identity |
 | `roles/iam.workloadIdentityUser` | the deploy SA, for this repository's principals only | the keyless login |
 
-**No JSON key exists anywhere.** If `gcloud builds submit` is refused for
-`iam.serviceAccounts.actAs` on the project's default Cloud Build/compute
-identity, grant `roles/iam.serviceAccountUser` on that one account to the
-deploy SA; the script does not do that for you, because that identity is often
-broad.
+and the build identity `CLOUD_BUILD_SERVICE_ACCOUNT`
+(`milo-cloudbuild@<project>.iam.gserviceaccount.com`) with exactly:
+
+| Role | Where | Needed by |
+|---|---|---|
+| `roles/artifactregistry.writer` | the image repository (`ARTIFACT_REGISTRY_REPOSITORY`) only | pushing both images |
+| `roles/storage.objectViewer` | the `gs://<project>_cloudbuild` bucket only | reading the uploaded source |
+| `roles/logging.logWriter` | project | build logs (`CLOUD_LOGGING_ONLY`) |
+
+Any other project role on it is reported as `WARN` (removing it is your call).
+
+**No JSON key exists anywhere, and the deployer never acts as the Compute
+Engine default service account** (`<number>-compute@developer.gserviceaccount.com`,
+Cloud Build's default identity here). `setup-wif.sh` never binds it; a deployer
+`serviceAccountUser` / `serviceAccountTokenCreator` on that account, or
+project-wide, is planned as `UNBIND` (the deployer's binding only).
 
 ### GitHub (Settings, once)
 
@@ -105,7 +159,8 @@ broad.
 - **Repository variables**: `GCP_WORKLOAD_IDENTITY_PROVIDER`,
   `GCP_DEPLOY_SERVICE_ACCOUNT`, `GCP_PROJECT_ID` (printed by `setup-wif.sh`);
   `MILO_OPERATOR_CONFIG` (the contents of your `production-operator.env` --
-  identifiers only; `READONLY_DATABASE_URL_ENV=MILO_READONLY_DB_URL`);
+  identifiers only; `READONLY_DATABASE_URL_ENV=MILO_READONLY_DB_URL`;
+  `CLOUD_BUILD_SERVICE_ACCOUNT=milo-cloudbuild@<project>.iam.gserviceaccount.com`);
   `MILO_PERMANENT_MODE=false`.
 
 ### Vercel (separate; kill switch only)

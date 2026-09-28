@@ -153,6 +153,7 @@ OPERATOR_ENV = (
     "CLOUD_RUN_CAPTURE_JOB=test-capture\n"
     "API_SERVICE_ACCOUNT=api@test.iam.gserviceaccount.com\n"
     "WORKER_SERVICE_ACCOUNT=worker@test.iam.gserviceaccount.com\n"
+    "CLOUD_BUILD_SERVICE_ACCOUNT=milo-cloudbuild@test-project.iam.gserviceaccount.com\n"
     "SUPABASE_PROJECT_REF=abcdefghijklmnopqrst\n"
     "SECRET_SUPABASE_URL=TEST_SUPABASE_URL\nSECRET_SUPABASE_SERVICE_KEY=TEST_SUPABASE_KEY\n"
     "SECRET_REDIS_URL=TEST_REDIS_URL\nSECRET_REDIS_TOKEN=TEST_REDIS_TOKEN\n"

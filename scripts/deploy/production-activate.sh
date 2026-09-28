@@ -45,6 +45,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 MILO_REPO_ROOT="$REPO_ROOT"
 # shellcheck source=operator-config.sh
 source "${SCRIPT_DIR}/operator-config.sh"
+# shellcheck source=deployment-contract.sh
+source "${SCRIPT_DIR}/deployment-contract.sh"
 
 DO_PREFLIGHT=0 DO_DB_GATE=0 DO_CAPTURE=0 DO_DEPLOY=0 DO_VERIFY=0 DO_PREPARE=0 DO_WEBSITE=0
 PLAN_ONLY=0 ENABLE_CATALOG=0 ENABLE_PREPARATION=0 FORCE_REDEPLOY=0 PRESERVE_STAGE=0
@@ -155,6 +157,7 @@ export_deploy_env() {
   for pair in PROJECT_ID:GCP_PROJECT_ID REGION:GCP_REGION REPOSITORY:ARTIFACT_REGISTRY_REPOSITORY \
               API_SERVICE:CLOUD_RUN_API_SERVICE WORKER_JOB:CLOUD_RUN_WORKER_JOB \
               API_SERVICE_ACCOUNT:API_SERVICE_ACCOUNT WORKER_SERVICE_ACCOUNT:WORKER_SERVICE_ACCOUNT \
+              CLOUD_BUILD_SERVICE_ACCOUNT:CLOUD_BUILD_SERVICE_ACCOUNT \
               MILO_GATEWAY_AUDIENCE:MILO_GATEWAY_AUDIENCE \
               MILO_APPROVED_GATEWAY_IDENTITIES:MILO_APPROVED_GATEWAY_IDENTITIES \
               MILO_EXPECTED_SUPABASE_PROJECT_REF:SUPABASE_PROJECT_REF \
@@ -167,6 +170,9 @@ export_deploy_env() {
     fi
     if [[ -z "$value" ]]; then
       printf 'FAIL: the operator configuration has no %s (needed by the deploy as %s)\n' "$key" "$name" >&2
+      [[ "$key" == "CLOUD_BUILD_SERVICE_ACCOUNT" ]] && \
+        printf '      Add the dedicated build identity, e.g. CLOUD_BUILD_SERVICE_ACCOUNT=milo-cloudbuild@%s.iam.gserviceaccount.com\n' \
+          "$(milo_op GCP_PROJECT_ID)" >&2
       return 1
     fi
     current="${!name:-}"
@@ -177,6 +183,12 @@ export_deploy_env() {
     fi
     export "${name}=${value}"
   done
+  # Both image builds run as this account, never as Cloud Build's default.
+  local problem
+  if ! problem="$(milo_build_service_account_problem "$CLOUD_BUILD_SERVICE_ACCOUNT")"; then
+    printf 'FAIL: %s\n' "$problem" >&2
+    return 1
+  fi
   # Stage A: the launcher stays disabled. A shell that exported another mode
   # does not get to deploy it through this bundle.
   export JOB_LAUNCHER_MODE=disabled
