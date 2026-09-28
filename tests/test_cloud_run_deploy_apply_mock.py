@@ -122,12 +122,24 @@ case "$args" in
   "artifacts repositories describe"*)
     echo "$MOCK_REPOSITORY" ;;
   "artifacts docker images describe"*)
-    # An image named in missing-images was never pushed.
-    if [[ -f "$MOCK_DIR/missing-images" ]] && grep -qF "$5" "$MOCK_DIR/missing-images"; then
-      printf 'ERROR: (gcloud.artifacts.docker.images.describe) NOT_FOUND: image not found\n' >&2
-      exit 1
+    # As in production: Container Analysis is enabled and the deployer holds
+    # no permission on it, so a describe fails even for an image that exists.
+    printf "ERROR: (gcloud.artifacts.docker.images.describe) PERMISSION_DENIED: Permission 'containeranalysis.occurrences.list' denied\n" >&2
+    exit 1 ;;
+  "artifacts docker tags list"*)
+    # $5 is the image path, $6 --filter=tag:<sha>. tags-list-status (and
+    # tags-list-stderr) make the call fail; tags-list-output replaces the
+    # answer; an image named in missing-images has no tag. Otherwise one row,
+    # as gcloud names it: the tag and the version as resource paths.
+    if [[ -f "$MOCK_DIR/tags-list-status" ]]; then
+      cat "$MOCK_DIR/tags-list-stderr" >&2 2>/dev/null
+      exit "$(cat "$MOCK_DIR/tags-list-status")"
     fi
-    echo "$MOCK_DIGEST" ;;
+    if [[ -f "$MOCK_DIR/tags-list-output" ]]; then cat "$MOCK_DIR/tags-list-output"; exit 0; fi
+    tag="${6#--filter=tag:}"
+    if [[ -f "$MOCK_DIR/missing-images" ]] && grep -qF "$5:$tag" "$MOCK_DIR/missing-images"; then exit 0; fi
+    package="projects/$MOCK_PROJECT/locations/us-central1/repositories/$MOCK_REPOSITORY/packages/${5##*/}"
+    printf '%s/tags/%s\t%s/versions/%s\n' "$package" "$tag" "$package" "$MOCK_DIGEST" ;;
   "secrets describe"*)
     echo "$3" ;;
   "builds submit"*)

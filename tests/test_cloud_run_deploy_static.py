@@ -520,8 +520,10 @@ def test_every_required_verification_runs_after_deployment():
 
 
 def test_image_verification_compares_the_registry_digest_and_release_sha():
-    assert "gcloud artifacts docker images describe" in SCRIPT
-    assert "image_summary.digest" in SCRIPT
+    # The exact-tag lookup (deployment-contract.sh), never `images describe`,
+    # which also reads Container Analysis.
+    assert "lookup_image_digest \"$expected_image\"" in SCRIPT
+    assert "gcloud artifacts docker images describe" not in SCRIPT
     assert "does not resolve to the release digest" in SCRIPT
     assert 'could not be tied to release SHA $RELEASE_SHA' in SCRIPT
 

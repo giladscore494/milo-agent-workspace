@@ -110,7 +110,7 @@ MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,
 PROJECT_ROLES=(
   "roles/run.admin"                        # cloud-run.sh deploy / jobs update / IAM binding on the jobs; kill switch; arm; capture flag; website stage (capture job ensure + its run-with-overrides binding)
   "roles/cloudbuild.builds.editor"         # cloud-run.sh: gcloud builds submit (both images)
-  "roles/artifactregistry.reader"          # images describe (capture script --ensure-job, verify, preflight)
+  "roles/artifactregistry.reader"          # cloud-run.sh + preflight: docker tags list (the built image's exact tag); images describe (capture script --ensure-job, verify). No Container Analysis role, ever
   "roles/secretmanager.viewer"             # preflight: secrets describe / get-iam-policy (metadata only, never a value)
   "roles/iam.serviceAccountViewer"         # preflight / cloud-run.sh: service-accounts describe
   "roles/serviceusage.serviceUsageConsumer" # gcloud builds submit / services list against the project

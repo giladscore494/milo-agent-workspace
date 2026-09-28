@@ -221,6 +221,38 @@ milo_redact_stream() {
 }
 
 # ---------------------------------------------------------------------------
+# Image tag lookup
+# ---------------------------------------------------------------------------
+# The digest a release tag points at is read with `gcloud artifacts docker
+# tags list`, which needs artifactregistry.tags.list (artifactregistry.reader)
+# and nothing else. `gcloud artifacts docker images describe` is NOT used:
+# where containeranalysis.googleapis.com is enabled it also reads the image's
+# build provenance from Container Analysis, a permission the deployer does not
+# hold and is never granted, so it fails for an image that exists.
+#
+# milo_tags_list_command IMAGE_REF — sets MILO_TAGS_LIST_COMMAND to the exact
+# call for REGISTRY/PROJECT/REPO/IMAGE:TAG: that image path, that tag. The
+# filter's ':' is a substring match, so the answer is never trusted as it
+# stands: milo_exact_tag_digests keeps only the rows whose tag IS the tag.
+# cloud-run.sh runs this call; preflight-deployer.sh runs the same one.
+milo_tags_list_command() {
+  local ref="$1"
+  MILO_TAGS_LIST_COMMAND=(gcloud artifacts docker tags list "${ref%:*}"
+    "--filter=tag:${ref##*:}" "--format=value(tag,version)")
+}
+
+# milo_exact_tag_digests TAG < TAGS_LIST_OUTPUT — the version (digest) of
+# every row whose tag's last path segment is exactly TAG, one per line,
+# de-duplicated ("<none>" for a row without one). gcloud names both as
+# resource paths (.../tags/<TAG>, .../versions/sha256:<hex>); only the last
+# segment counts.
+milo_exact_tag_digests() {
+  awk -F'\t' -v tag="$1" '
+    { t = $1; sub(/.*\//, "", t); v = $2; sub(/.*\//, "", v); if (v == "") v = "<none>" }
+    t == tag && !seen[v]++ { print v }'
+}
+
+# ---------------------------------------------------------------------------
 # Government capture job
 # ---------------------------------------------------------------------------
 # The operator capture runs the EXISTING entrypoint
