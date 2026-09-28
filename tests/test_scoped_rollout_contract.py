@@ -1073,8 +1073,23 @@ def test_the_batch_path_must_be_named_and_ready(tmp_path):
 # 5. production-verify.sh: separate facts, exact gates
 # =============================================================================
 
+#: The digest the mock registry resolves the release worker tag to.
+VERIFY_WORKER_DIGEST = "sha256:" + "7" * 64
+#: What a `gcloud artifacts docker images describe` answers in production,
+#: where Container Analysis is enabled and the deployer holds no permission on it.
+CONTAINER_ANALYSIS_DENIAL = ("ERROR: (gcloud.artifacts.docker.images.describe) PERMISSION_DENIED: "
+                             "Permission 'containeranalysis.occurrences.list' denied")
+
+
+def _tag_row(tag: str, digest: str) -> str:
+    package = "projects/test-project/locations/test-region/repositories/test-repo/packages/worker"
+    return f"{package}/tags/{tag}\t{package}/versions/{digest}\n"
+
+
 def _verify_tree(tmp_path, *, migration_detail: str, migration_status: str = "PASS",
-                 readiness: str, website: str, release_format: str = "{sha}") -> Tree:
+                 readiness: str, website: str, release_format: str = "{sha}",
+                 worker_image: str | None = None, tags_output: str | None = None,
+                 tags_exit: int = 0, tags_stderr: str = "") -> Tree:
     tree = Tree(tmp_path, ("production-verify.sh",))
     report = {"summary": {"blocked": 0 if migration_status == "PASS" else 1},
               "checks": [{"status": migration_status, "name": "remote:state",
@@ -1087,10 +1102,25 @@ def _verify_tree(tmp_path, *, migration_detail: str, migration_status: str = "PA
               + readiness)
     tree.stub("scripts/deploy/website-execution-check.sh", website)
     tree.stub("scripts/release/runtime_policy_manifest.py", "exit 0")
-    image = f"test-region-docker.pkg.dev/test-project/test-repo/worker:{tree.sha}"
+    image = worker_image or f"test-region-docker.pkg.dev/test-project/test-repo/worker:{tree.sha}"
     api_image = f"test-region-docker.pkg.dev/test-project/test-repo/api:{tree.sha}"
+    # The registry: `images describe` is denied exactly as in production; the
+    # exact-tag lookup answers one row for the release tag unless a test says
+    # otherwise (tags_output, "{sha}" standing for the release SHA), or fails
+    # (tags_exit, tags_stderr).
+    rows = _tag_row(tree.sha, VERIFY_WORKER_DIGEST) if tags_output is None \
+        else tags_output.replace("{sha}", tree.sha)
+    (tmp_path / "tags-list.out").write_text(rows, encoding="utf-8")
+    (tmp_path / "tags-list.err").write_text(tags_stderr, encoding="utf-8")
+    (tmp_path / "gcloud-calls.log").write_text("", encoding="utf-8")
     tree.tool("gcloud", "#!/usr/bin/env bash\n"
+                        f'printf \'%s\\n\' "$*" >> {shlex.quote(str(tmp_path / "gcloud-calls.log"))}\n'
                         'case "$*" in\n'
+                        '  "artifacts docker images describe"*)\n'
+                        f"    printf '%s\\n' {shlex.quote(CONTAINER_ANALYSIS_DENIAL)} >&2; exit 1 ;;\n"
+                        '  "artifacts docker tags list"*)\n'
+                        f"    if [[ {tags_exit} -ne 0 ]]; then cat {shlex.quote(str(tmp_path / 'tags-list.err'))} >&2; exit {tags_exit}; fi\n"
+                        f"    cat {shlex.quote(str(tmp_path / 'tags-list.out'))} ;;\n"
                         f'  *"services describe"*"containers[0].image"*) echo {api_image} ;;\n'
                         f'  *"jobs describe"*"containers[0].image"*) echo {image} ;;\n'
                         f"  *MILO_RELEASE_SHA*) printf '%s\\n' {shlex.quote(release_format.format(sha=tree.sha))} ;;\n"
@@ -1175,6 +1205,71 @@ def test_deployed_gate_rejects_a_release_sha_with_extra_characters(tmp_path):
     result = tree.run("production-verify.sh", "--gate", "deployed")
     assert result.returncode == 1
     assert _verdict(result.stdout)["CODE_DEPLOYED"] == "NO"
+
+
+DB_OK = "remote schema classified as fully-migrated (41/41)"
+
+
+def _deployed(tmp_path, **kwargs):
+    tree = _verify_tree(tmp_path, readiness=READY, website=SITE_OFF, migration_detail=DB_OK, **kwargs)
+    result = tree.run("production-verify.sh", "--gate", "deployed")
+    calls = (tmp_path / "gcloud-calls.log").read_text(encoding="utf-8").splitlines()
+    return tree, result, calls
+
+
+def test_the_deployed_gate_verifies_the_worker_tag_by_its_exact_digest(tmp_path):
+    """PR-Ops3c: the worker image is read by its exact tag, never by describe."""
+    tree, result, calls = _deployed(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "VERIFIED"
+    assert f"WORKER_IMAGE_DIGEST={VERIFY_WORKER_DIGEST}" in result.stdout
+    assert f"the worker image exists ({VERIFY_WORKER_DIGEST})" in result.stdout
+    path = "test-region-docker.pkg.dev/test-project/test-repo/worker"
+    assert f"artifacts docker tags list {path} --filter=tag:{tree.sha} --format=value(tag,version)" in calls
+    assert not [call for call in calls if "images describe" in call]
+
+
+def test_the_deployed_gate_does_not_verify_a_worker_on_another_release(tmp_path):
+    other = "test-region-docker.pkg.dev/test-project/test-repo/worker:" + "a" * 40
+    _, result, _ = _deployed(tmp_path, worker_image=other)
+    assert result.returncode == 1
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "NO"
+    assert "the worker image is not tagged" in result.stdout
+
+
+@pytest.mark.parametrize("rows", [
+    "",                                                               # no tag at all
+    _tag_row("release-{sha}", VERIFY_WORKER_DIGEST)                   # only tags that CONTAIN
+    + _tag_row("{sha}-rc1", VERIFY_WORKER_DIGEST),                    # the SHA (the filter's ':')
+])
+def test_the_deployed_gate_does_not_verify_an_absent_worker_tag(tmp_path, rows):
+    tree, result, _ = _deployed(tmp_path, tags_output=rows)
+    assert result.returncode == 1
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "NO"
+    assert f"is not in Artifact Registry: no tag is exactly {tree.sha}" in result.stdout
+    assert VERIFY_WORKER_DIGEST not in result.stdout
+
+
+def test_the_deployed_gate_does_not_verify_two_digests_for_one_tag(tmp_path):
+    rows = _tag_row("{sha}", VERIFY_WORKER_DIGEST) + _tag_row("{sha}", "sha256:" + "8" * 64)
+    _, result, _ = _deployed(tmp_path, tags_output=rows)
+    assert result.returncode == 1
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "UNVERIFIED"
+    assert "did not resolve to exactly one sha256 digest" in result.stdout
+
+
+def test_a_failed_worker_tag_lookup_is_shown_and_is_not_called_absent(tmp_path):
+    stderr = ("ERROR: (gcloud.artifacts.docker.tags.list) PERMISSION_DENIED: Permission "
+              "'artifactregistry.tags.list' denied\nSUPABASE_SECRET_KEY=sb_secret_VERIFYSENTINEL9\n")
+    _, result, _ = _deployed(tmp_path, tags_exit=1, tags_stderr=stderr)
+    assert result.returncode == 1
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == "UNVERIFIED"
+    assert "tag lookup for" in result.stdout and "FAILED (exit 1); whether it exists is unknown" in result.stdout
+    assert "not in Artifact Registry" not in result.stdout
+    assert "gcloud artifacts docker tags list (exit 1) said (redacted, at most 20 lines):" in result.stderr
+    assert "    | ERROR: (gcloud.artifacts.docker.tags.list) PERMISSION_DENIED" in result.stderr
+    assert "sb_secret_VERIFYSENTINEL9" not in result.stdout + result.stderr
+    assert "SUPABASE_SECRET_KEY=[REDACTED]" in result.stderr
 
 
 def test_the_verifier_never_reports_a_generic_snapshot_as_readiness():

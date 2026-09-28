@@ -10,6 +10,7 @@ tests/test_cloud_run_deploy_apply_mock.py; nothing real is contacted.
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -400,6 +401,39 @@ def test_the_build_path_hides_no_gcloud_error():
     assert "images describe" not in script
 
 
+def _code_part(line: str) -> str:
+    """A line without its comment: a whole-line comment, or a trailing
+    ` # ...` (shell, YAML and Python all comment that way)."""
+    if line.lstrip().startswith("#"):
+        return ""
+    return re.split(r"\s#(?:\s|$)", line, maxsplit=1)[0]
+
+
+def test_no_script_or_workflow_calls_images_describe():
+    """`gcloud artifacts docker images describe` also reads Container Analysis,
+    which the deployer does not hold; where that API is enabled it fails for
+    an image that exists. Only comments may name it, in scripts/ and .github/."""
+    offenders = []
+    for root in (REPO / "scripts", REPO / ".github"):
+        for path in sorted(p for p in root.rglob("*") if p.is_file()):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                if re.search(r"images\s+describe", _code_part(line)):
+                    offenders.append(f"{path.relative_to(REPO)}:{number}: {line.strip()}")
+    assert offenders == []
+
+
+def test_the_guard_sees_code_and_ignores_comments():
+    assert "images describe" in _code_part("  gcloud artifacts docker images describe x")
+    assert _code_part("x=1  # images describe") == "x=1 "
+    assert "images describe" not in _code_part("# never `images describe`")
+    assert "images describe" not in _code_part('  "roles/x"   # images describe (old)')
+    assert "images describe" in _code_part("    gcloud artifacts docker images describe ${REF}")
+
+
 # ---------------------------------------------------------------------------
 # redaction, and the Cloud Shell path
 # ---------------------------------------------------------------------------
@@ -467,7 +501,9 @@ def test_the_preflight_runs_the_deploys_exact_tag_lookup_and_no_image_describe(t
     script = (REPO / "scripts" / "ops" / "preflight-deployer.sh").read_text(encoding="utf-8")
     assert script.count('"${MILO_TAGS_LIST_COMMAND[@]}"') == 2
     deploy = (REPO / "scripts" / "deploy" / "cloud-run.sh").read_text(encoding="utf-8")
-    assert '"${MILO_TAGS_LIST_COMMAND[@]}"' in deploy
+    assert 'milo_image_digest_lookup "$image" "$GCLOUD_ERROR_FILE"' in deploy
+    contract = (REPO / "scripts" / "deploy" / "deployment-contract.sh").read_text(encoding="utf-8")
+    assert 'output=$("${MILO_TAGS_LIST_COMMAND[@]}" 2>"$error_file")' in contract
 
 
 def test_the_preflight_names_a_missing_tags_list_permission(tmp_path):

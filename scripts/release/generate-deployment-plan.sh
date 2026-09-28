@@ -357,10 +357,14 @@ production refuses to start without), provider keys absent:
     grep -Ec '^(env|secret) (${API_REQUIRED_GREP})\b' api-bindings-after.txt   # expect: ${API_REQUIRED_COUNT}
     grep -E '^(env|secret) (${PROVIDER_KEY_GREP})\b' api-bindings-after.txt   # expect: EMPTY (no provider key on the API)
 
-The image digest must match the pushed digest for each image:
+The image digest must match the pushed digest for each image. Read it from
+the exact tag, not from an image describe, which also reads Container
+Analysis (a permission the deployer does not hold). The filter is a substring
+match: use only the row whose tag ends in exactly
+/${SHA}, and expect exactly one sha256: digest.
 
-    gcloud artifacts docker images describe ${API_IMAGE_REF} --format 'value(image_summary.digest)'
-    gcloud artifacts docker images describe ${WORKER_IMAGE_REF} --format 'value(image_summary.digest)'
+    $(milo_tags_list_command_line "${API_IMAGE_REF}")
+    $(milo_tags_list_command_line "${WORKER_IMAGE_REF}")
 
 ## 11. Verify private ingress and invoker policy
 
@@ -424,13 +428,27 @@ fi
 # image this release never built.
 bad_tag=0
 bad_repo=""
+# The exact-tag lookup (milo_tags_list_command_line) names the image path
+# WITHOUT a tag and the tag in its filter: the path must still be a canonical
+# repository, and the filter exactly the full release SHA.
+tag_lookup='gcloud artifacts docker tags list '
+while IFS= read -r line; do
+  [[ -n "${line}" ]] || continue
+  ref="${line#*"${tag_lookup}"}"
+  ref="${ref%% *}"
+  case "${ref}" in
+    */"${MILO_API_IMAGE_REPO}"|*/"${MILO_WORKER_IMAGE_REPO}") ;;
+    *) bad_repo="${ref}" ;;
+  esac
+  [[ "${line}" == *" --filter='tag:${SHA}' "* ]] || bad_tag=1
+done < <(grep -F -- "${tag_lookup}" <<< "${plan}" || true)
 while IFS= read -r ref; do
   case "${ref}" in
     */"${MILO_API_IMAGE_REPO}":*|*/"${MILO_WORKER_IMAGE_REPO}":*) ;;
     *) bad_repo="${ref}"; continue ;;
   esac
   [[ "${ref##*:}" == "${SHA}" ]] || bad_tag=1
-done < <(grep -Eo '[^[:space:]]*docker\.pkg\.dev/[^[:space:]]+' <<< "${plan}" || true)
+done < <(grep -vF -- "${tag_lookup}" <<< "${plan}" | grep -Eo '[^[:space:]]*docker\.pkg\.dev/[^[:space:]]+' || true)
 if [[ "${bad_tag}" -eq 1 ]]; then
   record_check BLOCKED "image-tags" "plan contains an image reference that is not tagged with the full release SHA ${SHA}"
   plan_blocked=1

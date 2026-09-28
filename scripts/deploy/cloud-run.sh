@@ -598,10 +598,10 @@ assert_bindings_preserved() {
 verify_image_digest() {
   local label="$1" report="$2" expected_image="$3" deployed digest="" lookup=0
   deployed=$(report_field "$report" image)
-  lookup_image_digest "$expected_image" || lookup=$?
+  milo_image_digest_lookup "$expected_image" "$GCLOUD_ERROR_FILE" || lookup=$?
   case "$lookup" in
-    0) digest="$IMAGE_DIGEST" ;;
-    2) show_gcloud_error "the registry digest lookup (gcloud artifacts docker tags list, exit $IMAGE_LOOKUP_STATUS)" \
+    0) digest="$MILO_IMAGE_DIGEST" ;;
+    2) milo_show_gcloud_error "the registry digest lookup (gcloud artifacts docker tags list, exit $MILO_IMAGE_LOOKUP_STATUS)" \
          < "$GCLOUD_ERROR_FILE" ;;
   esac
   if [[ "$deployed" == *"@"* ]]; then
@@ -851,24 +851,10 @@ BUILD_ID_PATTERN='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
 BUILD_LIST_COMMAND="gcloud builds list --project=$PROJECT_ID --region=$REGION --limit=5 --format='table(id,status,createTime,images)'"
 
 # Every gcloud call on the build path keeps its stderr: a call that fails is
-# said so, with what it said -- redacted, at most GCLOUD_ERROR_LINES lines of
-# at most 500 characters -- and is never mistaken for an answer.
-GCLOUD_ERROR_LINES=20
+# said so, with what it said (milo_show_gcloud_error: redacted and bounded),
+# and is never mistaken for an answer.
 GCLOUD_ERROR_FILE=$(mktemp)
 trap 'rm -f "$GCLOUD_ERROR_FILE"' EXIT
-
-# show_gcloud_error WHAT < STDERR — what a failed gcloud call said, redacted
-# and bounded, on stderr.
-show_gcloud_error() {
-  local text
-  text=$(awk -v n="$GCLOUD_ERROR_LINES" 'NF && kept < n { print; kept++ }')
-  echo "  $1 said (redacted, at most $GCLOUD_ERROR_LINES lines):" >&2
-  if [[ -z "$text" ]]; then
-    echo "    | (nothing on stderr)" >&2
-  else
-    printf '%s\n' "$text" | milo_redact_stream | sed 's/^/    | /' >&2
-  fi
-}
 
 # submit_build LABEL CONFIG SUBSTITUTION -> BUILD_ID. stderr (the source upload)
 # passes through; stdout must be exactly one well-formed build id.
@@ -893,7 +879,7 @@ print_build_log_tail() {
     --order=desc --limit "$BUILD_LOG_LINES" --format='value(textPayload)' 2>"$GCLOUD_ERROR_FILE") || status=$?
   if [[ "$status" -ne 0 || -z "${log//[[:space:]]/}" ]]; then
     echo "  (the log of build $id could not be read$([[ "$status" -ne 0 ]] && printf ' (gcloud logging read exit %s)' "$status" || printf ': no entries yet'); the deploy stops regardless. Console: https://console.cloud.google.com/cloud-build/builds;region=$REGION/$id?project=$PROJECT_ID)" >&2
-    [[ "$status" -eq 0 ]] || show_gcloud_error "gcloud logging read" < "$GCLOUD_ERROR_FILE"
+    [[ "$status" -eq 0 ]] || milo_show_gcloud_error "gcloud logging read" < "$GCLOUD_ERROR_FILE"
     return 0
   fi
   echo "  the last log lines (up to $BUILD_LOG_LINES) of build $id, redacted:" >&2
@@ -934,7 +920,7 @@ wait_for_build() {
       if (( failed > 0 )); then
         echo "  $failed of $polls status reads of build $id FAILED (a failed read is not a status)." >&2
         printf '%s\n' "$last_error" \
-          | show_gcloud_error "the last failed status read (gcloud builds describe, exit $last_status)"
+          | milo_show_gcloud_error "the last failed status read (gcloud builds describe, exit $last_status)"
       fi
       fail "The $label build $id is still ${state:-unreadable} after the ${BUILD_DEADLINE_SECONDS}s deadline. Nothing was deployed; the build may still be running: gcloud builds describe $id --project=$PROJECT_ID --region=$REGION"
     fi
@@ -942,40 +928,21 @@ wait_for_build() {
   done
 }
 
-# lookup_image_digest IMAGE — the ONE digest the exact tag of IMAGE points at
-# (deployment-contract.sh, "Image tag lookup"). Returns 0 and sets IMAGE_DIGEST;
-# 1: the call succeeded and no tag is exactly that tag; 2: the call FAILED
-# (exit in IMAGE_LOOKUP_STATUS, stderr in GCLOUD_ERROR_FILE) -- whether the
-# image exists is unknown; 3: the exact tag did not yield exactly one sha256
-# digest (IMAGE_LOOKUP_DIGESTS holds what it yielded).
-IMAGE_DIGEST="" IMAGE_LOOKUP_STATUS=0 IMAGE_LOOKUP_DIGESTS=""
-lookup_image_digest() {
-  local image="$1" output=""
-  IMAGE_DIGEST="" IMAGE_LOOKUP_STATUS=0 IMAGE_LOOKUP_DIGESTS=""
-  milo_tags_list_command "$image"
-  output=$("${MILO_TAGS_LIST_COMMAND[@]}" 2>"$GCLOUD_ERROR_FILE") || IMAGE_LOOKUP_STATUS=$?
-  [[ "$IMAGE_LOOKUP_STATUS" -eq 0 ]] || return 2
-  IMAGE_LOOKUP_DIGESTS=$(printf '%s\n' "$output" | milo_exact_tag_digests "${image##*:}")
-  [[ -n "$IMAGE_LOOKUP_DIGESTS" ]] || return 1
-  [[ "$IMAGE_LOOKUP_DIGESTS" =~ ^sha256:[0-9a-f]{64}$ ]] || return 3
-  IMAGE_DIGEST="$IMAGE_LOOKUP_DIGESTS"
-}
-
 # verify_built_image LABEL ID IMAGE — the exact tag exists, at exactly one
 # digest, before it is deployed. A lookup that fails is never "missing".
 verify_built_image() {
   local label="$1" id="$2" image="$3" lookup=0
-  lookup_image_digest "$image" || lookup=$?
+  milo_image_digest_lookup "$image" "$GCLOUD_ERROR_FILE" || lookup=$?
   case "$lookup" in
     0)
-      echo "$label image: $image ($IMAGE_DIGEST)" ;;
+      echo "$label image: $image ($MILO_IMAGE_DIGEST)" ;;
     1)
       fail "The $label build $id reported SUCCESS, but $image is not in Artifact Registry: the tag lookup succeeded and lists no tag exactly '${image##*:}' on ${image%:*}. Nothing was deployed." ;;
     2)
-      show_gcloud_error "gcloud artifacts docker tags list (exit $IMAGE_LOOKUP_STATUS)" < "$GCLOUD_ERROR_FILE"
-      fail "The $label build $id reported SUCCESS, but the Artifact Registry tag lookup for $image FAILED (exit $IMAGE_LOOKUP_STATUS). This is NOT a missing image: whether it exists is unknown. The lookup needs artifactregistry.tags.list (artifactregistry.reader) on the repository. Nothing was deployed." ;;
+      milo_show_gcloud_error "gcloud artifacts docker tags list (exit $MILO_IMAGE_LOOKUP_STATUS)" < "$GCLOUD_ERROR_FILE"
+      fail "The $label build $id reported SUCCESS, but the Artifact Registry tag lookup for $image FAILED (exit $MILO_IMAGE_LOOKUP_STATUS). This is NOT a missing image: whether it exists is unknown. The lookup needs artifactregistry.tags.list (artifactregistry.reader) on the repository. Nothing was deployed." ;;
     *)
-      fail "The $label build $id reported SUCCESS, but the tag '${image##*:}' on ${image%:*} did not resolve to exactly one sha256 digest (it resolved to: $(printf '%s\n' "$IMAGE_LOOKUP_DIGESTS" | awk 'NR <= 5' | milo_redact_stream | paste -sd ' ' -)). Nothing was deployed." ;;
+      fail "The $label build $id reported SUCCESS, but the tag '${image##*:}' on ${image%:*} did not resolve to exactly one sha256 digest (it resolved to: $(milo_image_lookup_digests_shown)). Nothing was deployed." ;;
   esac
 }
 

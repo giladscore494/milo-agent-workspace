@@ -140,7 +140,7 @@ nothing else:
 |---|---|---|
 | `roles/run.admin` | project | deploy / update the API service and jobs, their IAM bindings, kill switch, capture flag, arm, website stage (capture job `--ensure-job` and its run-with-overrides binding) |
 | `roles/cloudbuild.builds.editor` | project | `gcloud builds submit` (both images) |
-| `roles/artifactregistry.reader` | project | the built image's exact-tag lookup, `gcloud artifacts docker tags list` (deploy, preflight); image describes (capture script `--ensure-job`, verify). The deployer holds **no** Container Analysis role, so the deploy never uses `images describe` |
+| `roles/artifactregistry.reader` | project | a release image's exact-tag lookup, `gcloud artifacts docker tags list` (deploy, preflight, `production-verify.sh` CODE_DEPLOYED, capture script `--ensure-job`). The deployer holds **no** Container Analysis role, so no script uses `images describe` |
 | `roles/secretmanager.viewer` | project | preflight: secret metadata and IAM policy, never a value |
 | `roles/iam.serviceAccountViewer` | project | preflight: service-account describes |
 | `roles/serviceusage.serviceUsageConsumer` | project | builds submit / services list |
