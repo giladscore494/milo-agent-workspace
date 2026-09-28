@@ -139,6 +139,37 @@ MILO_WORKER_SECRET_ENV_NAMES=(
 )
 MILO_SECRET_VERSION="latest"
 
+# OPTIONAL secret-backed environment variables (PR-OBS), as ENV_NAME=SECRET.
+# Each is bound ONLY when the Secret Manager secret has an ENABLED version;
+# without one the feature it configures stays off (SENTRY_DSN empty = error
+# reporting disabled, backend/observability.py). They are never in
+# REQUIRED_SECRETS, so no deploy ever waits on them, and --update-secrets
+# never removes one that is already bound.
+MILO_OPTIONAL_RUNTIME_SECRETS=(
+  "SENTRY_DSN=SENTRY_DSN"
+)
+
+# milo_optional_secret_bindings PROJECT -> one ENV=SECRET:VERSION line per
+# optional secret that has an enabled version. Metadata only (versions list,
+# roles/secretmanager.viewer): a secret VALUE is never read. A secret that is
+# absent or unreadable is reported on stderr and left unbound.
+milo_optional_secret_bindings() {
+  local project="$1" entry env_name secret_name enabled
+  for entry in "${MILO_OPTIONAL_RUNTIME_SECRETS[@]}"; do
+    env_name="${entry%%=*}"
+    secret_name="${entry#*=}"
+    enabled="$(gcloud secrets versions list "$secret_name" --project "$project" \
+      --filter='state:ENABLED' --limit=1 --format='value(name)' 2> /dev/null || true)"
+    if [[ -n "$enabled" ]]; then
+      printf 'NOTE: optional secret %s has an enabled version: bound as %s.\n' "$secret_name" "$env_name" >&2
+      printf '%s=%s:%s\n' "$env_name" "$secret_name" "$MILO_SECRET_VERSION"
+    else
+      printf 'NOTE: optional secret %s has no enabled version: %s stays unbound (feature off).\n' \
+        "$secret_name" "$env_name" >&2
+    fi
+  done
+}
+
 # gcloud dict flags accept an alternate delimiter via the ^DELIM^ prefix,
 # which keeps comma-containing values (CORS origins, identity allowlists)
 # intact as a single value.

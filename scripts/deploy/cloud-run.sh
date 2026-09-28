@@ -809,6 +809,14 @@ fi
 
 preflight
 print_targets
+# Optional runtime secrets (deployment-contract.sh): each is added to BOTH
+# surfaces only when it has an enabled version; otherwise it is said and left
+# out. Never a precondition of the deploy.
+while IFS= read -r optional_binding; do
+  [[ -n "$optional_binding" ]] || continue
+  API_SECRETS+=("$optional_binding")
+  WORKER_SECRETS+=("$optional_binding")
+done < <(milo_optional_secret_bindings "$PROJECT_ID")
 
 if [[ "$DEPLOY_MODE" == "apply" && "$JOB_LAUNCHER_MODE" == "cloud_run" ]]; then
   echo "WARNING: JOB_LAUNCHER_MODE=cloud_run — the API will be deployed with the Cloud Run job launcher ENABLED. This is an explicit operator override of the safe default (disabled)." >&2

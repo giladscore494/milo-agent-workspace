@@ -218,6 +218,13 @@ build_secret_args() {
   printf '%s=%s:%s,%s=%s:%s' \
     "SUPABASE_URL" "$(milo_op SECRET_SUPABASE_URL)" "$MILO_SECRET_VERSION" \
     "SUPABASE_SERVICE_ROLE_KEY" "$(milo_op SECRET_SUPABASE_SERVICE_KEY)" "$MILO_SECRET_VERSION"
+  # Optional runtime secrets (SENTRY_DSN): only when enabled; never a provider key.
+  local optional_binding
+  while IFS= read -r optional_binding; do
+    if [[ -n "$optional_binding" ]]; then
+      printf ',%s' "$optional_binding"
+    fi
+  done < <(milo_optional_secret_bindings "$PROJECT_ID")
 }
 
 ensure_job() {

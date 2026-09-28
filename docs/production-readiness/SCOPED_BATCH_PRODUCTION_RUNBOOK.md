@@ -121,8 +121,9 @@ Every script builds, tags and checks `git rev-parse HEAD`, so **the checkout is
 the release**. Keep this one checkout for the whole rollout.
 
 Check CI for that exact commit through the pull request that produced it.
-CI runs automatically on pull requests only; there is no automatic post-merge
-run on `main`. So
+CI runs automatically on pull requests and, since PR-OBS, on every push to
+`main` -- the push run on `$RELEASE_SHA` itself is an additional signal; the
+gate below is unchanged. So
 `$RELEASE_SHA` (the merge commit on `main`) is accepted when **both** hold:
 
 1. CI is green on the merged PR's **latest commit** (`$PR_HEAD_SHA`, the merge

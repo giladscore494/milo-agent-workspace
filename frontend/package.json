@@ -12,6 +12,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@sentry/nextjs": "^11.1.0",
     "@supabase/supabase-js": "2.50.0",
     "@vercel/oidc": "^3.8.0",
     "google-auth-library": "^10.9.0",

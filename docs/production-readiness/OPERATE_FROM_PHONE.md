@@ -173,6 +173,10 @@ project-wide, is planned as `UNBIND` (the deployer's binding only).
   = `main` only. Secret `MILO_READONLY_DB_URL` (the read-only connection string).
 - **Environments → `production-kill-switch`**: **no** required reviewer;
   deployment branches = `main` only. Secret `VERCEL_TOKEN` (see Vercel below).
+- **Environments → `production-backup`** (PR-OBS, created by
+  `scripts/ops/setup-backup.sh`): **no** required reviewer (it runs on a
+  schedule); deployment branches = `main` only; its own WIF pool
+  `milo-github-backup`. See [SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).
 - **Repository variables**: `GCP_WORKLOAD_IDENTITY_PROVIDER`,
   `GCP_DEPLOY_SERVICE_ACCOUNT`, `GCP_PROJECT_ID` (printed by `setup-wif.sh`);
   `MILO_OPERATOR_CONFIG` (the contents of your `production-operator.env` --
