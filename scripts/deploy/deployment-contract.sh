@@ -172,6 +172,39 @@ MILO_REVIEWED_WORKER_MODEL_ENV=(
 )
 
 # ---------------------------------------------------------------------------
+# Build identity (PR-Ops3)
+# ---------------------------------------------------------------------------
+# Both images are built by Cloud Build AS a dedicated, user-managed service
+# account (operator configuration CLOUD_BUILD_SERVICE_ACCOUNT, created by
+# scripts/ops/setup-wif.sh with artifactregistry.writer on the image
+# repository, storage.objectViewer on the source bucket and logging.logWriter
+# -- nothing else). Never Cloud Build's default identity: in this project that
+# is the Compute Engine default service account, which is broad, and whoever
+# can act as it can do anything it can. A build with a user-specified service
+# account must log to Cloud Logging only (options.logging CLOUD_LOGGING_ONLY in
+# both cloudbuild-*.yaml), since it has no access to a default logs bucket.
+MILO_CLOUD_BUILD_LOGGING="CLOUD_LOGGING_ONLY"
+
+# milo_build_service_account_problem EMAIL — prints why EMAIL cannot be the
+# build identity (and fails), or prints nothing and succeeds. The value is an
+# identifier, not a secret, so the message may name it.
+milo_build_service_account_problem() {
+  local email="${1:-}"
+  if [[ -z "$email" ]]; then
+    printf 'CLOUD_BUILD_SERVICE_ACCOUNT is not set; add it to the operator configuration (the dedicated build identity created by scripts/ops/setup-wif.sh)'
+  elif [[ "$email" == *-compute@developer.gserviceaccount.com ]]; then
+    printf 'CLOUD_BUILD_SERVICE_ACCOUNT is the Compute Engine default service account (%s); builds must run as the dedicated build identity, never as it' "$email"
+  elif [[ "$email" == *@cloudbuild.gserviceaccount.com ]]; then
+    printf "CLOUD_BUILD_SERVICE_ACCOUNT is Cloud Build's legacy default service account (%s); builds must run as the dedicated build identity" "$email"
+  elif [[ ! "$email" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z][a-z0-9-]*[a-z0-9]\.iam\.gserviceaccount\.com$ ]]; then
+    printf 'CLOUD_BUILD_SERVICE_ACCOUNT (%s) is not a user-managed service account email (NAME@PROJECT.iam.gserviceaccount.com)' "$email"
+  else
+    return 0
+  fi
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Government capture job
 # ---------------------------------------------------------------------------
 # The operator capture runs the EXISTING entrypoint

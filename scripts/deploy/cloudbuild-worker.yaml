@@ -17,3 +17,9 @@ steps:
 
 images:
   - ${_WORKER_IMAGE}
+
+# The build runs as a user-specified service account (cloud-run.sh passes
+# --service-account: the dedicated build identity, never the Compute default
+# service account), which requires logs to go to Cloud Logging only.
+options:
+  logging: CLOUD_LOGGING_ONLY

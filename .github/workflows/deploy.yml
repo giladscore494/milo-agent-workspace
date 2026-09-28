@@ -20,6 +20,12 @@ name: Deploy production
 # Stage P (plan authoring) and/or E' (the Prepare button). Never Stage 2 --
 # paid execution stays with arm.yml. Skipped in permanent operating mode, which
 # keeps the live stage.
+#
+# preflight_as_deployer (PR-Ops3): instead of deploying, run every read-only
+# gcloud call the deploy makes AS the deployer, plus testIamPermissions probes
+# for the build submit and actAs permissions, and report every missing API,
+# permission and resource at once (scripts/ops/preflight-deployer.sh). It
+# never builds, deploys or changes anything; the Deploy step does not run.
 
 on:
   workflow_dispatch:
@@ -40,6 +46,11 @@ on:
           - none
       dry_run:
         description: "Print every command and call nothing"
+        required: false
+        default: false
+        type: boolean
+      preflight_as_deployer:
+        description: "Read-only: run the deploy's gcloud reads and permission probes as the deployer, report every gap, deploy nothing"
         required: false
         default: false
         type: boolean
@@ -131,7 +142,21 @@ jobs:
       - name: PostgreSQL client
         run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
 
+      - name: Preflight as the deployer (read-only, deploys nothing)
+        if: ${{ inputs.preflight_as_deployer }}
+        env:
+          SHA_INPUT: ${{ inputs.sha }}
+          DRY_RUN_INPUT: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--sha "${SHA_INPUT}")
+          if [[ "${DRY_RUN_INPUT}" == "true" ]]; then
+            args+=(--dry-run)
+          fi
+          bash scripts/ops/preflight-deployer.sh "${args[@]}"
+
       - name: Deploy
+        if: ${{ !inputs.preflight_as_deployer }}
         env:
           SHA_INPUT: ${{ inputs.sha }}
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
