@@ -1,10 +1,10 @@
-"""How the four RECONSTRUCTED replay fixtures were written -- reproducibly.
+"""How the RECONSTRUCTED replay fixtures were written -- reproducibly.
 
-    python tests/replay/reconstruct.py            # rewrite the four manifests
+    python tests/replay/reconstruct.py            # rewrite the manifests
     python tests/replay/reconstruct.py --check    # exit 1 if any differs
 
-None of the raw provider outputs of runs 6825eb96, 280fc9e5, c4b8bb54 and
-aa63369b is available offline, and this repository reads no production state.
+None of the raw provider outputs of runs 6825eb96, 280fc9e5, c4b8bb54,
+aa63369b and 29eb076c is available offline, and this repository reads no production state.
 Every artifact below is therefore RECONSTRUCTED, and each manifest says so per
 artifact, naming the durable fact it was written from. Nothing here is labelled
 "captured": a captured fixture comes only from `scripts/export_replay_capture.py`
@@ -20,14 +20,16 @@ What is durable fact, and what is a stand-in
   open object (11 tasks); c4b8bb54's eleven completed tasks followed by ONE
   replan decision the contract refused; aa63369b's outcome as stated for this
   PR (8 vehicles, 2 ambiguous groups, a get_variants-only ``register_meta``
-  task that declared evidence).
+  task that declared evidence); 29eb076c's evidence block as the PR-EV finding
+  states it (every task: required_fields resolved/ambiguous/match_count,
+  minimum_sources 1, min_confidence 0.9; 11/11 resolved).
 * The register rows are STAND-INS. 37350/37439 (LIMITED, TZNA55L-GKZSZA) and
   37309/37345 (TRAILHUNTER, TZNH55L GKVSZA) are real duplicate identities; the
   other 4RUNNER codes and trims are the fixture values of
   tests/replay_6825eb96.py. Every 4RUNNER row is the committed R5 register row
-  38683 with its identity fields replaced; the c4b8bb54 / 280fc9e5 rows are real
-  RAV4 rows of the committed R5 capture, standing in for rows not available
-  offline.
+  38683 with its identity fields replaced; the c4b8bb54 / 280fc9e5 / 29eb076c
+  rows are real RAV4 rows of the committed R5 capture, standing in for rows not
+  available offline.
 * Every tool result is what the REAL Government tool answers over those rows
   (candidate ids and the activation timestamp normalized), so the replay's
   cross-check holds by construction and a data-layer drift breaks it.
@@ -641,9 +643,155 @@ def run_aa63369b_v4() -> dict[str, Any]:
     return document
 
 
+# =============================================================================
+# 29eb076c: the T batch -- 11/11 resolved, still partial_success (PR-EV)
+# =============================================================================
+
+#: The evidence block EVERY task of run 29eb076c declared, as the finding states
+#: it: the resolve_variant OUTPUT keys, which no Government evidence carries.
+T_EVIDENCE = {"required_fields": ["resolved", "ambiguous", "match_count"],
+              "minimum_sources": 1, "min_confidence": 0.9}
+
+#: The per-candidate output schema of the T plan: the register answer's keys.
+T_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "resolved": {"type": "boolean"},
+        "ambiguous": {"type": "boolean"},
+        "match_count": {"type": "integer", "minimum": 0},
+    },
+    "required": ["resolved", "ambiguous", "match_count"],
+    "additionalProperties": False,
+}
+
+
+def run_29eb076c() -> dict[str, Any]:
+    rows = rav4_rows(11)
+    register = Register(rows)
+    order = [str(row["_id"]) for row in rows]
+    task_ids = [f"t{index:02d}" for index in range(1, 12)]
+
+    def output(result, _item):
+        return {"resolved": result["resolved"], "ambiguous": result["ambiguous"],
+                "match_count": result["match_count"]}
+
+    tasks, results, workers = _resolve_tasks(
+        register, order, task_ids, output_schema=T_SCHEMA, evidence=T_EVIDENCE,
+        completion_spec={"required_outputs": ["resolved", "ambiguous", "match_count"],
+                         "evidence_satisfied": True, "allow_partial": True},
+        goal="resolve register candidate {task_id}", worker_output=output)
+    commander = [completion("planning", plan(tasks, objective=OBJECTIVE)),
+                 completion("replanning", REQUEST_VERIFICATION)]
+    provenance = {
+        "preparation": {"kind": RECONSTRUCTED, "source": (
+            "eleven queued items (the T batch: 11 candidates, all resolved); identities are "
+            "stand-ins from real RAV4 rows of the committed R5 capture")},
+        "commander[0]": {"kind": RECONSTRUCTED, "source": (
+            "an eleven-task resolve_variant plan in which EVERY task declares the evidence "
+            "block the run's plan declared: required_fields ['resolved', 'ambiguous', "
+            "'match_count'], minimum_sources 1, min_confidence 0.9; the run's own plan text "
+            "is not available offline")},
+        "commander[1]": {"kind": RECONSTRUCTED, "source": (
+            "the run reached verification and partial_success, so its replan decision is "
+            "written as REQUEST_VERIFICATION")},
+    }
+    for task_id in task_ids:
+        provenance[f"workers.{task_id}[0]"] = {"kind": RECONSTRUCTED, "source": (
+            "a completed task output rebuilt from the register answer; the raw completion "
+            "is not available offline")}
+        provenance[f"tool_results.{task_id}/c1"] = {"kind": RECONSTRUCTED, "source": TOOL_SOURCE}
+    provenance.update(row_provenance(rows, {record: STAND_IN_RAV4 for record in order}))
+    expected = {
+        "terminal": "unrecorded_call", "model_calls": 1,
+        "retry_reasons": [["commander", "planning", "EVIDENCE_FIELD_NOT_PRODUCIBLE"]],
+        "unconsumed": {"completions": 12, "tool_results": 11},
+        "unrecorded_call": {"role": "commander", "phase": "planning", "task_id": None,
+                            "index": 1},
+        "note": ("PR-EV: every task's evidence.required_fields names resolve_variant OUTPUT "
+                 "keys (resolved, ambiguous, match_count), which no Government evidence "
+                 "carries, so the firewall now refuses the plan (EVIDENCE_FIELD_NOT_PRODUCIBLE) "
+                 "and asks the Commander for its ONE repair. Production never produced that "
+                 "repair, so the replay stops at that call after one model call; nothing past "
+                 "the plan is paid for. The accepted-plan path is tests/replay/29eb076c-ev."),
+    }
+    return manifest(run_id="29eb076c", description=(
+        "The T batch, partial_success in production although 11/11 candidates resolved: "
+        "every task required the resolve_variant output keys as evidence fields, so every "
+        "task reported EVIDENCE_REQUIREMENTS_UNMET."),
+        register=register, preparation=register.preparation(order), commander=commander,
+        workers=workers, tool_results=results, provenance=provenance, expected=expected)
+
+
+# =============================================================================
+# 29eb076c-ev: the SAME recording plus the ONE repair the firewall asks for
+# =============================================================================
+
+#: The one substitution, applied to EVERY task's required_fields in the plan TEXT.
+EV_ORIGINAL = '"required_fields": ["resolved", "ambiguous", "match_count"]'
+EV_REPAIRED = '"required_fields": ["trim", "official_model_code"]'
+EV_PROVENANCE = "derived from 29eb076c (EV)"
+
+
+def derive_ev_plan_text(original: str) -> str:
+    """The original plan text with every task's required_fields made producible.
+
+    A TEXT substitution of one exact span, once per task, so every other byte
+    of what the Commander wrote is unchanged; reversible by swapping back.
+    """
+    if original.count(EV_ORIGINAL) != len(json.loads(original)["graph"]["tasks"]):
+        raise AssertionError("every task must carry the recorded required_fields")
+    return original.replace(EV_ORIGINAL, EV_REPAIRED)
+
+
+def reverse_ev_plan_text(derived: str) -> str:
+    return derived.replace(EV_REPAIRED, EV_ORIGINAL)
+
+
+#: The engine's outcome for the repaired plan on the current code: the same 11
+#: resolved candidates, now with NO evidence gap, so the run completes.
+EXPECTED_29EB076C_EV: dict[str, Any] = {
+    "terminal": "result", "model_calls": 14,
+    "retry_reasons": [["commander", "planning", "EVIDENCE_FIELD_NOT_PRODUCIBLE"]],
+    "unconsumed": {"completions": 0, "tool_results": 0},
+    "status": "complete", "result_kind": "usable_result",
+    "vehicles": 11, "unresolved_groups": 0, "needs_review": [],
+    "summary": {"unresolved_ambiguous": 0, "unresolved_not_found": 0,
+                "vehicles_resolved": 11, "vehicles_with_review": 0},
+    "note": ("PR-EV: the recorded plan is refused (EVIDENCE_FIELD_NOT_PRODUCIBLE), the ONE "
+             "repair names producible fields (trim, official_model_code), and the same 11 "
+             "resolved candidates now complete with no EVIDENCE_REQUIREMENTS_UNMET."),
+}
+
+
+def run_29eb076c_ev() -> dict[str, Any]:
+    original = run_29eb076c()
+    document = copy.deepcopy(original)
+    plan_text = original["commander"][0]["content"]
+    document["commander"] = [copy.deepcopy(original["commander"][0]),
+                             completion("planning", derive_ev_plan_text(plan_text), raw=True),
+                             copy.deepcopy(original["commander"][1])]
+    document["description"] = (
+        "DERIVED from the 29eb076c recording: the refused plan is kept as recorded and is "
+        "followed by the ONE repair the firewall asks for -- the same plan text with every "
+        "task's evidence.required_fields changed to ['trim', 'official_model_code']. Every "
+        "other artifact is 29eb076c's, unchanged.")
+    provenance = document["provenance"]
+    provenance["commander[2]"] = provenance.pop("commander[1]")
+    provenance["commander[1]"] = {"kind": RECONSTRUCTED, "source": (
+        f"{EV_PROVENANCE}: the 29eb076c plan text with ONLY every task's "
+        "evidence.required_fields changed from ['resolved', 'ambiguous', 'match_count'] to "
+        "['trim', 'official_model_code'] (tests/replay/reconstruct.py derive_ev_plan_text); "
+        "reversing that substitution restores the 29eb076c text byte for byte. Not a model "
+        "output.")}
+    document["provenance"] = dict(sorted(provenance.items()))
+    document["expected"] = EXPECTED_29EB076C_EV
+    return document
+
+
 BUILDERS = {"6825eb96": run_6825eb96, "280fc9e5": run_280fc9e5,
             "c4b8bb54": run_c4b8bb54, "aa63369b": run_aa63369b,
-            "aa63369b-v4": run_aa63369b_v4}
+            "aa63369b-v4": run_aa63369b_v4, "29eb076c": run_29eb076c,
+            "29eb076c-ev": run_29eb076c_ev}
 
 
 def render(document: dict[str, Any]) -> str:

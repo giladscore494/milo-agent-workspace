@@ -55,10 +55,10 @@ completions / tool results the current code never reached) are always stated.
 `note` is free text and is not compared.
 
 A fixture is **captured** only when every artifact came from
-`scripts/export_replay_capture.py`. The four fixtures committed with PR-Y are
-**reconstructed**: no raw provider output of them exists offline, so each was
-written by `tests/replay/reconstruct.py` from the durable facts the repository
-records about the run, with stand-in register rows, and each artifact says so.
+`scripts/export_replay_capture.py`. The fixtures committed with PR-Y, and
+29eb076c (PR-EV), are **reconstructed**: no raw provider output of them exists
+offline, so each was written by `tests/replay/reconstruct.py` from the durable
+facts the repository records about the run, with stand-in register rows, and each artifact says so.
 `python tests/replay/reconstruct.py --check` proves none was edited by hand.
 
 A **derived** fixture (`aa63369b-v4`) is a recording with ONE stated change:
@@ -68,6 +68,14 @@ artifact's provenance says `derived from aa63369b (V4)`; every other artifact
 is aa63369b's, unchanged, and a test reverses the substitution byte for byte.
 The original `aa63369b` is kept as recorded; on the current code its plan is
 refused and the replay stops at the Commander repair production never made.
+
+A second derived fixture, `29eb076c-ev`, keeps the recorded 29eb076c (T batch)
+plan -- which PR-EV's firewall refuses with `EVIDENCE_FIELD_NOT_PRODUCIBLE` --
+and adds the ONE repair the firewall asks for: the same plan text with every
+task's `evidence.required_fields` changed from the resolve_variant output keys
+(`resolved`, `ambiguous`, `match_count`) to `["trim", "official_model_code"]`.
+Its `commander[1]` provenance says `derived from 29eb076c (EV)`, every other
+artifact is 29eb076c's, and a test reverses the substitution byte for byte.
 
 The reconstructed tool results predate PR-V's `match_mode`; `reconstruct.py`
 confirms each is an `exact` match under the current tool and writes it as the
