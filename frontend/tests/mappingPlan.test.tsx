@@ -39,16 +39,24 @@ const apiMocks = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('../lib/api', () => ({
-  api: apiMocks.api,
-  executionUiEnabled: () => apiMocks.executionUi,
-  newIdempotencyKey: () => 'ui-test-idempotency-key',
-  ApiError: class ApiError extends Error {
+vi.mock('../lib/api', () => {
+  class ApiError extends Error {
     constructor(public status: number, public code: string, message: string) {
       super(message);
     }
-  },
-}));
+  }
+  // The catalog browser is off, as every deploy pins it: its reads answer 404
+  // and the page shows nothing (any other failure would show an error).
+  const catalogBrowser = async () => { throw new ApiError(404, 'CATALOG_BROWSER_DISABLED', 'not enabled'); };
+  return {
+    api: new Proxy(apiMocks.api, {
+      get: (target, name) => (name === 'catalogBrowser' ? catalogBrowser : Reflect.get(target, name)),
+    }),
+    executionUiEnabled: () => apiMocks.executionUi,
+    newIdempotencyKey: () => 'ui-test-idempotency-key',
+    ApiError,
+  };
+});
 
 const SWARM_PROJECT = { id: PROJECT, slug: 'swarm', name: 'Swarm Project', workflow_key: 'swarm_v2' };
 const V1_PROJECT = { id: '9a1d1b02-0b2f-4a5b-9a24-8f0d5a6f4c31', slug: 'v1', name: 'V1 Project', workflow_key: 'vehicle_catalog_v1' };

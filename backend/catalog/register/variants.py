@@ -27,7 +27,10 @@ The mapping rules (plan section 3.9)
   in their own `norm_*` columns; the source columns are never changed.
 * The driver-assistance indicators and their sources go in ONE `equipment`
   document whose keys are the closed `EQUIPMENT_FIELDS`; any other key is
-  refused (`check_equipment`, and the database's CHECK).
+  refused (`check_equipment`, and `record_catalog_variants`). The database
+  stores it compactly (PR-L1b, 20261001000100: two indicator masks and the
+  five source texts, in `EQUIPMENT_FIELDS` order) and reads it back as the
+  same document.
 
 The category (D4)
 -----------------
@@ -42,6 +45,9 @@ it cannot support (truck, bus, motorcycle, other) are dropped.
 
 `python -m backend.catalog.register.variants --snapshot-key KEY` is the
 operator backfill of ONE active snapshot (scripts/ops/register-variants.sh).
+Only the ACTIVE snapshot of a tozar (its latest activation) is built, by a
+capture or a backfill: a superseded one is refused
+(CATALOG_VARIANT_SNAPSHOT_SUPERSEDED).
 """
 
 from __future__ import annotations
@@ -146,13 +152,18 @@ VARIANT_REASONS: Mapping[str, str] = {
     "CATALOG_VARIANT_SNAPSHOT_UNKNOWN": "no active Government snapshot has that key",
     "CATALOG_VARIANT_SNAPSHOT_INELIGIBLE":
         "only an active, count-verified, whole-tozar Government snapshot is built",
+    "CATALOG_VARIANT_SNAPSHOT_SUPERSEDED": "only the active snapshot of a tozar is built",
     "CATALOG_VARIANT_MAPPER_MISMATCH": "the database's mapper version is not this code's",
     "CATALOG_VARIANT_ROWS_INVALID": "the database refused a variant batch",
     "CATALOG_VARIANT_BUILD_FAILED": "the variant build did not complete",
 }
 #: The database's refusal codes the repository maps (a subset of the above).
-DATABASE_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE",
-                                      "CATALOG_VARIANT_MAPPER_MISMATCH", "CATALOG_VARIANT_ROWS_INVALID")
+DATABASE_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CATALOG_VARIANT_SNAPSHOT_SUPERSEDED",
+                                      "CATALOG_VARIANT_MAPPER_MISMATCH", "CATALOG_VARIANT_ROWS_INVALID",
+                                      "CATALOG_VARIANT_EQUIPMENT_KEY_UNKNOWN")
+#: The refusals the backfill reports as REFUSED (exit 2), not FAILED.
+BACKFILL_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CATALOG_VARIANT_SNAPSHOT_SUPERSEDED",
+                                      "CATALOG_VARIANT_MAPPER_MISMATCH")
 
 
 class VariantMappingError(ValueError):
@@ -361,7 +372,7 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
         report = build_snapshot_variants(repo, snapshot["id"])
     except Exception as failure:  # noqa: BLE001 - reduced to a static code
         code = _static_code(failure)
-        refused = code in ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CATALOG_VARIANT_MAPPER_MISMATCH")
+        refused = code in BACKFILL_REFUSALS
         print(f"{'REFUSED' if refused else 'FAILED'} {code}: {args.snapshot_key}")
         return EXIT_REFUSED if refused else EXIT_FAILED
     line = (f"snapshot_key={args.snapshot_key} status={report['status']} "

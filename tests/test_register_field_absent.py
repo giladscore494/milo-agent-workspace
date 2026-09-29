@@ -22,11 +22,13 @@ RECORD = {"upstream_record_id": "38683", "tozar": "טויוטה", "kinuy_mishari
           "delek_cd": 1, "delek_nm": "בנזין"}
 
 
-def _outcome(record: dict | None, *, resolved: bool = True) -> dict:
+def _outcome(record: dict | None, *, resolved: bool = True, unstated: list[str] | None = None) -> dict:
     result = {"resolved": resolved, "ambiguous": False, "match_count": 1 if resolved else 0,
               "variants": [{"upstream_record_id": "38683"}] if resolved else []}
     if record is not None:
         result["source_record"] = record
+    if unstated is not None:
+        result["register_unstated"] = unstated
     return candidate_outcome(task_id="t01", call_id="c1", tool=GOVERNMENT_TOOL_NAME,
                              operation="resolve_variant", arguments={}, result=result)
 
@@ -38,14 +40,41 @@ def test_the_field_table_is_the_evidence_mappers():
 
 
 def test_a_resolved_outcome_names_the_fields_its_row_does_not_state():
-    assert "register_fields_absent" not in _outcome(RECORD)
+    assert "register_fields_absent" not in _outcome(RECORD, unstated=[])
     no_trim = {k: v for k, v in RECORD.items() if k != "ramat_gimur"}
-    assert _outcome(no_trim)["register_fields_absent"] == ["trim"]
-    no_fuel = {**RECORD, "delek_cd": None}
-    assert _outcome(no_fuel)["register_fields_absent"] == ["identity_dimensions.fuel_type"]
+    assert _outcome(no_trim, unstated=["ramat_gimur"])["register_fields_absent"] == ["trim"]
+    no_fuel = {k: v for k, v in RECORD.items() if k != "delek_cd"}
+    assert _outcome(no_fuel, unstated=["delek_cd"])["register_fields_absent"] == ["identity_dimensions.fuel_type"]
     # Only a RESOLVED row with its server-built record says anything.
-    assert "register_fields_absent" not in _outcome(None)
-    assert "register_fields_absent" not in _outcome(no_trim, resolved=False)
+    assert "register_fields_absent" not in _outcome(None, unstated=["ramat_gimur"])
+    assert "register_fields_absent" not in _outcome(no_trim, resolved=False, unstated=["ramat_gimur"])
+    # Never read from the typed projection: a result that does not state the
+    # raw absence states none, even when the projection lacks the field.
+    assert "register_fields_absent" not in _outcome(no_trim)
+
+
+def _resolved_with(value) -> dict:
+    """The REAL tool reading of a row whose `delek_cd` is `value`."""
+    from backend.catalog.government.query import identity_projection, unstated_fields
+
+    payload = {"_id": 38683, **{k: v for k, v in RECORD.items() if k != "upstream_record_id"}, "delek_cd": value}
+    record = {"upstream_record_id": "38683", **identity_projection(payload)}
+    return _outcome(record, unstated=list(unstated_fields(payload)))
+
+
+def test_p32_absence_is_the_raw_register_value_and_a_wrong_type_stays_hard():
+    for raw in (None, "", "   "):
+        assert _resolved_with(raw)["register_fields_absent"] == ["identity_dimensions.fuel_type"], raw
+    # "1" (text) or 1.5 is a STATED value of the wrong type: the projection
+    # drops it, but the register said something -- not absent, so a missing
+    # fuel fact stays the hard EVIDENCE_REQUIREMENTS_UNMET.
+    for wrong in ("1", 1.5, True):
+        outcome = _resolved_with(wrong)
+        assert "delek_cd" not in outcome.get("registration", {}) and "register_fields_absent" not in outcome
+        assert _gaps(["identity_dimensions.fuel_type"], set(),
+                     outcome.get("register_fields_absent")) == [{"task_id": "t01",
+                                                                 "code": "EVIDENCE_REQUIREMENTS_UNMET"}]
+    assert "register_fields_absent" not in _resolved_with(1)
 
 
 def _gaps(required: list[str], fields: set[str], absent: list[str] | None, *,

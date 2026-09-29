@@ -267,8 +267,8 @@ def test_the_preflight_reports_the_archive_as_a_gap_and_a_violation_as_blocked()
 
 RETENTION_PSQL = """#!/usr/bin/env bash
 printf '%s\\n' "psql" >> "$OPS_TEST_CALLS"
-printf 'PRUNABLE cs1.a rows=5 estimated_bytes=1000\\nTOTAL snapshots=%s rows=5 estimated_bytes=1000\\nDIGEST %s\\n' \\
-  "${OPS_TEST_PRUNABLE:-1}" "$OPS_TEST_DIGEST"
+printf 'PRUNABLE cs1.a rows=5 estimated_bytes=1000\\nTOTAL snapshots=%s rows=5 estimated_bytes=1000 variant_builds=%s\\nDIGEST %s\\n' \\
+  "${OPS_TEST_PRUNABLE:-1}" "${OPS_TEST_VARIANT_BUILDS:-0}" "$OPS_TEST_DIGEST"
 """
 RETENTION_GCLOUD = """#!/usr/bin/env bash
 printf 'gcloud %s\\n' "$*" >> "$OPS_TEST_CALLS"
@@ -335,6 +335,16 @@ def test_nothing_prunable_runs_no_job(tmp_path):
                       extra_env={"OPS_TEST_DIGEST": DIGEST, "OPS_TEST_PRUNABLE": "0"})
     assert result.returncode == 0 and "nothing is prunable" in result.stdout
     assert not [c for c in tree.tool_calls() if "jobs execute" in c]
+
+
+def test_old_mapper_variant_builds_alone_are_still_pruned(tmp_path):
+    """PR-L1b: no snapshot, but an old mapper version's variant build: the job runs."""
+    tree = retention_tree(tmp_path)
+    result = tree.run("register-retention.sh", "--apply", "--confirm", "PRUNE", "--digest", DIGEST,
+                      extra_env={"OPS_TEST_DIGEST": DIGEST, "OPS_TEST_PRUNABLE": "0", "OPS_TEST_VARIANT_BUILDS": "1",
+                                 "MILO_RETENTION_POLL_SECONDS": "0"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert [c for c in tree.tool_calls() if "jobs execute" in c]
 
 
 def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():

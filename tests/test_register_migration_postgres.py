@@ -99,8 +99,8 @@ def regdb():
             server.psql(file=migration)
         assert server.psql("select to_regclass('public.catalog_register_capture_units') is null") == "t"
         server.psql(file=_register_migration())
-        # Later migrations (PR-L1's variants, PR-HYG's placeholder exclusion) apply on
-        # top, as in production.
+        # Later migrations (PR-L1's variants, PR-HYG's placeholder exclusion,
+        # PR-L1b's retention) apply on top, as in production.
         for migration in after:
             server.psql(file=migration)
         yield server
@@ -280,7 +280,8 @@ def test_a_captured_unit_needs_an_active_counted_archived_snapshot(regdb):
     captured = json.loads(_rpc_as_service(regdb, status))
     assert captured["status"] == "captured" and captured["count_verified"] is True
     assert captured["measured_bytes"] > 0
-    assert captured["measurement_method"] == "pg_column_size(raw_records+candidates)"
+    # PR-L1b: the full measurement (a fresh snapshot has no variants or ledger rows yet).
+    assert captured["measurement_method"] == "pg_column_size(raw_records+candidates+variants+ledger)"
     lines = regdb.psql(f"select string_agg((r.source_locator->>'capture_index') || '>' || l.archive_line, ',' "
                        f"order by l.archive_line) from public.catalog_register_archive_lines l "
                        f"join public.catalog_raw_records r on r.id = l.raw_record_id where l.snapshot_key = '{key}'")

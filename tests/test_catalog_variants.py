@@ -25,7 +25,7 @@ from backend.catalog.register import variants as mapper
 from backend.dependencies import get_repository
 from backend.main import app
 from backend.testing.memory_repository import MemoryRepository
-from tests.test_register_capture import (USER, api_env, captured_world, no_sockets,  # noqa: F401
+from tests.test_register_capture import (USER, _snapshot, api_env, captured_world, no_sockets,  # noqa: F401
                                          snapshot_by_key)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -353,10 +353,25 @@ def test_the_newest_capture_of_a_snapshot_decides_its_count_verification():
     assert getattr(refused.value, "code", "") == "CATALOG_VARIANT_SNAPSHOT_INELIGIBLE"
 
 
-def test_retention_keeps_a_snapshot_with_variants():
+def test_retention_keeps_the_current_variant_build():
     repo, _w, _report, snapshot = built_world()
-    kept = {row["snapshot_id"] for row in repo.prunable_register_snapshots()}
-    assert snapshot["id"] not in kept
+    # Two later activations, never built, and no capture unit names the
+    # built snapshot any more: it is still the tozar's CURRENT build.
+    repo._register_state()["units"].clear()
+    for index in (1, 2):
+        newer = _snapshot(f"cs1.newer{index}", "טויוטה", f"2999-01-0{index}")
+        repo.catalog_snapshots[("government", "newer", newer["snapshot_key"])] = newer
+    assert snapshot["id"] not in {row["snapshot_id"] for row in repo.prunable_register_snapshots()}
+
+
+def test_a_superseded_snapshot_is_never_built(capsys):
+    repo, _w, _report, snapshot = built_world()
+    newer = _snapshot("cs1.newer", "טויוטה", "2999-01-01")
+    repo.catalog_snapshots[("government", "newer", newer["snapshot_key"])] = newer
+    repo._variants = None
+    assert mapper.main(["--snapshot-key", snapshot["snapshot_key"]], repository=repo) == mapper.EXIT_REFUSED
+    assert capsys.readouterr().out.strip() == f"REFUSED CATALOG_VARIANT_SNAPSHOT_SUPERSEDED: {snapshot['snapshot_key']}"
+    assert repo._variants_state()["builds"] == {}
 
 
 def test_an_ineligible_snapshot_is_refused():

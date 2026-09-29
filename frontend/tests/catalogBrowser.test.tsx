@@ -24,6 +24,7 @@ import { parseCapabilities, parseDirectory, parseWorkScopeState } from '../lib/w
 import { CAPABILITIES, CONVERSATION, DIGEST, DIRECTORY, PLAN, PROJECT, stateBody } from './fixtures/workScope';
 
 const TOYOTA = 'טויוטה';
+type BrowserLevelName = Parameters<CatalogBrowserClient['browse']>[1];
 const MAZDA = 'מאזדה';
 const UNMAPPED = 'יצרן לא ידוע';
 const DIRECTORY_WITH_MAZDA = {
@@ -180,6 +181,32 @@ describe('CatalogBrowserPanel', () => {
     expect(api.openPlan).not.toHaveBeenCalled();
   });
 
+  it('shows an error, never nothing, when the first read fails for any reason but 404', async () => {
+    const api = client({ manufacturers: new ApiError(503, 'REPOSITORY_ERROR', 'unavailable') });
+    await openPanel(api);
+    expect((await screen.findByRole('alert')).textContent).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Catalog' })).toBeTruthy();
+    // And a later read that succeeds replaces it.
+    (api.browse as ReturnType<typeof vi.fn>).mockResolvedValueOnce(page([{ tozar: TOYOTA, variants: 30 }]));
+    fireEvent.click(screen.getByRole('button', { name: 'All manufacturers' }));
+    expect(await screen.findByRole('button', { name: TOYOTA })).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps the facets when a navigation read starts before they arrive', async () => {
+    let release: (value: unknown) => void = () => undefined;
+    const base = client();
+    const api = client({}, {
+      browse: vi.fn((project: string, level: BrowserLevelName, query: string) => (level === 'facets'
+        ? new Promise((resolve) => { release = resolve; }) : base.browse(project, level, query))),
+    });
+    await openPanel(api);
+    fireEvent.click(await screen.findByRole('button', { name: TOYOTA }));
+    await screen.findByRole('button', { name: 'RAV4' });
+    await act(async () => release(FACETS));
+    expect(screen.getByRole('option', { name: 'בנזין' })).toBeTruthy();
+  });
+
   it('renders the manufacturers', async () => {
     await openPanel(client());
     expect(await screen.findByRole('button', { name: TOYOTA })).toBeTruthy();
@@ -276,6 +303,32 @@ describe('CatalogBrowserPanel', () => {
     await waitFor(() => expect(onPlanChanged).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(api.openPlan).toHaveBeenCalledTimes(2));
     expect((screen.getByRole('checkbox', { name: `Select ${TOYOTA}` }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('states the open plan\'s own year range, which a revision keeps, and lists the selection', async () => {
+    const api = client({}, { openPlan: vi.fn(async () => ({ work_scope: stateBody() })) });
+    await openPanel(api);
+    await screen.findByRole('button', { name: TOYOTA });
+    fireEvent.change(screen.getByLabelText('To year'), { target: { value: '2024' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${MAZDA}` }));
+    expect(await screen.findByText(/Year range: the plan's own 2018–any, kept when it is revised \(clear the year filter/))
+      .toBeTruthy();
+    expect(screen.queryByText(/Year range: any–2024/)).toBeNull();
+    expect(screen.getByText(`Selected: ${MAZDA}`)).toBeTruthy();
+    fireEvent.click(screen.getByRole('checkbox', { name: `Select ${TOYOTA}` }));
+    expect(screen.getByText(`Selected: ${MAZDA}, ${TOYOTA}`)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('To year'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+    expect(await screen.findByText(/Year range: the plan's own 2018–any, kept when it is revised\. /)).toBeTruthy();
+  });
+
+  it('states the filter\'s year range when there is no plan yet', async () => {
+    await openPanel(client());
+    await screen.findByRole('button', { name: TOYOTA });
+    fireEvent.change(screen.getByLabelText('From year'), { target: { value: '2020' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+    expect(await screen.findByText(/Year range: 2020–any\./)).toBeTruthy();
   });
 
   it('writes nothing when the stated year range differs from the open plan\'s', async () => {

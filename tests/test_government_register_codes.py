@@ -127,6 +127,9 @@ def test_each_real_row_resolves_uniquely_when_its_codes_are_stated():
         source = result["source_record"]
         assert (source["tozeret_cd"], source["degem_cd"], source["sug_degem"]) == \
             coverage.register_codes(REAL_ROWS[record])
+        # P32 (PR-L1b): the raw absence, read from the row itself.
+        assert result["register_unstated"] == [name for name in ("ramat_gimur", "delek_cd")
+                                               if REAL_ROWS[record].get(name) in (None, "")]
         assert "distinguishing" not in result
 
 

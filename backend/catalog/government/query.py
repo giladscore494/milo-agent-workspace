@@ -223,6 +223,10 @@ class VariantResolutionResult:
     match_count: int
     provenance: DatasetProvenance
     identity_projection: Mapping[str, Any] = field(default_factory=dict)
+    #: PR-L1b (P32): the reviewed identity fields whose RAW register value is
+    #: missing, null or blank for that one row -- never read from the typed
+    #: projection, which also drops a value of the wrong type.
+    unstated_fields: tuple[str, ...] = ()
     #: PR-V: `exact`, or `separator_insensitive` when the exact code matched
     #: nothing and the one separator-insensitive retry answered instead.
     match_mode: str = MATCH_EXACT
@@ -299,6 +303,15 @@ def identity_projection(payload: Mapping[str, Any]) -> dict[str, Any]:
         if code is not None:
             projected[field_name] = code
     return projected
+
+
+def unstated_fields(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """The reviewed identity fields the RAW row states no value for: missing,
+    null, or a string that is empty after trimming. A value of the wrong type
+    IS stated (the projection drops it, but the register said something)."""
+    return tuple(name for name in IDENTITY_RECORD_FIELD_TYPES
+                 if payload.get(name) is None
+                 or (isinstance(payload.get(name), str) and not payload[name].strip()))
 
 
 class GovernmentCatalogQuery:
@@ -482,6 +495,7 @@ class GovernmentCatalogQuery:
         return VariantResolutionResult(
             matches=matches, match_count=1, provenance=page.provenance,
             identity_projection=identity_projection(payload if isinstance(payload, Mapping) else {}),
+            unstated_fields=unstated_fields(payload) if isinstance(payload, Mapping) else (),
             match_mode=mode)
 
     def _separator_insensitive(self, manufacturer: str, commercial_model: str,

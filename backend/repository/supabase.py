@@ -2504,11 +2504,14 @@ class SupabaseRepository:
         return data
 
     def prunable_register_snapshots(self) -> list[dict[str, Any]]:
-        """The whole prunable list, as ONE jsonb document (never row-capped)."""
+        """The whole prunable list, as ONE jsonb document (never row-capped):
+        the snapshots, then (PR-L1b) the old-mapper variant builds, each
+        carrying its digest `item`."""
         data = self.client.rpc("catalog_register_prunable_list", {}).execute().data
-        if not isinstance(data, dict) or not isinstance(data.get("snapshots"), list):
+        if not isinstance(data, dict) or not isinstance(data.get("snapshots"), list) \
+                or not isinstance(data.get("variant_builds"), list):
             raise AppError("REPOSITORY_ERROR", "the prunable list returned an unreadable document", 502)
-        return data["snapshots"]
+        return data["snapshots"] + data["variant_builds"]
 
     def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]:
         return self._guarded_rpc("prune_register_snapshots", {

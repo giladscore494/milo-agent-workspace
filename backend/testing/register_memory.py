@@ -209,8 +209,12 @@ class RegisterMemoryMixin:
     def _snapshot_bytes(self, snapshot_id: str) -> int:
         size = sum(len(json.dumps(row, default=str)) for (sid, _k), row in self.catalog_raw_records.items()
                    if str(sid) == str(snapshot_id))
-        return size + sum(len(json.dumps(row, default=str)) for (sid, _k), row in self.catalog_candidates.items()
-                          if str(sid) == str(snapshot_id))
+        size += sum(len(json.dumps(row, default=str)) for (sid, _k), row in self.catalog_candidates.items()
+                    if str(sid) == str(snapshot_id))
+        # PR-L1b: and its variants.
+        rows = (getattr(self, "_variants", None) or {}).get("rows") or {}
+        return size + sum(len(json.dumps(row, default=str)) for (sid, _u, _m), row in rows.items()
+                          if sid == str(snapshot_id))
 
     def record_register_unit_status(self, run_id: UUID, unit_id: str, status: str, failure_code: str | None,
                                     snapshot_id: str | None, api_total: int | None, captured_rows: int | None,
@@ -294,7 +298,9 @@ class RegisterMemoryMixin:
                     + list(self.work_scope_queue_items)):
             if row.get("snapshot_id"):
                 referenced_ids.add(str(row["snapshot_id"]))
-        referenced_keys = {str(row.get("snapshot_key")) for row in self.catalog_variant_coverage.values()}
+        # PR-L1b: only a `register`-level ledger row keeps a snapshot.
+        referenced_keys = {str(row.get("snapshot_key")) for row in self.catalog_variant_coverage.values()
+                           if row.get("level") == "register"}
         for checkpoint in self.checkpoints:
             government = (checkpoint.get("artifacts") or {}).get("government")
             if isinstance(government, dict) and government.get("snapshot_key"):
@@ -305,9 +311,8 @@ class RegisterMemoryMixin:
             if unit["status"] == "captured" and unit.get("snapshot_id"):
                 latest_unit[unit["tozar"]] = unit
         referenced_ids |= {str(u["snapshot_id"]) for u in latest_unit.values()}
-        # PR-L1: a snapshot with variant rows or a variant build is kept.
-        builds = (getattr(self, "_variants", None) or {}).get("builds") or {}
-        referenced_ids |= {str(snapshot_id) for snapshot_id, _mapper in builds}
+        # PR-L1b: the CURRENT variant build of each tozar is kept.
+        referenced_ids |= self._current_variant_snapshots()
         rows = retention.prunable(self.catalog_snapshots.values(), referenced_ids=referenced_ids,
                                   referenced_keys=referenced_keys, live_run_ids=live)
         return [{"snapshot_id": str(r["id"]), "snapshot_key": r["snapshot_key"],
@@ -325,6 +330,10 @@ class RegisterMemoryMixin:
             if current != digest or retention.prune_digest(snapshot_keys) != digest:
                 raise AppError("CATALOG_PRUNE_DIGEST_MISMATCH", "digest mismatch", 409)
             ids = {r["snapshot_id"] for r in rows}
+            variants = self._variants_state()
+            for table in ("rows", "builds"):
+                for key in [k for k in variants[table] if k[0] in ids]:
+                    del variants[table][key]
             candidates = [k for k in self.catalog_candidates if str(k[0]) in ids]
             records = [k for k in self.catalog_raw_records if str(k[0]) in ids]
             for key in candidates:

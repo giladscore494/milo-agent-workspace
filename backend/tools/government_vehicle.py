@@ -221,7 +221,11 @@ OPERATIONS: dict[str, ToolOperation] = {
                  # PR-Z3: an ambiguous answer's per-match distinguishing
                  # fields. Optional: absent on every other answer, and on
                  # every result recorded before it existed.
-                 "distinguishing": _array(_DISTINGUISHING, MAX_RESOLUTION_MATCHES)},
+                 "distinguishing": _array(_DISTINGUISHING, MAX_RESOLUTION_MATCHES),
+                 # PR-L1b (P32): beside `source_record`, the reviewed identity
+                 # fields the resolved row's RAW register value leaves unstated.
+                 # Optional: absent on every result recorded before it existed.
+                 "register_unstated": _array(_STR, len(IDENTITY_RECORD_FIELD_TYPES))},
                 ("resolved", "ambiguous", "match_count", "variants", "provenance"))),
     "search_codes": ToolOperation(
         "search_codes",
@@ -533,6 +537,7 @@ class GovernmentVehicleTool:
             result["source_record"] = {
                 "upstream_record_id": resolution.variant.upstream_record_id,
                 **dict(resolution.identity_projection)}
+            result["register_unstated"] = list(resolution.unstated_fields)
         if resolution.ambiguous and any(item.register_codes for item in resolution.matches):
             # PR-Z3: per match, ONLY what tells the matches apart. Not an
             # identity projection and not a resolution: which row a queued

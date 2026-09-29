@@ -102,6 +102,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260930000100": ("table", "catalog_variants"),
     # PR-HYG P27: placeholder records left out at the queue build.
     "20260930000200": ("column", "catalog_work_scope_unit_coverage.excluded_placeholder"),
+    # PR-L1b variant retention, compact equipment, rank-1 builds.
+    "20261001000100": ("column", "catalog_variants.equipment_stated"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")
