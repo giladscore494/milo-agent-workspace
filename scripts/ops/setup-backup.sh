@@ -28,8 +28,10 @@
 #      production-backup -- this script only READS that condition (run
 #      setup-wif.sh --apply first) and never changes the pool or provider.
 #      Each backup account's workloadIdentityUser goes to the principalSet of
-#      that environment only (attribute.environment/production-backup), never
-#      to the repository-wide principalSet the deployer uses.
+#      that environment only (attribute.environment/production-backup). It
+#      refuses, before changing anything, while the deployer still holds the
+#      repository-wide principalSet (setup-wif.sh --apply narrows it to the
+#      production and production-kill-switch environments first).
 #   5. The backup passphrase: a NEW random value in ~/.milo_backup_passphrase
 #      (mode 600), created once and never printed. It is NOT the manual
 #      workflow's SUPABASE_BACKUP_PASSPHRASE. Keep a copy in the operator's
@@ -131,6 +133,23 @@ policy = json.loads(sys.argv[1] or "{}")
 print(" ".join(sorted({b.get("role", "") for b in policy.get("bindings") or []
                        if sys.argv[2] in (b.get("members") or []) and b.get("role") != sys.argv[3]})))' "$1" "$2" "$3"
 }
+
+# 0. The deployer must already be narrowed (scripts/ops/setup-wif.sh --apply):
+#    while milo-github-deployer holds the repository-wide principalSet, a job
+#    in the reviewer-less production-backup environment could impersonate it.
+#    Refused -- in --check too -- before anything is created or changed.
+DEPLOYER_ID="milo-github-deployer"
+REPOSITORY_PRINCIPALS="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.repository/${GITHUB_REPOSITORY_NAME}"
+if ! deployer_policy="$(gcloud iam service-accounts get-iam-policy "${DEPLOYER_ID}@${PROJECT_ID}.iam.gserviceaccount.com" \
+       --project "$PROJECT_ID" --format=json 2> /dev/null)"; then
+  printf 'FAIL the IAM policy of %s could not be read: run scripts/ops/setup-wif.sh --apply first. Nothing was changed.\n' "$DEPLOYER_ID"
+  exit 1
+fi
+if has_member "$deployer_policy" roles/iam.workloadIdentityUser "$REPOSITORY_PRINCIPALS"; then
+  printf 'FAIL %s still holds workloadIdentityUser for the repository-wide principalSet: run scripts/ops/setup-wif.sh --apply first (it narrows the deployer to production and production-kill-switch). Nothing was changed.\n' "$DEPLOYER_ID"
+  exit 1
+fi
+pass "${DEPLOYER_ID} holds no repository-wide workloadIdentityUser binding (narrowed by setup-wif.sh)"
 
 # 1. APIs ---------------------------------------------------------------------
 for api in storage.googleapis.com iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com; do

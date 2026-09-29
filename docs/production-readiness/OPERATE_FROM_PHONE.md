@@ -135,8 +135,12 @@ if the project has none yet, and the workload identity pool `milo-github`, the O
 'production-kill-switch', 'production-backup']` (`production-backup`: the
 scheduled Supabase backup, PR-OBS; its identities are bound to that
 environment's principalSet only), and the deploy service account
-`milo-github-deployer@<project>.iam.gserviceaccount.com` with these roles and
-nothing else:
+`milo-github-deployer@<project>.iam.gserviceaccount.com`, impersonable ONLY
+from the `production` and `production-kill-switch` environments (its
+`workloadIdentityUser` members are exactly those two environment
+principalSets; `--apply` binds and reads them back, then removes the former
+repository-wide binding, then reads back that exactly those two remain -- and
+only then writes the provider condition), with these roles and nothing else:
 
 | Role | Where | Needed by |
 |---|---|---|

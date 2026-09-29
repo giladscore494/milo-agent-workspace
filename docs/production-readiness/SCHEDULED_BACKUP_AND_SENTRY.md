@@ -65,19 +65,47 @@ workflow, job, run id and commit — never a log line or a secret.
 All in Cloud Shell, from a checkout of `main`, with `gh auth login` done as a
 repository admin and `~/.milo_ro_url` (mode 600) in place.
 
-1. **Admit `production-backup` in the deploy WIF provider** (idempotent):
+1. **Narrow the deployer, then admit `production-backup`** (idempotent, one
+   run):
 
    ```bash
-   bash scripts/ops/setup-wif.sh --plan     # expect exactly one UPDATE: the provider condition
+   bash scripts/ops/setup-wif.sh --plan     # expect, in this order: BIND, BIND, UNBIND, UPDATE
    bash scripts/ops/setup-wif.sh --apply
    ```
 
-   `ALLOWED_ENVIRONMENTS` is now `production`, `production-kill-switch`,
-   `production-backup`; the repository and `refs/heads/main` clauses are
-   unchanged, and no binding of the deployer or the kill switch changes. The
-   existing provider is updated in place (`update-oidc`) and read back:
+   **Decision (owner):** `milo-github-deployer` may be impersonated ONLY from
+   the `production` and `production-kill-switch` GitHub environments -- never
+   from `production-backup` or any other. Every workflow that authenticates
+   as `vars.GCP_DEPLOY_SERVICE_ACCOUNT` runs in one of those two (deploy, arm,
+   gates, capture-flag, website-stage: `production`; kill-switch:
+   `production-kill-switch`); the backup workflows use their own identities.
+   `tests/test_ops_workflows.py` holds every workflow to that.
+
+   `setup-wif.sh --apply` does it in this order, enforced in the script, and
+   stops at the first failure:
+
+   1. binds `roles/iam.workloadIdentityUser` on the deployer for
+      `principalSet://…/workloadIdentityPools/milo-github/attribute.environment/production`
+      and `…/attribute.environment/production-kill-switch` (both held to this
+      repository and `refs/heads/main` by the provider condition), and reads
+      both back -- a provider that does not map `attribute.environment`, a
+      failed binding or one that does not read back stops it with NOTHING
+      removed;
+   2. only then removes the former repository-wide binding
+      (`principalSet://…/attribute.repository/giladscore494/milo-agent-workspace`);
+   3. reads back that the deployer's `workloadIdentityUser` members are
+      EXACTLY those two -- the repository-wide principalSet or any other
+      member left is a `FAIL`, and the condition is not touched;
+   4. only then updates the provider condition in place (`update-oidc`) so
+      `ALLOWED_ENVIRONMENTS` is `production`, `production-kill-switch`,
+      `production-backup` (the repository and `refs/heads/main` clauses
+      unchanged), and reads it back.
+
+   The read-back lines:
 
    ```
+   PASS   milo-github-deployer environment bindings read back: production production-kill-switch
+   PASS   milo-github-deployer workloadIdentityUser members read back: exactly principalSet attribute.environment/production and attribute.environment/production-kill-switch of pool milo-github
    PASS   provider github-actions condition read back: repository giladscore494/milo-agent-workspace, ref refs/heads/main, environments production, production-kill-switch, production-backup
    ```
 
@@ -86,25 +114,19 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    the deploy identity cannot read the WIF provider (by design), so a
    preflight run BY THE DEPLOY WORKFLOW always reports it as "not verifiable
    with this identity"; only an operator run
-   (`bash scripts/deploy/check-wif-environment.sh <project>`) can show PASS. And
-   `setup-backup.sh` refuses with `FAIL provider github-actions does not admit
-   production-backup: run scripts/ops/setup-wif.sh --apply first`.
-
-   **Known exposure (owner decision pending):** the deployer's
-   `workloadIdentityUser` binding is to the REPOSITORY-wide principalSet
-   (`attribute.repository/<repo>`), unchanged by this PR. Once the provider
-   admits `production-backup`, a job on `main` in that reviewer-less
-   environment could therefore also impersonate `milo-github-deployer` --
-   the same exposure `production-kill-switch` already has. It needs a change
-   merged to `main` (reviewed) to use it. Narrowing it (the deployer bound to
-   the `production` and `production-kill-switch` principalSets only, or an
-   attribute mapping that issues `attribute.repository` only for those two)
-   is a separate owner decision. Also: the backup identities' principalSet
+   (`bash scripts/deploy/check-wif-environment.sh <project>`) can show PASS.
+   The backup identities' principalSet
    (`attribute.environment/production-backup`) is scoped to this repository
    ONLY through the provider condition; the condition must never admit
    another repository.
 
-2. **Backup setup** (idempotent; prints only `PASS` / `FAIL`):
+2. **Prove the deployer still authenticates from `production`:** run the
+   `deploy` workflow with `preflight_as_deployer=true` (it deploys nothing;
+   it authenticates as the deployer through the `production` environment
+   principal and runs every read-only probe). It must be green before the
+   next step.
+
+3. **Backup setup** (idempotent; prints only `PASS` / `FAIL`):
 
    ```bash
    bash scripts/ops/setup-backup.sh            # converge
@@ -116,12 +138,17 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    It creates the bucket, the two service accounts and their bucket-level
    roles, their `workloadIdentityUser` binding for
    `principalSet://…/workloadIdentityPools/milo-github/attribute.environment/production-backup`
-   (never the repository-wide principalSet the deployer uses), the passphrase
+   (never a repository-wide principalSet), the passphrase
    file, and the `production-backup` environment with its secrets and
    variables. It only READS the provider condition; it never changes the pool
-   or the provider.
+   or the provider. It refuses -- before changing anything, in `--check` too
+   -- while the deployer still holds the repository-wide binding:
+   `FAIL milo-github-deployer still holds workloadIdentityUser for the
+   repository-wide principalSet: run scripts/ops/setup-wif.sh --apply first`;
+   and with `FAIL provider github-actions does not admit production-backup:
+   run scripts/ops/setup-wif.sh --apply first` until step 1 has run.
 
-3. **Keep the passphrase.** `~/.milo_backup_passphrase` is the only readable
+4. **Keep the passphrase.** `~/.milo_backup_passphrase` is the only readable
    copy of `MILO_BACKUP_PASSPHRASE` (GitHub secrets cannot be read back, and a
    Cloud Shell home is deleted after long inactivity). Copy it into the
    operator password manager now, next to — and labelled differently from —
@@ -130,11 +157,11 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    `setup-backup.sh` refuses to continue; `--rotate-passphrase` starts a new one
    (older backups then need the old passphrase).
 
-4. **Sentry projects.** Create two projects in Sentry: `milo-backend`
+5. **Sentry projects.** Create two projects in Sentry: `milo-backend`
    (platform Python) and `milo-frontend` (platform Next.js). With data
    scrubbing on and IP addresses not stored.
 
-5. **Backend DSN** (Secret Manager, bound by the existing deploy):
+6. **Backend DSN** (Secret Manager, bound by the existing deploy):
 
    ```bash
    # Paste the DSN at the prompt: it is not echoed and not kept in shell history.
@@ -156,12 +183,12 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    binding to `latest` without an enabled version stops new revisions and
    executions from starting, and `cloud-run.sh` refuses to deploy in that state.
 
-6. **Frontend DSN** (Vercel → Project → Settings → Environment Variables,
+7. **Frontend DSN** (Vercel → Project → Settings → Environment Variables,
    Production): `NEXT_PUBLIC_SENTRY_DSN` = the `milo-frontend` DSN, then
    redeploy. Optional: `NEXT_PUBLIC_MILO_SENTRY_TRACES_SAMPLE_RATE` (≤ 0.05;
    empty = off). The site builds and runs without either.
 
-7. **First backup, by hand:**
+8. **First backup, by hand:**
 
    ```bash
    before="$(gh run list --workflow backup-supabase-scheduled.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
@@ -174,7 +201,7 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
 
    Expect `PASS backup created: ...` and `PASS uploaded gs://.../supabase/<date>/...`.
 
-8. **Restore test, by hand** (after step 7):
+9. **Restore test, by hand** (after step 8):
 
    ```bash
    gh workflow run backup-supabase-scheduled.yml --ref main -f job=restore-test

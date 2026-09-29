@@ -104,7 +104,11 @@ def test_a_deploy_preflight_with_the_old_condition_still_passes(tmp_path):
 def test_setup_backup_binds_the_environment_principal_set_not_the_repository_one():
     text = SETUP_BACKUP.read_text()
     assert 'PRINCIPAL="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/${ENVIRONMENT_NAME}"' in text
-    assert "attribute.repository/" not in text
+    # The repository-wide principalSet appears only as what it REFUSES on (the
+    # deployer must be narrowed first); it is never bound to anything here.
+    assert text.count("attribute.repository/") == 1
+    assert 'REPOSITORY_PRINCIPALS="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.repository/' in text
+    assert '--member "$REPOSITORY_PRINCIPALS"' not in text
     assert 'POOL_ID="milo-github"' in text and 'PROVIDER_ID="github-actions"' in text
     # It reads the provider and never writes it.
     for verb in ("providers create-oidc", "providers update-oidc", "workload-identity-pools create"):

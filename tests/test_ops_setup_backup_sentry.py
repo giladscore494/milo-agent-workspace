@@ -347,3 +347,31 @@ def test_setup_backup_fails_when_someone_else_can_impersonate_a_backup_identity(
     result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
     assert result.returncode == 1
     assert "FAIL milo-backup-writer: its own IAM policy grants more than workloadIdentityUser" in result.stdout
+
+
+
+def test_setup_backup_refuses_while_the_deployer_holds_the_repository_wide_binding(env):
+    data = env.data()
+    data.setdefault("policies", {})[f"sa:milo-github-deployer@{PROJECT}.iam.gserviceaccount.com"] = {"bindings": [{
+        "role": "roles/iam.workloadIdentityUser",
+        "members": ["principalSet://iam.googleapis.com/projects/123456789/locations/global/"
+                    f"workloadIdentityPools/milo-github/attribute.repository/{REPOSITORY}"]}]}
+    env.state.write_text(json.dumps(data))
+    for args in ((), ("--check",)):
+        result = env.run(SETUP_BACKUP, *args, "--pg-major", "17")
+        assert result.returncode == 1
+        assert ("FAIL milo-github-deployer still holds workloadIdentityUser for the repository-wide "
+                "principalSet: run scripts/ops/setup-wif.sh --apply first") in result.stdout
+        assert env.mutations() == [], "nothing may change before the deployer is narrowed"
+
+
+def test_setup_backup_proceeds_once_the_deployer_is_narrowed(env):
+    pool = "principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/milo-github"
+    data = env.data()
+    data.setdefault("policies", {})[f"sa:milo-github-deployer@{PROJECT}.iam.gserviceaccount.com"] = {"bindings": [{
+        "role": "roles/iam.workloadIdentityUser",
+        "members": [f"{pool}/attribute.environment/production", f"{pool}/attribute.environment/production-kill-switch"]}]}
+    env.state.write_text(json.dumps(data))
+    result = env.run(SETUP_BACKUP, "--pg-major", "17")
+    assert result.returncode == 0, result.stdout
+    assert "PASS milo-github-deployer holds no repository-wide workloadIdentityUser binding" in result.stdout
