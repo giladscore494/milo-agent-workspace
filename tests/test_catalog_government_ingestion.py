@@ -1278,6 +1278,9 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # directory's version function.
         "backend/catalog/register/capture.py",
         "backend/testing/register_memory.py",
+        # PR-HYG P27: the in-memory mirror of the work-scope queue build reads
+        # the ONE placeholder rule (`is_placeholder_identity`), as the SQL does.
+        "backend/testing/memory_repository.py",
         # CODE-3: the bounded READ-ONLY review layer. It names the WLTP resource
         # constant and reads through `GovernmentCatalogQuery`, which is the
         # existing bounded database-side reader -- it constructs no transport,

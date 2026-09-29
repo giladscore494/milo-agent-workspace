@@ -211,6 +211,14 @@ describe('3. needs_review, conflicts and coverage gaps', () => {
       expect(describeReviewCode(code)).toBeDefined();
     }
   });
+
+  it('3e. a required field the resolved register row does not state is a coverage gap', () => {
+    // P32: the register has no value to quote -- an answer, not a failed task.
+    const payload = JSON.parse(JSON.stringify(fixtures.partial_result));
+    payload.needs_review[2].code = 'REGISTER_FIELD_ABSENT';
+    expect(ok(payload, 'partial_success').review[2].kind).toBe('coverage_gap');
+    expect(describeReviewCode('REGISTER_FIELD_ABSENT')).toBe('The register states no value for a required field');
+  });
 });
 
 describe('4. the backend invariants, mirrored', () => {

@@ -28,6 +28,7 @@ import copy
 import json
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from unittest.mock import patch
 from uuid import UUID, uuid4
 
 from backend.catalog.government.preparation import GovernmentPreparation, prepare_government_work
@@ -299,9 +300,13 @@ def build_production_run(*, tasks: int | None = None, decisions: list[Any] | Non
     repository.seed_user(user)
     repository.seed_project(project, "gov-scale", "Gov scale", [user], workflow_key="swarm_v2")
     conversation = repository.create_conversation(UUID(project), "c", UUID(user))["id"]
-    prepared = seed_prepared_plan(repository, user_id=user, conversation_id=conversation,
-                                  units=("toyota",), max_items=QUEUE_ITEMS,
-                                  batch_size=QUEUE_ITEMS, records=register_rows())
+    # The queue of run 6825eb96 was built before P27, so its placeholder
+    # reached the batch and run preparation excluded it: that queue is built
+    # here (the queue build's own placeholder check is off for this seed).
+    with patch("backend.testing.memory_repository.is_placeholder_identity", lambda *_args: False):
+        prepared = seed_prepared_plan(repository, user_id=user, conversation_id=conversation,
+                                      units=("toyota",), max_items=QUEUE_ITEMS,
+                                      batch_size=QUEUE_ITEMS, records=register_rows())
     run_id = start_batch_run(repository, prepared)["run"]["id"]
     snapshot = grow_snapshot(repository, snapshot_rows)
     spy = WholeSnapshotSpy(repository)

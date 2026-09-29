@@ -574,6 +574,8 @@ const COVERAGE_GAP_CODES: ReadonlySet<string> = new Set([
   // listed for review, never a task failure.
   'CANDIDATE_UNRESOLVED_AMBIGUOUS',
   'CANDIDATE_UNRESOLVED_NOT_FOUND',
+  // P32: the resolved register row states no value for a required field.
+  'REGISTER_FIELD_ABSENT',
 ]);
 
 /** The exact key sets `FinalBuilder` and the engine write. */
@@ -1076,6 +1078,7 @@ const REVIEW_CODE_LABELS: ReadonlyMap<string, string> = new Map([
   ['EVIDENCE_REQUIREMENTS_UNMET', 'Evidence requirements were not met'],
   ['CANDIDATE_UNRESOLVED_AMBIGUOUS', 'The register matched more than one variant; left unresolved'],
   ['CANDIDATE_UNRESOLVED_NOT_FOUND', 'The register matched no variant'],
+  ['REGISTER_FIELD_ABSENT', 'The register states no value for a required field'],
   ['TASK_FAILED', 'The task did not complete'],
 ]);
 

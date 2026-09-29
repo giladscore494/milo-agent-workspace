@@ -154,10 +154,15 @@ def candidate_outcome(*, task_id: str, call_id: str, tool: str, operation: str,
 
 
 def register_fields_absent(outcomes: Iterable[Mapping[str, Any]]) -> set[str]:
-    """Every evidence field a RESOLVED outcome of one task says its row lacks."""
-    return {str(field) for item in outcomes
-            if isinstance(item, Mapping) and item.get("outcome") == RESOLVED
-            for field in (item.get("register_fields_absent") or [])}
+    """The evidence fields EVERY resolved outcome of one task says its row lacks.
+
+    An intersection: a field one resolved row states was quotable, so its
+    missing evidence is a real shortfall, never excused by another row. No
+    resolved outcome, no absent field.
+    """
+    rows = [{str(field) for field in (item.get("register_fields_absent") or [])}
+            for item in outcomes if isinstance(item, Mapping) and item.get("outcome") == RESOLVED]
+    return set.intersection(*rows) if rows else set()
 
 
 def unresolved_kinds(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:

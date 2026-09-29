@@ -4,7 +4,9 @@
 # through the same mandatory CI and review as any other change.
 # GitHub Actions: semver-major updates are ignored -- a major action upgrade
 # (e.g. actions/checkout@v5 -> v6) is a deliberate change made by hand, since
-# several static tests and operator workflows pin the exact major.
+# several static tests and operator workflows pin the exact major. A security
+# fix that exists only in a new major may then show as a Dependabot alert
+# without an update PR: take it by hand.
 version: 2
 updates:
   - package-ecosystem: pip

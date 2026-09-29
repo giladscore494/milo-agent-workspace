@@ -14,7 +14,8 @@ from types import SimpleNamespace
 from backend.catalog.government.evidence import GOVERNMENT_FIELD_SOURCES, GOVERNMENT_TOOL_NAME
 from backend.engines.swarm_v2.engine import SwarmV2Engine
 from backend.engines.swarm_v2.resolution import (REGISTER_EVIDENCE_FIELDS, REGISTER_FIELD_ABSENT,
-                                                 SOFT_GAP_CODES, candidate_outcome)
+                                                 SOFT_GAP_CODES, candidate_outcome,
+                                                 register_fields_absent)
 
 RECORD = {"upstream_record_id": "38683", "tozar": "טויוטה", "kinuy_mishari": "RAV4",
           "shnat_yitzur": 2022, "degem_nm": "AXAA54L-CNZVBA", "ramat_gimur": "ADVENTURE",
@@ -65,6 +66,16 @@ def _gaps(required: list[str], fields: set[str], absent: list[str] | None, *,
 def test_a_shortfall_of_exactly_absent_fields_is_soft():
     assert _gaps(["trim", "official_model_code"], {"official_model_code"}, ["trim"]) == \
         [{"task_id": "t01", "code": REGISTER_FIELD_ABSENT}]
+
+
+def test_a_field_absent_from_only_some_resolved_rows_is_not_absent():
+    both = [{"outcome": "resolved", "register_fields_absent": ["trim"]},
+            {"outcome": "resolved", "register_fields_absent": ["trim", "identity_dimensions.fuel_type"]}]
+    assert register_fields_absent(both) == {"trim"}
+    one = [{"outcome": "resolved", "register_fields_absent": ["trim"]}, {"outcome": "resolved"}]
+    assert register_fields_absent(one) == set()
+    assert register_fields_absent([{"outcome": "unresolved_ambiguous", "register_fields_absent": ["trim"]}]) == set()
+    assert register_fields_absent([]) == set()
 
 
 def test_any_other_shortfall_stays_hard():
