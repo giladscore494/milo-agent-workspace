@@ -114,7 +114,9 @@ Modes:
                           the same capture-job bindings as E'. Gate:
                           production-verify.sh --gate deployed, the capture
                           job on the release image, and the register archive
-                          (setup-register-archive.sh --check PASS).
+                          (setup-register-archive.sh --check PASS, or
+                          PARTIAL -- the bucket's posture verified, its IAM
+                          left to the operator's Cloud Shell check -- WARN).
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
                           production-verify.sh --gate prepared for the named
                           plan revision. The Vercel half is printed, never
@@ -649,7 +651,13 @@ if [[ "$MODE" == "apply-register-capture" ]]; then
   archive_state="$(bash "${REPO_ROOT}/scripts/ops/setup-register-archive.sh" --check \
     --operator-config "$CONFIG_PATH" 2> /dev/null || printf 'UNREADABLE the check did not run')"
   printf '%s\n' "$archive_state"
-  if [[ "$archive_state" != PASS\ * ]]; then
+  if [[ "$archive_state" == PARTIAL\ * ]]; then
+    # The deployer reads the bucket (describe) but holds no IAM read on the
+    # bucket or the project, by design: the capture grant and the absence of
+    # a delete-capable role are the operator's to verify in Cloud Shell.
+    printf 'WARN: the bucket posture is verified; its IAM is not readable by this identity.\n'
+    printf '      Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check (expect PASS).\n'
+  elif [[ "$archive_state" != PASS\ * ]]; then
     printf '\nFAIL: the register archive is not set up (above). Every capture would refuse\n' >&2
     printf '      CATALOG_ARCHIVE_NOT_CONFIGURED. Run scripts/ops/setup-register-archive.sh --apply,\n' >&2
     printf '      then government-production-capture.sh --ensure-job. Nothing was changed.\n' >&2

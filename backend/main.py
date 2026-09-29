@@ -788,7 +788,7 @@ def get_register(project_id: UUID, user: AuthenticatedUser = Depends(get_authent
 @app.post("/projects/{project_id}/register/captures")
 def request_register_capture(project_id: UUID, request: RegisterCaptureRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)):
     require_stage_enabled(register_service.REGISTER_FLAG, "register capture")
-    enforce_rate_limit("run_creation_user", str(user.user_id))
+    enforce_rate_limit("register_actions_user", str(user.user_id))
     try:
         answer, started = register_service.request_capture(
             repo, user.user_id, project_id, register_version=request.register_version,
@@ -801,13 +801,16 @@ def request_register_capture(project_id: UUID, request: RegisterCaptureRequest, 
     return answer
 
 
-@app.post("/projects/{project_id}/register/directory", status_code=202)
-def request_register_directory(project_id: UUID, request: RegisterDirectoryRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+@app.post("/projects/{project_id}/register/directory")
+def request_register_directory(project_id: UUID, request: RegisterDirectoryRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
     require_stage_enabled(register_service.REGISTER_FLAG, "register directory refresh")
-    enforce_rate_limit("run_creation_user", str(user.user_id))
-    return register_service.request_directory_refresh(repo, user.user_id, project_id,
-                                                      conversation_id=request.conversation_id,
-                                                      trigger=trigger)
+    enforce_rate_limit("register_actions_user", str(user.user_id))
+    answer = register_service.request_directory_refresh(repo, user.user_id, project_id,
+                                                        conversation_id=request.conversation_id,
+                                                        trigger=trigger)
+    # One refresh at a time: a refresh already in flight answers 200 with its ids.
+    response.status_code = 202 if answer["started"] else 200
+    return answer
 
 
 @app.post("/work-scopes/{work_scope_id}/pause", response_model=WorkScopeControlResult)

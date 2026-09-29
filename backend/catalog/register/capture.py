@@ -9,9 +9,11 @@ across snapshots):
    tozar Prepare already captured with the same content IS the same snapshot;
 2. every row written in bounded batches (the ingestor's own batch writes);
 3. BEFORE ACTIVATION (`GovernmentCatalogIngestor(before_activation=...)`):
-   * count verification: the rows stored for the snapshot must equal the
-     source's total for that tozar at capture time, else the snapshot stays
-     inactive with ``CATALOG_CAPTURE_COUNT_MISMATCH`` (never used by Prepare);
+   * count verification: the rows stored for the snapshot must equal a
+     FRESH, independent count of that exact tozar taken at the end of the
+     capture (the directory's bounded ``limit=0`` request, not the capture's
+     own reported total), else the snapshot stays inactive with
+     ``CATALOG_CAPTURE_COUNT_MISMATCH`` (never used by Prepare);
    * the archive: the object is written create-only and recorded in the
      database, else the snapshot stays inactive with
      ``CATALOG_ARCHIVE_WRITE_FAILED``. No archive, no activation.
@@ -35,7 +37,7 @@ from backend.catalog.government import source as src
 from backend.catalog.government.capture_scope import (CAPTURE_SCOPE_REASONS, CaptureScope,
                                                       CaptureScopeError)
 from backend.catalog.government.client import DataGovClient, ResourceCapture
-from backend.catalog.government.directory import RegisterDirectory, discover_directory
+from backend.catalog.government.directory import RegisterDirectory, count_tozar, discover_directory
 from backend.catalog.government.ingest import (GOVERNMENT_INGESTION_REASONS,
                                                GovernmentCatalogIngestor, GovernmentIngestionError)
 from backend.catalog.government.source import GOVERNMENT_SOURCE_REASONS, GovernmentSourceError
@@ -163,6 +165,7 @@ class _Archiver:
 
 
 def _verify_count(repository: Any, snapshot_id: str, api_total: int) -> int:
+    """The stored rows of the snapshot against the fresh source count."""
     stored = int(repository.count_catalog_raw_records(snapshot_id))
     if stored != int(api_total):
         raise RegisterCaptureError("CATALOG_CAPTURE_COUNT_MISMATCH")
@@ -194,11 +197,17 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         capture = client.capture_resource(src.require_allowed_resource(resource_id),
                                           package_id=src.require_allowed_package(package_id),
                                           query=scope.query())
-        outcome.api_total = int(capture.reported_total)
+
+        def fresh_total() -> int:
+            # Taken once, after every row is written: an independent count
+            # of this exact tozar, never the capture's own reported total.
+            if outcome.api_total is None:
+                outcome.api_total = count_tozar(client, tozar, resource_id=resource_id)
+            return outcome.api_total
 
         def before_activation(taken: ResourceCapture, snapshot: Mapping[str, Any]) -> None:
             seen["snapshot"] = dict(snapshot)
-            outcome.captured_rows = _verify_count(repository, str(snapshot["id"]), taken.reported_total)
+            outcome.captured_rows = _verify_count(repository, str(snapshot["id"]), fresh_total())
             archiver.ensure(tozar, taken, snapshot)
 
         ingestor = GovernmentCatalogIngestor(repository, lease, client=client,
@@ -209,7 +218,7 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         seen["snapshot"] = snapshot
         # A reused or replayed ACTIVE snapshot skipped the hook: the same two
         # checks, now (its archive is written if it is missing).
-        outcome.captured_rows = _verify_count(repository, report.snapshot_id, capture.reported_total)
+        outcome.captured_rows = _verify_count(repository, report.snapshot_id, fresh_total())
         archiver.ensure(tozar, capture, snapshot)
         record("captured", snapshot_id=report.snapshot_id, api_total=outcome.api_total,
                captured=outcome.captured_rows, verified=True)

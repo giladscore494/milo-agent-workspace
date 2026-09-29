@@ -173,7 +173,12 @@ $$;
 
 create table if not exists public.catalog_register_capture_groups (
   id uuid primary key default gen_random_uuid(),
-  register_version text not null check (register_version ~ '^[0-9a-f]{64}$'),
+  -- 'capture': one group of tozars of one directory version; 'directory': one
+  -- directory refresh (no units, no version). One execution of the capture
+  -- job each; the same trigger record and liveness rule for both.
+  kind text not null default 'capture' check (kind in ('capture', 'directory')),
+  register_version text check ((kind = 'capture' and register_version ~ '^[0-9a-f]{64}$')
+                               or (kind = 'directory' and register_version is null)),
   -- An audit fact, not a foreign key (as elsewhere for requesters).
   requested_by uuid not null,
   expected_rows bigint not null check (expected_rows >= 0),
@@ -188,6 +193,36 @@ create table if not exists public.catalog_register_capture_groups (
 );
 create index if not exists catalog_register_capture_groups_run_idx
   on public.catalog_register_capture_groups (run_id);
+create index if not exists catalog_register_capture_groups_kind_idx
+  on public.catalog_register_capture_groups (kind, claimed_at desc);
+
+-- THE liveness rule of a group (a capture group or a directory refresh): it
+-- is STALE -- its work will not happen, so it may be requested again and it
+-- holds no capacity -- when its trigger failed, it was claimed but never got
+-- a run within the grace, its run ended, its run was never claimed by a
+-- worker within the grace, or its run's lease expired longer ago than the
+-- grace (a killed job). Used by request_register_capture (retries and the
+-- in-flight capacity), request_register_directory_refresh (one at a time)
+-- and mirrored by the page (backend/catalog/register/service.py).
+create or replace function public.catalog_register_group_stale(p_group_id uuid, p_grace interval)
+returns boolean
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select coalesce((
+    select g.trigger_state = 'trigger_failed'
+        or (g.trigger_state = 'claimed' and g.run_id is null and g.claimed_at < now() - p_grace)
+        or (r.id is not null and r.status in ('completed', 'partial_success', 'failed',
+                                              'cancelled', 'timed_out', 'budget_exhausted'))
+        or (r.id is not null and r.status = 'queued' and r.worker_id is null
+            and coalesce(g.triggered_at, g.claimed_at) < now() - p_grace)
+        or (r.id is not null and r.status in ('starting', 'running') and r.lease_expires_at is not null
+            and r.lease_expires_at < now() - p_grace)
+      from public.catalog_register_capture_groups g
+      left join public.runs r on r.id = g.run_id
+     where g.id = p_group_id), true)
+$$;
 
 create table if not exists public.catalog_register_capture_units (
   id uuid primary key default gen_random_uuid(),
@@ -316,7 +351,6 @@ declare
   v_expected integer;
   v_unit public.catalog_register_capture_units%rowtype;
   v_group public.catalog_register_capture_groups%rowtype;
-  v_run public.runs%rowtype;
   v_grace interval;
   v_new text[] := '{}';
   v_new_rows bigint := 0;
@@ -364,20 +398,7 @@ begin
     if v_unit.status = 'captured' then
       continue;
     end if;
-    select * into v_group from public.catalog_register_capture_groups where id = v_unit.group_id;
-    v_run := null;
-    if v_group.run_id is not null then
-      select * into v_run from public.runs where id = v_group.run_id;
-    end if;
-    v_retry := v_unit.status = 'failed'
-      or v_group.trigger_state = 'trigger_failed'
-      or (v_group.trigger_state = 'claimed' and v_group.claimed_at < now() - v_grace)
-      or (v_run.id is not null and v_run.status in ('completed', 'partial_success', 'failed',
-                                                    'cancelled', 'timed_out', 'budget_exhausted'))
-      or (v_run.id is not null and v_run.status = 'queued' and v_run.worker_id is null
-          and coalesce(v_group.triggered_at, v_group.claimed_at) < now() - v_grace)
-      or (v_run.id is not null and v_run.status in ('starting', 'running') and v_run.lease_expires_at is not null
-          and v_run.lease_expires_at < now() - v_grace);
+    v_retry := v_unit.status = 'failed' or public.catalog_register_group_stale(v_unit.group_id, v_grace);
     if v_retry then
       v_new := v_new || v_tozar;
       v_new_rows := v_new_rows + v_expected;
@@ -399,10 +420,13 @@ begin
   -- Capacity guard, before anything is written: no partial start.
   -- Rows claimed by requests still in flight are not in the database yet:
   -- they count against the threshold too.
+  -- Only LIVE work counts: a unit whose group is stale (a killed job, a
+  -- failed trigger, ...) will write nothing and reserves nothing.
   select coalesce(sum(u.expected_rows), 0) into v_inflight
     from public.catalog_register_capture_units u
    where u.status in ('requested', 'capturing')
-     and not (u.register_version = p_register_version and u.tozar = any(v_new));
+     and not (u.register_version = p_register_version and u.tozar = any(v_new))
+     and not public.catalog_register_group_stale(u.group_id, v_grace);
   v_current := pg_database_size(current_database());
   v_projected := v_current + (v_new_rows + v_inflight) * p_bytes_per_row;
   if v_projected > p_capacity_limit_bytes then
@@ -428,6 +452,33 @@ begin
   return jsonb_build_object('decision', 'claimed', 'group', to_jsonb(v_group), 'units',
     (select jsonb_agg(to_jsonb(u) order by u.tozar) from public.catalog_register_capture_units u
       where u.group_id = v_group.id));
+end;
+$$;
+
+-- One directory refresh at a time: answered with the live one while it is
+-- live (catalog_register_group_stale), else a new 'directory' group is claimed.
+create or replace function public.request_register_directory_refresh(
+  p_requested_by uuid, p_grace_seconds integer
+) returns jsonb
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_group public.catalog_register_capture_groups%rowtype;
+begin
+  if p_requested_by is null or p_grace_seconds is null or p_grace_seconds not between 300 and 86400 then
+    raise exception 'CATALOG_REGISTER_REQUEST_INVALID: invalid directory refresh request' using errcode = '22023';
+  end if;
+  perform pg_advisory_xact_lock(hashtext('public.catalog_register_directory'));
+  select * into v_group from public.catalog_register_capture_groups
+   where kind = 'directory' order by claimed_at desc, id desc limit 1;
+  if found and not public.catalog_register_group_stale(v_group.id, make_interval(secs => p_grace_seconds)) then
+    return jsonb_build_object('decision', 'existing', 'group', to_jsonb(v_group));
+  end if;
+  insert into public.catalog_register_capture_groups (kind, register_version, requested_by, expected_rows)
+  values ('directory', null, p_requested_by, 0)
+  returning * into v_group;
+  return jsonb_build_object('decision', 'claimed', 'group', to_jsonb(v_group));
 end;
 $$;
 
@@ -833,6 +884,7 @@ begin
   foreach fn in array array[
     'public.record_register_directory(text,timestamptz,jsonb)',
     'public.request_register_capture(text,text[],uuid,integer,bigint,integer,integer)',
+    'public.request_register_directory_refresh(uuid,integer)',
     'public.record_register_capture_trigger(uuid,uuid,text,text)',
     'public.record_register_unit_status(uuid,text,integer,text,uuid,text,text,uuid,integer,integer,boolean)',
     'public.record_register_snapshot_archive(uuid,text,integer,text,uuid,text,bigint,text,integer)',
@@ -859,7 +911,8 @@ begin
     'public.catalog_register_coverage()',
     'public.catalog_register_latest_directory()',
     'public.catalog_register_unit_states()',
-    'public.catalog_register_prunable_list()'
+    'public.catalog_register_prunable_list()',
+    'public.catalog_register_group_stale(uuid,interval)'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname = 'anon') then
@@ -903,18 +956,21 @@ begin
     end loop;
   end if;
 
-  -- The read-only role the release tools and the gates connect as
-  -- (supabase_read_only_user on Supabase, docs/production-readiness), and any
-  -- other read-only login role: not a superuser, BYPASSRLS (every table here
-  -- has RLS on and no policies) and a member of pg_read_all_data. SELECT on
-  -- the tables and view, EXECUTE on the read functions -- nothing that writes.
-  -- Explicit (PR-D1): pg_read_all_data carries SELECT, never EXECUTE, and the
-  -- read functions are revoked from PUBLIC above.
+  -- The read-only roles the release tools, the gates and retention connect
+  -- as: the release read-only role (milo_release_readonly_<suffix>: LOGIN,
+  -- BYPASSRLS, SELECT through postgres's default privileges, NOT a member of
+  -- pg_read_all_data), Supabase's supabase_read_only_user, and any other
+  -- read-only login role that is BYPASSRLS and a pg_read_all_data member.
+  -- Never a superuser or a platform role. SELECT on the tables and view,
+  -- EXECUTE on the read functions -- nothing that writes. Explicit: SELECT
+  -- may arrive by default privileges, EXECUTE never does (the read functions
+  -- are revoked from PUBLIC above).
   for ro in
     select r.rolname from pg_roles r
      where r.rolcanlogin and not r.rolsuper
        and r.rolname not in ('postgres', 'service_role', 'authenticator', 'anon', 'authenticated')
        and (r.rolname = 'supabase_read_only_user'
+            or (r.rolbypassrls and r.rolname like 'milo\_release\_readonly\_%')
             or (r.rolbypassrls and pg_has_role(r.oid, 'pg_read_all_data', 'MEMBER')))
   loop
     foreach tbl in array array[
@@ -933,7 +989,8 @@ begin
       'public.catalog_register_coverage()',
       'public.catalog_register_latest_directory()',
       'public.catalog_register_unit_states()',
-      'public.catalog_register_prunable_list()'
+      'public.catalog_register_prunable_list()',
+      'public.catalog_register_group_stale(uuid,interval)'
     ] loop
       execute format('grant execute on function %s to %I', fn, ro.rolname);
     end loop;

@@ -86,6 +86,7 @@ INVENTORY=(
   "MILO_RATE_LIMIT_RUN_CREATION_USER|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_RUN_CREATION_PROJECT|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_CANCELLATION|cloud-run-api-only|no|backend/rate_limit.py"
+  "MILO_RATE_LIMIT_REGISTER_ACTIONS_USER|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_WORKER_MUTATIONS|cloud-run-api-only|no|backend/rate_limit.py"
   "UPSTASH_REDIS_REST_URL|shared-api-worker|no|backend/rate_limit.py"
   "UPSTASH_REDIS_REST_TOKEN|shared-api-worker|yes|backend/rate_limit.py"

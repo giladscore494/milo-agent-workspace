@@ -126,7 +126,8 @@ def _stalled(group: Mapping[str, Any], run: Mapping[str, Any], now: datetime) ->
     started = _time(group.get("triggered_at")) or claimed
     lease = _time(run.get("lease_expires_at")) if run.get("lease_expires_at") else None
     return bool(
-        (group.get("trigger_state") == "claimed" and claimed is not None and claimed < limit)
+        (group.get("trigger_state") == "claimed" and not group.get("run_id")
+         and claimed is not None and claimed < limit)
         or (run.get("status") == "queued" and not run.get("worker_id") and started is not None and started < limit)
         or (run.get("status") in ("starting", "running") and lease is not None and lease < limit))
 
@@ -332,8 +333,9 @@ def _request_capture(repo: Any, user_id: UUID, project_id: UUID, *, register_ver
 
 def request_directory_refresh(repo: Any, user_id: UUID, project_id: UUID, *, conversation_id: UUID,
                               trigger: Any, env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """Start one directory refresh (metadata reads only). A refresh of an
-    unchanged register lands on the same version."""
+    """Start one directory refresh (metadata reads only), or answer with the
+    one still live -- one at a time (`request_register_directory_refresh`).
+    A refresh of an unchanged register lands on the same version."""
     environment = os.environ if env is None else env
     try:
         require_enabled(environment)
@@ -341,21 +343,34 @@ def request_directory_refresh(repo: Any, user_id: UUID, project_id: UUID, *, con
         if trigger is None:
             raise _refusal("CATALOG_REGISTER_UNAVAILABLE")
         _release_gate(trigger)
-        from uuid import uuid4
+        claim = repo.request_register_directory_refresh(user_id, grace_seconds=START_GRACE_SECONDS)
+        group = claim["group"]
+        if claim["decision"] != "claimed":
+            return {"started": False, "group_id": str(group["id"]), "run_id": group.get("run_id")}
+
+        def record(state: str, run_id: str | None, execution: str | None = None) -> None:
+            repo.record_register_capture_trigger(group["id"], run_id=run_id, trigger_state=state,
+                                                 execution_name=execution)
 
         run_id = _run_for(repo, conversation_id=conversation_id, user_id=user_id,
-                          key=f"register-directory-{uuid4()}", environment=environment)
+                          key=f"register-directory-{group['id']}", environment=environment)
         if run_id is None:
+            record(trig.TRIGGER_FAILED, None)
             raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED")
+        record("claimed", run_id)
         try:
             invocation = register_directory(
                 project_ref=str(environment.get("MILO_EXPECTED_SUPABASE_PROJECT_REF") or ""), run_id=run_id)
         except InvocationError:
+            record(trig.TRIGGER_FAILED, run_id)
             raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED") from None
         outcome = trigger.run(invocation)
+        if outcome.state not in (trig.TRIGGERED, trig.TRIGGER_FAILED, trig.TRIGGER_UNKNOWN):
+            outcome = trig.TriggerOutcome(trig.TRIGGER_UNKNOWN)
+        record(outcome.state, run_id, outcome.execution_name)
         if outcome.state == trig.TRIGGER_FAILED:
             raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED")
-        return {"started": True, "run_id": run_id}
+        return {"started": True, "group_id": str(group["id"]), "run_id": run_id}
     except AppError as refused:
         _log_refusal(project_id, refused.code)
         raise

@@ -153,6 +153,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "request_register_capture": {
         "p_bytes_per_row", "p_capacity_limit_bytes", "p_grace_seconds", "p_group_max_rows", "p_register_version", "p_requested_by", "p_tozars"
     },
+    "request_register_directory_refresh": {"p_grace_seconds", "p_requested_by"},
     "request_work_scope_preparation": {
         "p_digest", "p_grace_seconds", "p_requested_by", "p_revision", "p_work_scope_id"
     },

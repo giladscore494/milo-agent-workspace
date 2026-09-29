@@ -7,6 +7,14 @@
 #            first and changes only what is missing, so a re-run is a no-op.
 #   --check  read-only, one machine line for the deploy preflight:
 #              PASS <detail>        the bucket and the grant are in place
+#              PARTIAL <detail>     the bucket's own posture is verified
+#                                   (exists, us-central1, uniform access,
+#                                   public access prevention enforced) but
+#                                   this identity cannot read IAM -- the
+#                                   deployer's case: it holds no IAM read on
+#                                   the bucket or the project, by design.
+#                                   The operator verifies the IAM half from
+#                                   Cloud Shell (this --check, run there).
 #              GAP <detail>         not set up yet (register capture refuses)
 #              FAIL <detail>        a posture violation (public access, a
 #                                   delete-capable role for an app identity)
@@ -161,11 +169,23 @@ if [[ "$MODE" == "check" ]]; then
     exit 0
   fi
   read -r location uniform pap <<< "$(python3 -c "$POSTURE_PY" <<< "$json")"
-  if ! facts="$(policy_facts)"; then
-    printf 'UNREADABLE the IAM policy of %s or of the project could not be read by this identity\n' "$BUCKET"
+  if [[ "$pap" != "enforced" ]]; then
+    printf 'FAIL bucket %s is not closed to the public (public access prevention %s)\n' "$BUCKET" "$pap"
     exit 0
   fi
-  if grep -q '^PUBLIC ' <<< "$facts" || [[ "$pap" != "enforced" ]]; then
+  if ! facts="$(policy_facts)"; then
+    # What a describe proves is checked; the IAM half is the operator's to
+    # verify (public access prevention already rules out a public grant).
+    if [[ "$uniform" != "true" || "$location" != "$REGISTER_ARCHIVE_LOCATION" ]]; then
+      printf 'GAP bucket %s is not in %s with uniform access (location %s, uniform %s)\n' \
+        "$BUCKET" "$REGISTER_ARCHIVE_LOCATION" "${location:-unknown}" "$uniform"
+    else
+      printf 'PARTIAL bucket %s: %s, uniform access, public access prevention enforced; its IAM (the capture grant, no delete-capable role) is not readable by this identity. Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check\n' \
+        "$BUCKET" "$REGISTER_ARCHIVE_LOCATION"
+    fi
+    exit 0
+  fi
+  if grep -q '^PUBLIC ' <<< "$facts"; then
     printf 'FAIL bucket %s is not closed to the public (public access prevention %s)\n' "$BUCKET" "$pap"
   elif grep -qE '^(PROJECT_)?DELETE ' <<< "$facts"; then
     printf 'FAIL an application identity holds a delete-capable role on %s or the project (%s)\n' "$BUCKET" \

@@ -15,15 +15,19 @@ proxied, and its two writes are execution routes, so they use the existing
 
 | Step | Where | What |
 |---|---|---|
-| Directory | capture job (`--register-directory`) | One distinct read (`fields=tozar`, `distinct=true`) and one count per tozar (`limit=0`, `filters={"tozar": <exact>}`). Metadata only, no row payload, under hard caps (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`, default 6000; `MILO_REGISTER_DIRECTORY_MAX_SECONDS`, default 3000). A new directory version only when the content differs from the CURRENT (newest) one (a register that reverts A → B → A records A again), and only capturable values become units (a value `CaptureScope` refuses -- null, empty, padded, over-long, control/format characters -- is counted as unfilterable): `register_version` = SHA-256 of `gov.register.directory.1`, the resource id, and the sorted `(tozar, count)` list. |
+| Directory | API (`POST /projects/{id}/register/directory`) then capture job (`--register-directory`) | One refresh at a time: while one is live (`catalog_register_group_stale`, the same liveness rule as a capture), a second press answers 200 with its `group_id` / `run_id` and executes nothing; otherwise 202. One distinct read (`fields=tozar`, `distinct=true`) and one count per tozar (`limit=0`, `filters={"tozar": <exact>}`). Metadata only, no row payload, under hard caps (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`, default 6000; `MILO_REGISTER_DIRECTORY_MAX_SECONDS`, default 3000). A new directory version only when the content differs from the CURRENT (newest) one (a register that reverts A → B → A records A again), and only capturable values become units (a value `CaptureScope` refuses -- null, empty, padded, over-long, control/format characters -- is counted as unfilterable): `register_version` = SHA-256 of `gov.register.directory.1`, the resource id, and the sorted `(tozar, count)` list. |
 | Capture request | API (`POST /projects/{id}/register/captures`) | Release refusal first (both jobs on the current release, `prepare_trigger.release_refusal_for`); then ONE database call (`request_register_capture`) that is idempotent per `(tozar, register_version)`, refuses a group over `MILO_REGISTER_GROUP_MAX_ROWS` expected rows (a single larger tozar is captured alone and never split), and refuses a capture that would take the database above the threshold -- before anything is written. Then an operator capture run and the capture job with the register invocation. |
-| Capture | capture job (`--register-group-id`) | Per tozar: the scoped capture Prepare uses (same client, bounds, snapshot key and content hash), rows written in bounded batches, then **before activation**: the stored count must equal the source's total for that tozar, and the archive object must be written and recorded. Otherwise the snapshot stays inactive (never used by Prepare). |
+| Capture | capture job (`--register-group-id`) | Per tozar: the scoped capture Prepare uses (same client, bounds, snapshot key and content hash), rows written in bounded batches, then **before activation**: the stored count must equal a FRESH, independent count of that exact tozar taken after every row is written (the directory's bounded `limit=0` request with `filters={"tozar": <exact>}` -- never the capture's own reported total; it is the unit's `api_total`), and the archive object must be written and recorded. A snapshot that is already ACTIVE with the same key (e.g. Prepare captured the same content, with no archive) gets the same two checks after the ingest: its archive is written and verified (idempotent: a recorded archive is trusted) before the unit is marked captured. Otherwise the snapshot stays inactive (never used by Prepare). |
 | Page | API (`GET /projects/{id}/register`) | Every tozar with expected rows and state (not captured / capturing / captured with snapshot key, rows and verified / failed with its code), totals vs the directory, measured bytes per row, and the capacity bar. 404 while the flag is off. |
 
 ### Capacity
 
 `projected = pg_database_size + (expected_rows + rows still in flight) x MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE`
-(rows of earlier requests still `requested` / `capturing` count too),
+(rows of earlier requests still `requested` / `capturing` count too, but only
+while their work is LIVE by `catalog_register_group_stale` -- a failed trigger,
+a claim with no run, a run that ended, a run no worker claimed or a lease that
+expired, each past the 15-minute grace, reserves nothing: a killed job never
+holds capacity, whichever directory version it was for),
 refused when `projected > MILO_DB_CAPACITY_BYTES x MILO_DB_CAPACITY_THRESHOLD`
 with `CATALOG_CAPACITY_THRESHOLD_EXCEEDED` and the three numbers (current,
 projected, limit, in bytes) in the response body (`error.capacity`) and on the
@@ -47,7 +51,9 @@ capture identity holds `roles/storage.objectCreator` and `roles/storage.objectVi
 on that bucket only: it can create an object and read its metadata back (so an
 upload whose answer was lost, or a crash before the database record, is
 verified by its recorded SHA-256 instead of wedging the snapshot), and can
-never overwrite or delete one. A unit that fails ends its run `failed`, so the
+never overwrite or delete one. `objectViewer` also lets that identity read
+the archived objects' content (public register data) on that bucket; the
+owner accepted this over a custom metadata-only role. A unit that fails ends its run `failed`, so the
 next capture of that tozar -- or Prepare's -- adopts the pending snapshot once
 that run's lease has lapsed (at most `MILO_WORKER_LEASE_SECONDS`, 300 s;
 earlier, the retry answers `GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN` and can simply
@@ -75,13 +81,19 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |
+| `MILO_RATE_LIMIT_REGISTER_ACTIONS_USER` | `10` per 60 s | both register writes, per user; its own bucket (never `run_creation_user`) |
 | `MILO_ENABLE_REGISTER_CAPTURE_JOB` | off | capture job; set only by the API's invocation, per execution |
 
 ## Operator steps, in order
 
 1. **Apply the migration** `20260929000100_catalog_register_capture.sql` with
-   the release (additive; grants SELECT / EXECUTE on the read functions to the
-   read-only role).
+   the release (additive). It grants SELECT on the register tables and view
+   and EXECUTE on the read functions only -- nothing that writes -- to the
+   read-only roles the gates and retention connect as: the release role
+   `milo_release_readonly_<suffix>` (LOGIN, BYPASSRLS, not a member of
+   `pg_read_all_data`; matched by that prefix, never a hard-coded suffix),
+   `supabase_read_only_user`, and any other BYPASSRLS login role in
+   `pg_read_all_data`. Never a superuser or a platform role.
 2. **Archive bucket** (Cloud Shell, idempotent): set
    `REGISTER_ARCHIVE_BUCKET=<new globally unique name>` in the operator
    configuration (and the `MILO_OPERATOR_CONFIG` repository variable), then
@@ -93,14 +105,30 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
 
    The deploy preflight reports `storage:register-archive` (WARN until this
    has run; BLOCKED for a public bucket or an app identity with a
-   delete-capable role).
+   delete-capable role; as the deployer, WARN `PARTIAL` -- see step 3).
 3. **Turn the Register page on**: Actions -> **Website stage** -> `stage =
    register-capture` (or `bash scripts/ops/website-stage.sh --stage
    register-capture`). It ensures the capture job on the release image (which
    now carries the bucket), checks the archive, binds the API identity on the
    capture job exactly as E' does, and sets `MILO_ENABLE_REGISTER_CAPTURE` on
-   the API, read back. A Stage A deploy pins it off again; re-run this stage
-   after a deploy (it is not part of `both`). The kill switch closes it.
+   the API, read back. A Stage A deploy pins it off again: dispatch **Deploy**
+   with `restore_website_stage = register-capture` (or `all` = `both` +
+   register-capture) to turn it back on after the deploy, or re-run this
+   stage. Either refuses up front without `REGISTER_ARCHIVE_BUCKET`. The kill
+   switch closes it.
+
+   **The archive gate, as the deployer.** The workflow runs as the deployer,
+   which may describe the bucket but holds NO IAM read on the bucket or the
+   project (by design; none is granted for this). `setup-register-archive.sh
+   --check` then verifies what a describe proves -- the bucket exists, is in
+   us-central1, has uniform access and public access prevention ENFORCED --
+   and answers `PARTIAL ...`: the gate passes with
+   `WARN: the bucket posture is verified; its IAM is not readable by this identity.`
+   A missing bucket, public access prevention off, or the wrong location /
+   access still refuses. The IAM half (the capture identity's grant, no
+   delete-capable role for an application identity) is the operator's: in
+   Cloud Shell, `bash scripts/ops/setup-register-archive.sh --check` must
+   print `PASS` (the full check, unchanged).
 4. **Use it**: open a conversation in the project, open **Register**, press
    **Refresh directory**, then **Capture** one tozar or a selected group.
 5. **Retention, dry-run first**: Actions -> **Register retention** with
@@ -112,7 +140,9 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
    row `REGISTER_COVERAGE` reads
    `INFO directory <version>; units a/b; rows c/d; database x/y bytes (...); unverified snapshots n`.
    Informational, except `FAIL` when the database is above the threshold
-   (the gate then fails).
+   (the gate then fails). Only an exit 1 WITH a `REGISTER_COVERAGE=FAIL` line
+   means that; any other failure of the report reads
+   `INFO not available (the coverage report did not run: exit <n>)`.
 
 ## Error codes
 

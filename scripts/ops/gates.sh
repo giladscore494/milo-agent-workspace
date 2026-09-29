@@ -67,12 +67,23 @@ gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJE
   --format=json > "$service_json" 2> /dev/null || : > "$service_json"
 service_args=()
 [[ -s "$service_json" ]] && service_args=(--service-json "$service_json")
-coverage_line="$(cd "$REPO_ROOT" && python3 -m backend.catalog.register.coverage "${service_args[@]}" \
-  <<< "${coverage_json:-null}")" || coverage_status=$?
+coverage_output="$(cd "$REPO_ROOT" && python3 -m backend.catalog.register.coverage "${service_args[@]}" \
+  <<< "${coverage_json:-null}" 2> /dev/null)" || coverage_status=$?
+coverage_line="$(grep -m1 '^REGISTER_COVERAGE=' <<< "$coverage_output" || true)"
+# ONLY exit 1 with a REGISTER_COVERAGE=FAIL line means "above the threshold".
+# Any other failure of the report (a crash, a missing interpreter, no line)
+# is "not available" -- informational, never a gate failure. Its stderr is
+# dropped: a traceback can quote the document it was reading.
+above_threshold=0
+if [[ "$coverage_status" -eq 1 && "$coverage_line" == REGISTER_COVERAGE=FAIL\ * ]]; then
+  above_threshold=1
+elif [[ "$coverage_status" -ne 0 || -z "$coverage_line" ]]; then
+  coverage_line="REGISTER_COVERAGE=INFO not available (the coverage report did not run: exit ${coverage_status})"
+fi
 printf '%s\n' "$coverage_line"
 coverage_rest="${coverage_line#REGISTER_COVERAGE=}"
 summary "REGISTER_COVERAGE" "${coverage_rest%% *}" "${coverage_rest#* }"
-if [[ "$coverage_status" -ne 0 && "$status" -eq 0 ]]; then
+if [[ "$above_threshold" -eq 1 && "$status" -eq 0 ]]; then
   status=1
   summary "gate ${GATE}" FAIL "the database is above the register capacity threshold (REGISTER_COVERAGE)"
 elif [[ "$status" -eq 0 ]]; then

@@ -278,6 +278,7 @@ ARCHIVE_CHECK="$(bash "${REPO_ROOT}/scripts/ops/setup-register-archive.sh" --che
   --operator-config "$CONFIG_PATH" 2> /dev/null || printf 'UNREADABLE the check did not run')"
 case "$ARCHIVE_CHECK" in
   PASS\ *) record_check PASS "storage:register-archive" "${ARCHIVE_CHECK#PASS }" ;;
+  PARTIAL\ *) record_check WARN "storage:register-archive" "${ARCHIVE_CHECK#PARTIAL }" ;;
   FAIL\ *) record_check BLOCKED "storage:register-archive" \
        "${ARCHIVE_CHECK#FAIL } Remediation: bash scripts/ops/setup-register-archive.sh --plan" ;;
   UNREADABLE\ *) record_check WARN "storage:register-archive" \

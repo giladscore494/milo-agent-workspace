@@ -44,6 +44,12 @@ LEXUS = "לקסוס"
 RO_ROLE = "supabase_read_only_user"
 OTHER_READER = "milo_other_reader_test"
 NOT_A_READER = "milo_not_a_reader_test"
+# Production-shaped release read-only role: LOGIN, BYPASSRLS, NOT a member of
+# pg_read_all_data, SELECT on public tables through postgres's default
+# privileges only. The suffix is arbitrary (the migration matches the prefix).
+RELEASE_RO = "milo_release_readonly_7e3a0c11d2b4"
+# The prefix alone is not enough: without BYPASSRLS it is not a reader.
+RELEASE_NO_RLS = "milo_release_readonly_norls"
 TABLES = ("catalog_register_directory_versions", "catalog_register_directory_units",
           "catalog_register_capture_groups", "catalog_register_capture_units",
           "catalog_register_snapshot_archives", "catalog_register_archive_lines")
@@ -51,13 +57,14 @@ READ_FUNCTIONS = ("catalog_register_version(text,jsonb)", "catalog_register_data
                   "catalog_register_snapshot_bytes(uuid)", "catalog_register_prunable_snapshots()",
                   "catalog_register_prune_digest(text[])", "catalog_register_coverage()",
                   "catalog_register_latest_directory()", "catalog_register_unit_states()",
-                  "catalog_register_prunable_list()")
+                  "catalog_register_prunable_list()", "catalog_register_group_stale(uuid,interval)")
 WRITE_FUNCTIONS = ("record_register_directory(text,timestamptz,jsonb)",
                    "request_register_capture(text,text[],uuid,integer,bigint,integer,integer)",
                    "record_register_capture_trigger(uuid,uuid,text,text)",
                    "record_register_unit_status(uuid,text,integer,text,uuid,text,text,uuid,integer,integer,boolean)",
                    "record_register_snapshot_archive(uuid,text,integer,text,uuid,text,bigint,text,integer)",
-                   "prune_register_snapshots(text[],text)")
+                   "prune_register_snapshots(text[],text)",
+                   "request_register_directory_refresh(uuid,integer)")
 
 
 def _register_migration():
@@ -71,6 +78,13 @@ def regdb():
     server.start()
     try:
         server.create_database()
+        # The release read-only role as production has it, before anything is
+        # created: SELECT arrives by postgres's default privileges, EXECUTE
+        # never does.
+        server.psql(f"create role {RELEASE_RO} login bypassrls; grant usage on schema public to {RELEASE_RO}; "
+                    f"alter default privileges for role postgres in schema public "
+                    f"grant select on tables to {RELEASE_RO}; "
+                    f"create role {RELEASE_NO_RLS} login")
         server.psql(file=BASELINE)
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
@@ -135,7 +149,7 @@ def test_the_migration_applies_on_45_and_is_rerun_safe(regdb):
     assert regdb.psql("select count(*) from pg_policies where tablename like 'catalog\\_register%'") == "0"
 
 
-@pytest.mark.parametrize("role", [RO_ROLE, OTHER_READER])
+@pytest.mark.parametrize("role", [RO_ROLE, OTHER_READER, RELEASE_RO])
 def test_the_read_only_role_may_read_everything_and_write_nothing(regdb, role):
     for table in TABLES:
         assert regdb.psql(f"select has_table_privilege('{role}', 'public.{table}', 'SELECT')") == "t"
@@ -150,8 +164,30 @@ def test_the_read_only_role_may_read_everything_and_write_nothing(regdb, role):
                              "unverified_snapshots", "database_bytes"}
 
 
+def test_the_production_release_readonly_role_runs_the_page_and_retention_reads(regdb):
+    """Blocker: the production role is LOGIN + BYPASSRLS, NOT in pg_read_all_data,
+    with SELECT through default privileges only -- the reads must run AS it."""
+    assert regdb.psql(f"select rolcanlogin, rolbypassrls, rolsuper, pg_has_role('{RELEASE_RO}', "
+                      f"'pg_read_all_data', 'MEMBER') from pg_roles where rolname = '{RELEASE_RO}'") == "t|t|f|f"
+    # Its SELECT on everything else is the default privileges' (a table the
+    # migration did not grant it).
+    assert regdb.psql(f"select has_table_privilege('{RELEASE_RO}', 'public.catalog_source_snapshots', "
+                      "'SELECT')") == "t"
+    coverage = json.loads(regdb.psql(f"set role {RELEASE_RO}; select public.catalog_register_coverage(); reset role"))
+    assert set(coverage) >= {"register_version", "units_total", "database_bytes"}
+    listing = json.loads(regdb.psql(f"set role {RELEASE_RO}; select public.catalog_register_prunable_list(); "
+                                    "reset role"))
+    assert set(listing) == {"snapshots", "digest"}
+    assert listing["digest"] == prune_digest(s["snapshot_key"] for s in listing["snapshots"])
+    # Still read-only: every write refuses as it.
+    with pytest.raises(AssertionError) as refused:
+        regdb.psql(f"set role {RELEASE_RO}; select public.prune_register_snapshots(array[]::text[], "
+                   f"'{'0' * 64}')")
+    assert "permission denied" in str(refused.value)
+
+
 def test_browsers_and_other_roles_get_nothing(regdb):
-    for role in ("anon", "authenticated", NOT_A_READER):
+    for role in ("anon", "authenticated", NOT_A_READER, RELEASE_NO_RLS):
         for table in TABLES:
             assert regdb.psql(f"select has_table_privilege('{role}', 'public.{table}', 'SELECT')") == "f"
         for function in READ_FUNCTIONS + WRITE_FUNCTIONS:
@@ -332,3 +368,65 @@ def test_an_archive_uri_must_name_its_snapshot(regdb):
     wrong = f"gs://milo-test-archive/register/{RESOURCE}/{'a' * 16}/cs1.other.jsonl.gz"
     assert "does not name this snapshot" in _refusal(
         regdb, f"select public.record_register_snapshot_archive({args}, '{snapshot}', '{wrong}', 100, '{'b' * 64}', 1)")
+
+
+# -- the review's round 2 ----------------------------------------------------------
+
+def _leased_group(db, answer: dict) -> str:
+    """Bind the claimed group to a LEASED operator capture run: (run id)."""
+    _user, _project, conversation = _ws_world(db)
+    run_id, _args = _wsp_capture_run(db, conversation)
+    group = answer["group"]["id"]
+    for state in ("claimed", "triggered"):
+        _rpc_as_service(db, f"select public.record_register_capture_trigger('{group}', '{run_id}', '{state}', "
+                            f"{'null' if state == 'claimed' else chr(39) + 'exec-1' + chr(39)})")
+    return run_id
+
+
+def test_a_killed_job_reserves_no_capacity_across_a_directory_version_change(regdb):
+    tozar, other = f"kj-{uuid.uuid4().hex[:6]}", f"kj-{uuid.uuid4().hex[:6]}"
+    old = _directory(regdb, {tozar: 1000, other: 10})
+    inflight = int(regdb.psql("select coalesce(sum(u.expected_rows), 0) from public.catalog_register_capture_units u "
+                              "where u.status in ('requested', 'capturing') "
+                              "and not public.catalog_register_group_stale(u.group_id, interval '900 seconds')"))
+    current = int(regdb.psql("select pg_database_size(current_database())"))
+    # Fits the new request alone (1001 rows, with 500 rows of slack for the
+    # database's own growth), never with the old 1000 still in flight.
+    limit = current + (1001 + inflight + 500) * 3500
+    answer = json.loads(_rpc_as_service(regdb, _request(regdb, old, [tozar], limit=limit)))
+    assert answer["decision"] == "claimed"
+    run_id = _leased_group(regdb, answer)
+    new = _directory(regdb, {tozar: 1001, other: 10})
+    assert new != old
+    assert "CATALOG_CAPACITY_THRESHOLD_EXCEEDED" in _refusal(regdb, _request(regdb, new, [tozar], limit=limit))
+    # The job is killed: its lease expired an hour ago and nothing renews it.
+    regdb.psql(f"update public.runs set lease_expires_at = now() - interval '1 hour' where id = '{run_id}'")
+    assert regdb.psql(f"select status in ('starting', 'running') from public.runs where id = '{run_id}'") == "t"
+    assert regdb.psql(f"select public.catalog_register_group_stale('{answer['group']['id']}', "
+                      "interval '900 seconds')") == "t"
+    claimed = json.loads(_rpc_as_service(regdb, _request(regdb, new, [tozar], limit=limit)))
+    assert claimed["decision"] == "claimed"
+
+
+def test_one_directory_refresh_at_a_time(regdb):
+    def refresh() -> dict:
+        return json.loads(_rpc_as_service(
+            regdb, f"select public.request_register_directory_refresh('{uuid.uuid4()}', 900)"))
+
+    first = refresh()
+    if first["decision"] == "existing":  # an earlier test's refresh: end it
+        _rpc_as_service(regdb, f"select public.record_register_capture_trigger('{first['group']['id']}', null, "
+                               "'trigger_failed', null)")
+        first = refresh()
+    assert first["decision"] == "claimed"
+    assert (first["group"]["kind"], first["group"]["register_version"]) == ("directory", None)
+    second = refresh()
+    assert second["decision"] == "existing" and second["group"]["id"] == first["group"]["id"]
+    # Its run ends (killed long ago): the next request claims a new refresh.
+    run_id = _leased_group(regdb, first)
+    assert refresh()["group"]["id"] == first["group"]["id"]
+    regdb.psql(f"update public.runs set status = 'failed' where id = '{run_id}'")
+    third = refresh()
+    assert third["decision"] == "claimed" and third["group"]["id"] != first["group"]["id"]
+    assert "CATALOG_REGISTER_REQUEST_INVALID" in _refusal(
+        regdb, f"select public.request_register_directory_refresh('{uuid.uuid4()}', 10)")

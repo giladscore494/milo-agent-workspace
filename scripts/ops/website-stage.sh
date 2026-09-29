@@ -23,6 +23,8 @@
 #                    (website-execution-activate.sh --apply-register-capture).
 #                    Refused until scripts/ops/setup-register-archive.sh has
 #                    run. Not part of `both`: it is its own decision.
+#   all              `both`, then the Register page (the capture job is
+#                    ensured once)
 #   none             nothing
 #
 # Every step is the canonical tool, unchanged, behind its own gate
@@ -42,12 +44,12 @@ source "${SCRIPT_DIR}/common.sh"
 STAGE="" STEP_PREFIX="" HEADER=1
 usage() {
   cat << 'EOF'
-Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|none [--dry-run]
+Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|all|none [--dry-run]
                         [--operator-config <path>] [--step-prefix <n>] [--no-header]
 
 Turns the website's plan authoring (Stage P) and/or its Prepare button (E'),
-or its Register page (register-capture), on through the canonical activation
-tools. Never Stage 2. --dry-run calls nothing.
+or its Register page (register-capture; all = both + register-capture), on
+through the canonical activation tools. Never Stage 2. --dry-run calls nothing.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -62,8 +64,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$STAGE" in
-  plan-authoring | web-preparation | both | register-capture | none) ;;
-  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture or none\n' >&2; usage >&2; exit 2 ;;
+  plan-authoring | web-preparation | both | register-capture | all | none) ;;
+  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, all or none\n' >&2; usage >&2; exit 2 ;;
 esac
 [[ -z "$STEP_PREFIX" || "$STEP_PREFIX" =~ ^[0-9]{1,2}$ ]] \
   || { printf 'FAIL: --step-prefix must be a step number\n' >&2; exit 2; }
@@ -75,9 +77,12 @@ if [[ "$STAGE" != "none" ]]; then
   milo_require_op SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
     PRODUCTION_ORIGIN MILO_WORKER_AUDIENCE || exit 2
 fi
-if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "register-capture" ]]; then
+if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
   milo_require_op CLOUD_RUN_CAPTURE_JOB API_SERVICE_ACCOUNT ARTIFACT_REGISTRY_REPOSITORY \
     SUPABASE_PROJECT_REF SECRET_SUPABASE_URL SECRET_SUPABASE_SERVICE_KEY || exit 2
+fi
+if [[ "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
+  milo_require_op REGISTER_ARCHIVE_BUCKET || exit 2
 fi
 
 # step_name NUMBER LETTER NAME -- "2 capture-job" alone, "11b capture-job" in a deploy.
@@ -107,13 +112,13 @@ run_step() {
   summary "$step" PASS "$detail"
 }
 
-if [[ "$STAGE" == "plan-authoring" || "$STAGE" == "both" ]]; then
+if [[ "$STAGE" == "plan-authoring" || "$STAGE" == "both" || "$STAGE" == "all" ]]; then
   run_step "$(step_name 1 a plan-authoring)" \
     "Stage P: MILO_ENABLE_WORK_SCOPE_MUTATIONS on the API; run creation read back OFF" \
     "Stage P was not applied (above); the website cannot edit a plan" \
     "${activate[@]}" --apply-plan-authoring
 fi
-if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" ]]; then
+if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "all" ]]; then
   run_step "$(step_name 2 b capture-job)" \
     "the capture job on the release image ${release:0:12}" \
     "the capture job was not ensured (above); the Prepare button stays off" \
@@ -124,12 +129,16 @@ if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" ]]; then
     "${activate[@]}" --apply-web-preparation
 fi
 if [[ "$STAGE" == "register-capture" ]]; then
-  milo_require_op REGISTER_ARCHIVE_BUCKET || exit 2
   run_step "$(step_name 2 b capture-job)" \
     "the capture job on the release image ${release:0:12}, with the register archive bucket" \
     "the capture job was not ensured (above); the Register page stays off" \
     "${capture[@]}" --ensure-job --enable-catalog-execution
-  run_step "$(step_name 3 c register-capture)" \
+fi
+if [[ "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
+  # `all`: the capture job was ensured once, above (step 2).
+  register_step=(3 c)
+  [[ "$STAGE" == "all" ]] && register_step=(4 d)
+  run_step "$(step_name "${register_step[0]}" "${register_step[1]}" register-capture)" \
     "PR-D1 (the Register page): the register archive read back; the API identity runs and reads the capture job; MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
     "register capture was not applied (above); the Register page stays off" \
     "${activate[@]}" --apply-register-capture

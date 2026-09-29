@@ -88,18 +88,7 @@ class RegisterMemoryMixin:
                     continue
                 if unit["status"] == "captured":
                     continue
-                group = state["groups"][unit["group_id"]]
-                run = self.runs.get(str(group.get("run_id"))) if group.get("run_id") else None
-                claimed = datetime.fromisoformat(group["claimed_at"])
-                started = datetime.fromisoformat(group.get("triggered_at") or group["claimed_at"])
-                retry = (unit["status"] == "failed" or group["trigger_state"] == "trigger_failed"
-                         or (group["trigger_state"] == "claimed" and claimed < datetime.now(UTC) - grace)
-                         or (run is not None and run.get("status") in _TERMINAL)
-                         or (run is not None and run.get("status") == "queued" and not run.get("worker_id")
-                             and started < datetime.now(UTC) - grace)
-                         or (run is not None and run.get("status") in ("starting", "running")
-                             and run.get("lease_expires_at")
-                             and _as_time(run["lease_expires_at"]) < datetime.now(UTC) - grace))
+                retry = unit["status"] == "failed" or self._group_stale(unit["group_id"], grace)
                 if retry:
                     new.append(tozar)
             if not new:
@@ -111,13 +100,15 @@ class RegisterMemoryMixin:
                 raise AppError("CATALOG_REGISTER_GROUP_TOO_LARGE", "too large", 409)
             inflight = sum(int(u["expected_rows"]) for u in state["units"].values()
                            if u["status"] in ("requested", "capturing")
-                           and not (u["register_version"] == register_version and u["tozar"] in new))
+                           and not (u["register_version"] == register_version and u["tozar"] in new)
+                           and not self._group_stale(u["group_id"], grace))
             current = int(self.register_database_bytes)
             projected = current + (rows + inflight) * int(bytes_per_row)
             if projected > capacity_limit_bytes:
                 raise AppError("CATALOG_CAPACITY_THRESHOLD_EXCEEDED",
                                f"current={current} projected={projected} limit={capacity_limit_bytes}", 409)
-            group = {"id": str(uuid4()), "register_version": register_version, "requested_by": str(requested_by),
+            group = {"id": str(uuid4()), "kind": "capture", "register_version": register_version,
+                     "requested_by": str(requested_by),
                      "expected_rows": rows, "run_id": None, "trigger_state": "claimed", "execution_name": None,
                      "claimed_at": _now(), "triggered_at": None, "updated_at": _now()}
             state["groups"][group["id"]] = group
@@ -133,6 +124,38 @@ class RegisterMemoryMixin:
             return {"decision": "claimed", "group": dict(group), "units": sorted(
                 (dict(u) for u in state["units"].values() if u["group_id"] == group["id"]),
                 key=lambda u: u["tozar"])}
+
+    def _group_stale(self, group_id: str, grace: timedelta) -> bool:
+        """Mirror of public.catalog_register_group_stale."""
+        group = self._register_state()["groups"].get(str(group_id))
+        if group is None:
+            return True
+        now = datetime.now(UTC)
+        run = self.runs.get(str(group.get("run_id"))) if group.get("run_id") else None
+        started = _as_time(group.get("triggered_at") or group["claimed_at"])
+        return bool(
+            group["trigger_state"] == "trigger_failed"
+            or (group["trigger_state"] == "claimed" and not group.get("run_id")
+                and _as_time(group["claimed_at"]) < now - grace)
+            or (run is not None and run.get("status") in _TERMINAL)
+            or (run is not None and run.get("status") == "queued" and not run.get("worker_id") and started < now - grace)
+            or (run is not None and run.get("status") in ("starting", "running") and run.get("lease_expires_at")
+                and _as_time(run["lease_expires_at"]) < now - grace))
+
+    def request_register_directory_refresh(self, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
+        """Mirror of public.request_register_directory_refresh: one live refresh at a time."""
+        state = self._register_state()
+        with self.lock:
+            latest = max((g for g in state["groups"].values() if g.get("kind") == "directory"),
+                         key=lambda g: str(g["claimed_at"]), default=None)
+            if latest is not None and not self._group_stale(latest["id"], timedelta(seconds=grace_seconds)):
+                return {"decision": "existing", "group": dict(latest)}
+            group = {"id": str(uuid4()), "kind": "directory", "register_version": None,
+                     "requested_by": str(requested_by), "expected_rows": 0, "run_id": None,
+                     "trigger_state": "claimed", "execution_name": None, "claimed_at": _now(),
+                     "triggered_at": None, "updated_at": _now()}
+            state["groups"][group["id"]] = group
+            return {"decision": "claimed", "group": dict(group)}
 
     def record_register_capture_trigger(self, group_id: Any, *, run_id: Any, trigger_state: str,
                                         execution_name: str | None) -> dict[str, Any]:

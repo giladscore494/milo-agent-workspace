@@ -88,6 +88,8 @@ nothing:
 | `plan-authoring` | `website-execution-activate.sh --apply-plan-authoring` |
 | `web-preparation` | `government-production-capture.sh --ensure-job --enable-catalog-execution`, then `website-execution-activate.sh --apply-web-preparation` |
 | `both` | the two above, in that order |
+| `register-capture` | the Register page (PR-D1): `government-production-capture.sh --ensure-job --enable-catalog-execution`, then `website-execution-activate.sh --apply-register-capture`; needs `REGISTER_ARCHIVE_BUCKET` (refused before the deploy starts without it) |
+| `all` | `both`, then `website-execution-activate.sh --apply-register-capture` (the capture job is ensured once) |
 | `none` | nothing |
 
 Each runs behind its own deployed gate and reads back that run creation, paid

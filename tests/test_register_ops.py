@@ -49,6 +49,13 @@ if args[:3] == ["config", "get-value", "project"]:
 if args[:3] == ["config", "get-value", "account"]:
     print("owner@example.test"); sys.exit(0)
 name = args[3].replace("gs://", "") if len(args) > 3 else ""
+if os.environ.get("OPS_TEST_IAM_DENIED") and "get-iam-policy" in args:
+    # The deployer: it may describe the bucket but holds no IAM read on the
+    # bucket or the project.
+    sys.stderr.write("ERROR: PERMISSION_DENIED: storage.buckets.getIamPolicy / resourcemanager.projects.getIamPolicy\n")
+    sys.exit(1)
+if args[:3] == ["run", "jobs", "describe"]:
+    print(json.loads(os.environ.get("OPS_TEST_JOB_IMAGES", "{}")).get(args[3], "")); sys.exit(0)
 if args[:3] == ["storage", "buckets", "describe"]:
     if name not in state["buckets"]:
         sys.exit(1)
@@ -163,12 +170,85 @@ def test_a_delete_capable_role_or_a_public_bucket_is_a_failure(tmp_path):
         "FAIL bucket test-project-milo-register-archive is not closed to the public")
 
 
+def test_the_deployer_check_verifies_the_bucket_posture_and_leaves_iam_to_the_operator(tmp_path):
+    tree, env = archive_tree(tmp_path)
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    deployer = {**env, "OPS_TEST_IAM_DENIED": "1"}
+    applied = len(mutations(tree))
+    check = tree.run("setup-register-archive.sh", "--check", extra_env=deployer)
+    assert check.returncode == 0
+    assert check.stdout.startswith(f"PARTIAL bucket {BUCKET}: us-central1, uniform access, "
+                                   "public access prevention enforced; its IAM")
+    assert "Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check" in check.stdout
+    # It asked, and was refused (the stub denies getIamPolicy); nothing changed.
+    assert any("buckets get-iam-policy" in call for call in tree.tool_calls())
+    assert len(mutations(tree)) == applied
+    # The operator (IAM readable) still gets the whole check.
+    assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith("PASS ")
+    path = tmp_path / "storage.json"
+    state = json.loads(path.read_text())
+    state["buckets"][BUCKET]["public_access_prevention"] = "inherited"
+    path.write_text(json.dumps(state))
+    assert tree.run("setup-register-archive.sh", "--check", extra_env=deployer).stdout.startswith(
+        f"FAIL bucket {BUCKET} is not closed to the public")
+    state["buckets"][BUCKET].update(public_access_prevention="enforced", location="EU")
+    path.write_text(json.dumps(state))
+    assert tree.run("setup-register-archive.sh", "--check", extra_env=deployer).stdout.startswith(
+        f"GAP bucket {BUCKET} is not in us-central1")
+    no_secret(check.stdout, check.stderr)
+    assert "@" not in check.stdout + check.stderr
+
+
+def activation_tree(tmp_path: Path) -> tuple[OpsTree, dict[str, str]]:
+    tree, env = archive_tree(tmp_path)
+    (tree.root / "scripts" / "deploy" / "production-verify.sh").write_text(VERIFY_STUB)
+    # The capture job is not on the release image: the gate AFTER the archive
+    # refuses, so reaching it proves the archive gate passed.
+    env["OPS_TEST_JOB_IMAGES"] = json.dumps({"test-worker": "us-docker.pkg.dev/p/r/milo@sha256:" + "1" * 64})
+    return tree, env
+
+
+def activate(tree: OpsTree, env: dict[str, str]):
+    return tree.run("../deploy/website-execution-activate.sh", "--apply-register-capture", extra_env=env)
+
+
+def test_the_register_activation_passes_the_archive_gate_as_the_deployer_with_a_warning(tmp_path):
+    tree, env = activation_tree(tmp_path)
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    before, calls = len(mutations(tree)), len(tree.tool_calls())
+    result = activate(tree, {**env, "OPS_TEST_IAM_DENIED": "1"})
+    out = result.stdout + result.stderr
+    assert f"PARTIAL bucket {BUCKET}" in result.stdout
+    assert "WARN: the bucket posture is verified; its IAM is not readable by this identity." in result.stdout
+    assert "Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check" in result.stdout
+    assert "the register archive is not set up" not in out
+    assert "the capture job does not run the release image" in out and result.returncode == 1
+    assert len(mutations(tree)) == before
+    assert not any("add-iam-policy-binding" in c or "services update" in c for c in tree.tool_calls()[calls:])
+    no_secret(result.stdout, result.stderr)
+
+
+def test_the_register_activation_still_refuses_a_missing_or_public_bucket_as_the_deployer(tmp_path):
+    tree, env = activation_tree(tmp_path)
+    missing = activate(tree, {**env, "OPS_TEST_IAM_DENIED": "1"})
+    assert missing.returncode == 1 and "the register archive is not set up" in missing.stderr
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    path = tmp_path / "storage.json"
+    state = json.loads(path.read_text())
+    state["buckets"][BUCKET]["public_access_prevention"] = "inherited"
+    path.write_text(json.dumps(state))
+    public = activate(tree, {**env, "OPS_TEST_IAM_DENIED": "1"})
+    assert public.returncode == 1 and "the register archive is not set up" in public.stderr
+    assert f"FAIL bucket {BUCKET} is not closed to the public" in public.stdout
+
+
 def test_the_preflight_reports_the_archive_as_a_gap_and_a_violation_as_blocked():
     text = (Path(OPS).parents[1] / "scripts" / "deploy" / "production-preflight.sh").read_text()
     block = text[text.index('ARCHIVE_CHECK="$('):text.index("# Gateway / frontend binding.")]
     assert 'PASS\\ *) record_check PASS "storage:register-archive"' in block
     assert 'FAIL\\ *) record_check BLOCKED "storage:register-archive"' in block
     assert 'UNREADABLE\\ *) record_check WARN "storage:register-archive"' in block
+    assert 'PARTIAL\\ *) record_check WARN "storage:register-archive"' in block
     assert '*) record_check WARN "storage:register-archive"' in block
     # Placed with the capture identity's checks, and read-only.
     assert text.index("iam:capture-cannot-read-provider-key") < text.index('ARCHIVE_CHECK="$(')
@@ -348,6 +428,25 @@ def test_register_coverage_fails_the_gate_above_the_threshold(tmp_path):
     assert "SUMMARY|REGISTER_COVERAGE|FAIL|" in result.stdout
     assert "above the register capacity threshold" in result.stdout
     no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_a_coverage_report_that_fails_otherwise_is_not_available_never_a_gate_failure(tmp_path):
+    tree = gates_tree(tmp_path)
+    # The report itself cannot run: python3 exits 1 with a traceback and no
+    # REGISTER_COVERAGE line (and 2 for an interpreter error).
+    for code in ("1", "2"):
+        tree.tool("python3", f"#!/usr/bin/env bash\necho 'Traceback (most recent call last):' >&2\nexit {code}\n")
+        result = tree.run("gates.sh", "--gate", "deployed", extra_env={"OPS_TEST_DB_BYTES": "400000001"})
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"REGISTER_COVERAGE=INFO not available (the coverage report did not run: exit {code})" \
+            in result.stdout
+        assert "SUMMARY|REGISTER_COVERAGE|INFO|not available" in result.stdout
+        assert "above the register capacity threshold" not in result.stdout
+        assert "Traceback" not in result.stdout + result.stderr
+    # A non-FAIL line with a non-zero exit is not a FAIL either.
+    tree.tool("python3", "#!/usr/bin/env bash\necho 'REGISTER_COVERAGE=INFO directory x'\nexit 1\n")
+    result = tree.run("gates.sh", "--gate", "deployed", extra_env={"OPS_TEST_DB_BYTES": "1"})
+    assert result.returncode == 0 and "REGISTER_COVERAGE=INFO not available" in result.stdout
 
 
 def test_a_project_level_delete_capable_role_is_a_failure(tmp_path):

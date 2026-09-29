@@ -229,5 +229,15 @@ def _count(client: DataGovClient, resource_id: str, tozar: str, budget: _Budget)
     return total
 
 
+def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLTP_RESOURCE_ID,
+                clock: Callable[[], float] = time.monotonic) -> int:
+    """ONE fresh count of an exact tozar: the directory's own bounded
+    ``limit=0`` request (one request, no row payload). Register capture takes
+    it at the END of a capture to verify the stored rows independently of the
+    capture's own reported total."""
+    budget = _Budget(max_requests=1, max_seconds=DEFAULT_MAX_SECONDS, clock=clock)
+    return _count(client, src.require_allowed_resource(resource_id), tozar, budget)
+
+
 __all__ = ["DIRECTORY_CONTRACT", "DirectoryUnit", "RegisterDirectory", "configured_caps",
-           "discover_directory", "register_version"]
+           "count_tozar", "discover_directory", "register_version"]

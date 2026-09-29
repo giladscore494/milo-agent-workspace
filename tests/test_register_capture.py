@@ -72,6 +72,7 @@ def api_env(monkeypatch):
     monkeypatch.setenv("MILO_EXPECTED_SUPABASE_PROJECT_REF", PROJECT_REF)
     monkeypatch.setenv("SUPABASE_URL", SUPABASE_URL)
     monkeypatch.setenv("MILO_RATE_LIMIT_RUN_CREATION_USER", "1000")
+    monkeypatch.setenv("MILO_RATE_LIMIT_REGISTER_ACTIONS_USER", "1000")
     for flag in ("MILO_ENABLE_RUN_CREATION", "GATEWAY_ALLOW_RUN_START_ROUTES", "MILO_ENABLE_PAID_EXECUTION",
                  "MILO_ENABLE_WORK_SCOPE_BATCHES", "MILO_ENABLE_EXECUTION_CONTROL"):
         monkeypatch.delenv(flag, raising=False)
@@ -145,8 +146,19 @@ def request(repo: MemoryRepository, w: Mapping[str, Any], version: str, tozars: 
         env=dict(os.environ, **(env or {})))
 
 
-def scoped_client(records: list[Mapping[str, Any]], marque: str = TOYOTA) -> DataGovClient:
-    return DataGovClient(FixtureTransport(bodies={0: scoped_page(records, marque=marque)}),
+def count_body(total: int, marque: str = TOYOTA) -> bytes:
+    """The source's answer to a fresh `limit=0` count of that exact tozar."""
+    document = json.loads(scoped_page([], marque=marque))
+    document["result"].update(total=total, limit=0, records=[])
+    return capture_fixtures.encode(document)
+
+
+def scoped_client(records: list[Mapping[str, Any]], marque: str = TOYOTA, *,
+                  fresh_total: int | None = None, transport: FixtureTransport | None = None) -> DataGovClient:
+    bodies: dict[Any, bytes] = {0: scoped_page(records, marque=marque)}
+    if fresh_total is not None:
+        bodies["count"] = count_body(fresh_total, marque)
+    return DataGovClient(transport or FixtureTransport(bodies=bodies),
                          page_limit=entrypoint.CAPTURE_PAGE_LIMIT, sleep_fn=lambda _s: None)
 
 
@@ -157,7 +169,7 @@ def claimed_lease(repo: MemoryRepository, run_id: str):
     return WorkerLease(claimed["id"], "capture-worker", int(claimed["attempt"]), claimed["lease_token"])
 
 
-def captured_world(records=None, *, writer: FakeWriter | None = None):
+def captured_world(records=None, *, writer: FakeWriter | None = None, client: DataGovClient | None = None):
     """The API claims ONE tozar; the capture job captures it."""
     repo, w = world()
     version = directory(repo)
@@ -166,7 +178,7 @@ def captured_world(records=None, *, writer: FakeWriter | None = None):
     group = repo.register_capture_group(answer["group_id"])["group"]
     lease = claimed_lease(repo, group["run_id"])
     writer = writer if writer is not None else FakeWriter()
-    report = capture_group(repo, lease, client=scoped_client(records or planned_records()),
+    report = capture_group(repo, lease, client=client or scoped_client(records or planned_records()),
                            group_id=answer["group_id"], archive_writer=writer)
     return repo, w, version, report, writer
 
@@ -384,16 +396,34 @@ def test_the_register_snapshot_is_the_snapshot_prepare_makes():
     assert repo.catalog_variant_coverage == {}
 
 
-def test_a_count_mismatch_keeps_the_snapshot_inactive_and_out_of_prepare(monkeypatch):
-    original = MemoryRepository.count_catalog_raw_records
-    monkeypatch.setattr(MemoryRepository, "count_catalog_raw_records",
-                        lambda self, sid: original(self, sid) - 1)
-    repo, _w, _version, report, writer = captured_world()
+def test_the_count_is_a_fresh_exact_limit_zero_count_taken_after_the_rows():
+    records = planned_records()
+    transport = FixtureTransport(bodies={0: scoped_page(records)})
+    repo, _w, _version, report, _writer = captured_world(
+        client=scoped_client(records, transport=transport))
+    (outcome,) = report.units
+    assert outcome.status == "captured"
+    counts = [i for i, (_action, params) in enumerate(transport.calls) if params.get("limit") == "0"]
+    # Exactly one count, after every page of the capture, for that exact tozar.
+    assert counts == [len(transport.calls) - 1]
+    params = transport.calls[counts[0]][1]
+    assert json.loads(params["filters"]) == {"tozar": TOYOTA} and "q" not in params
+    assert the_unit(repo)["api_total"] == len(records)
+
+
+def test_a_count_mismatch_keeps_the_snapshot_inactive_and_out_of_prepare():
+    # The capture itself is complete and self-consistent (its reported total
+    # matches its rows); the FRESH count at its end says the source now holds
+    # one more row for that tozar. No counter is patched.
+    records = planned_records()
+    repo, _w, _version, report, writer = captured_world(
+        client=scoped_client(records, fresh_total=len(records) + 1))
     (outcome,) = report.units
     assert (outcome.status, outcome.failure_code) == ("failed", "CATALOG_CAPTURE_COUNT_MISMATCH")
     unit = the_unit(repo)
     assert unit["status"] == "failed" and unit["failure_code"] == "CATALOG_CAPTURE_COUNT_MISMATCH"
     assert unit["count_verified"] is False
+    assert (unit["api_total"], unit["captured_rows"]) == (len(records) + 1, None)
     snapshot = snapshot_by_key(repo, outcome.snapshot_key)
     assert snapshot["activated_at"] is None
     # Prepare resolves ACTIVE snapshots only: this one is never used.
@@ -677,6 +707,48 @@ def test_a_directory_refresh_executes_the_directory_invocation():
     assert "--register-directory" in invocation.entrypoint_args
 
 
+def test_one_directory_refresh_at_a_time():
+    repo, w = world()
+    trigger = FakeTrigger()
+    api = client(repo, trigger)
+    body = {"conversation_id": w["conversation"]}
+    first = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body)
+    assert first.status_code == 202, first.text
+    # A second press while the first is live answers it, and executes nothing.
+    again = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body)
+    assert again.status_code == 200, again.text
+    assert again.json() == {**first.json(), "started": False}
+    assert len(trigger.calls) == 1
+    # Once that run has ended, a new refresh starts.
+    repo.runs[first.json()["run_id"]]["status"] = "completed"
+    third = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body)
+    assert third.status_code == 202 and third.json()["group_id"] != first.json()["group_id"]
+    assert len(trigger.calls) == 2
+
+
+def test_register_actions_have_their_own_rate_limit_bucket(monkeypatch):
+    from backend import main as main_module
+    from backend import rate_limit
+
+    seen: list[str] = []
+    real = main_module.enforce_rate_limit
+    monkeypatch.setattr(main_module, "enforce_rate_limit",
+                        lambda category, identifier, *a: (seen.append(category), real(category, identifier, *a)))
+    rate_limit.reset_for_tests()
+    monkeypatch.setenv("MILO_RATE_LIMIT_REGISTER_ACTIONS_USER", "1")
+    repo, w = world()
+    version = directory(repo)
+    api = client(repo, FakeTrigger())
+    refresh = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(),
+                       json={"conversation_id": w["conversation"]})
+    assert refresh.status_code == 202, refresh.text
+    capture = api.post(f"/projects/{w['project']}/register/captures", headers=as_user(), json={
+        "register_version": version, "tozars": [TOYOTA], "conversation_id": w["conversation"]})
+    assert capture.status_code == 429
+    assert seen == ["register_actions_user", "register_actions_user"]
+    rate_limit.reset_for_tests()
+
+
 # =============================================================================
 # 5. retention (D1-5) and REGISTER_COVERAGE (D1-6)
 # =============================================================================
@@ -863,7 +935,38 @@ def test_prepare_can_adopt_a_snapshot_a_failed_register_run_left_pending():
     prepared = GovernmentCatalogIngestor(repo, prepare_lease, client=scoped_client(planned_records())).ingest_resource(
         src.WLTP_RESOURCE_ID, capture_scope=CaptureScope.for_register_marque(TOYOTA))
     assert prepared.snapshot_key == report.units[0].snapshot_key
-    assert snapshot_by_key(repo, prepared.snapshot_key)["activated_at"] is not None
+    snapshot = snapshot_by_key(repo, prepared.snapshot_key)
+    assert snapshot["activated_at"] is not None
+    # Prepare activated it WITHOUT an archive (Prepare writes none).
+    assert repo.register_snapshot_archive(snapshot["id"]) is None
+
+    # The next register capture of that tozar meets the already-active
+    # snapshot (same key, no archive row): it writes and verifies the archive
+    # before it marks the unit captured -- and doing it twice is a no-op.
+    retry, started = request(repo, w, version, [TOYOTA])
+    assert started
+    retry_lease = claimed_lease(repo, repo.register_capture_group(retry["group_id"])["group"]["run_id"])
+    writer = FakeWriter()
+    again = capture_group(repo, retry_lease, client=scoped_client(planned_records()),
+                          group_id=retry["group_id"], archive_writer=writer)
+    (outcome,) = again.units
+    assert (outcome.status, outcome.snapshot_key) == ("captured", prepared.snapshot_key)
+    archive = repo.register_snapshot_archive(snapshot["id"])
+    assert archive is not None and archive["line_count"] == len(planned_records())
+    (data,) = writer.objects.values()
+    assert hashlib.sha256(data).hexdigest() == archive["sha256"]
+    unit = the_unit(repo)
+    assert (unit["status"], unit["count_verified"], unit["snapshot_key"]) == (
+        "captured", True, prepared.snapshot_key)
+    # Idempotent: the same unit again trusts the recorded archive and writes nothing.
+    from backend.catalog.register.capture import capture_unit
+
+    (group_unit,) = repo.register_capture_group(retry["group_id"])["units"]
+    replay_writer = FakeWriter()
+    replay = capture_unit(repo, retry_lease, client=scoped_client(planned_records()), unit=group_unit,
+                          archive_writer=replay_writer)
+    assert replay.status == "captured" and replay_writer.objects == {}
+    assert repo.register_snapshot_archive(snapshot["id"]) == archive
 
 
 def test_a_recorded_archive_is_trusted_for_the_same_snapshot():
@@ -898,6 +1001,32 @@ def test_the_capacity_guard_counts_rows_still_in_flight():
         # Alone it would fit (394,798,000); with LEXUS still in flight it does not.
         request(repo, w, version, [TOYOTA])
     assert refused.value.capacity["projected_bytes"] == 394_700_000 + (28 + 1500) * 3500
+
+
+def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_change():
+    """Only LIVE in-flight work reserves capacity: a unit whose job was killed
+    (its lease expired long past the grace) under an OLD directory version
+    reserves nothing for a capture of the NEW version."""
+    from datetime import UTC, datetime, timedelta
+
+    repo, w = world()
+    repo.register_database_bytes = 394_700_000
+    old = directory(repo, {TOYOTA: 28, LEXUS: 1500})
+    answer, started = request(repo, w, old, [LEXUS])
+    assert started
+    run_id = repo.register_capture_group(answer["group_id"])["group"]["run_id"]
+    claimed_lease(repo, run_id)  # the job started: running, under a lease
+    new = directory(repo, {TOYOTA: 28, LEXUS: 1501})
+    assert new != old
+    # Live: the old unit still counts (394,700,000 + (1501 + 1500) x 3500 > 400,000,000).
+    with pytest.raises(register_service.CapacityRefusal) as refused:
+        request(repo, w, new, [LEXUS])
+    assert refused.value.capacity["projected_bytes"] == 394_700_000 + (1501 + 1500) * 3500
+    # Killed: the job's lease expired an hour ago and nothing renewed it.
+    repo.runs[run_id]["lease_expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    assert repo.runs[run_id]["status"] in ("starting", "running")
+    answer, started = request(repo, w, new, [LEXUS])
+    assert started and answer["decision"] == "claimed"
 
 
 def test_a_stalled_capture_reads_failed_and_can_be_captured_again():

@@ -246,6 +246,7 @@ class Repository(Protocol):
     def record_register_directory(self, resource_id: str, fetched_at: str, units: list[dict[str, Any]]) -> dict[str, Any]: ...
     def latest_register_directory(self) -> dict[str, Any] | None: ...
     def request_register_capture(self, register_version: str, tozars: list[str], requested_by: UUID, *, group_max_rows: int, capacity_limit_bytes: int, bytes_per_row: int, grace_seconds: int) -> dict[str, Any]: ...
+    def request_register_directory_refresh(self, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]: ...
     def record_register_capture_trigger(self, group_id: Any, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]: ...
     def register_capture_group(self, group_id: Any) -> dict[str, Any]: ...
     def register_capture_groups(self, group_ids: list[str]) -> list[dict[str, Any]]: ...
@@ -2398,6 +2399,15 @@ class SupabaseRepository:
         if not isinstance(data, dict) or not isinstance(data.get("version"), dict) \
                 or not isinstance(data.get("units"), list):
             raise AppError("REPOSITORY_ERROR", "register directory returned an unreadable document", 502)
+        return data
+
+    def request_register_directory_refresh(self, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
+        """Claim the ONE live directory refresh, or be answered with it."""
+        data = self._guarded_rpc("request_register_directory_refresh", {
+            "p_requested_by": str(requested_by), "p_grace_seconds": int(grace_seconds)},
+            "register directory refresh", refusals=self._REGISTER_REFUSALS)
+        if not isinstance(data, dict) or data.get("decision") not in ("existing", "claimed"):
+            raise AppError("REPOSITORY_ERROR", "directory refresh returned an unreadable row", 502)
         return data
 
     def request_register_capture(self, register_version: str, tozars: list[str], requested_by: UUID, *, group_max_rows: int, capacity_limit_bytes: int, bytes_per_row: int, grace_seconds: int) -> dict[str, Any]:
