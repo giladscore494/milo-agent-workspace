@@ -87,6 +87,8 @@ if tool == "gcloud":
         state["accounts"].append(args[3] + "@" + opt("--project") + ".iam.gserviceaccount.com")
         mutate("create-sa", args[3]); done()
     if args[:3] == ["iam", "service-accounts", "get-iam-policy"]:
+        if "sa:" + args[3] in state.get("unreadable_policies", []):
+            done("", 1)
         done(json.dumps(policy("sa:" + args[3])))
     if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:
         bind("sa:" + args[3], opt("--member"), opt("--role")); mutate("bind", args[3], opt("--role")); done()

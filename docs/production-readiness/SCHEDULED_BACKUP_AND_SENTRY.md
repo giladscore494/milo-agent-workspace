@@ -73,6 +73,14 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    bash scripts/ops/setup-wif.sh --apply
    ```
 
+   `--plan` lists, in this order, `BIND` (production), `BIND`
+   (production-kill-switch), `UNBIND` (the repository-wide principalSet) and
+   `UPDATE` (the condition). If an earlier revision of this branch already
+   admitted `production-backup`, there is no `UPDATE`: the narrowing then
+   closes an exposure that already exists, so apply it before anything else.
+   Run it when no deploy or kill-switch workflow is in progress: IAM changes
+   can take a few minutes to propagate, and step 2 proves the result.
+
    **Decision (owner):** `milo-github-deployer` may be impersonated ONLY from
    the `production` and `production-kill-switch` GitHub environments -- never
    from `production-backup` or any other. Every workflow that authenticates

@@ -294,24 +294,48 @@ fi
 #    attribute.environment; one that does not is refused before anything
 #    changes.
 wif_members() {
-  # wif_members POLICY_JSON -> the workloadIdentityUser members, one per line, sorted
+  # wif_members POLICY_JSON -> the workloadIdentityUser members, one per line,
+  # sorted. A member bound under an IAM CONDITION is listed with a
+  # " [conditional]" suffix, so it never counts as one of the two exact
+  # environment principals.
   python3 -c '
 import json, sys
 policy = json.loads(sys.argv[1] or "{}")
-members = sorted({m for b in policy.get("bindings") or []
+members = sorted({m + (" [conditional]" if b.get("condition") else "")
+                  for b in policy.get("bindings") or []
                   if b.get("role") == "roles/iam.workloadIdentityUser" for m in b.get("members") or []})
 print("\n".join(members))' "$1"
 }
+# The provider, read ONCE: its mapping decides whether an environment
+# principal can match a token, and its condition is compared in 4b. Only
+# NOT_FOUND means "no provider yet" (a fresh project, created in 4b); any
+# other error is a FAIL before anything changes.
+provider_err="$(mktemp)"
+provider_status=0
 provider_json="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
   --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
-  --format=json 2> /dev/null || true)"
-if [[ -n "$provider_json" ]] && ! python3 -c '
-import json, sys
-mapping = json.loads(sys.argv[1] or "{}").get("attributeMapping") or {}
-sys.exit(0 if mapping.get("attribute.environment") == "assertion.environment" else 1)' "$provider_json"; then
-  printf 'FAIL   provider %s does not map attribute.environment = assertion.environment: an environment\n' "$PROVIDER_ID" >&2
-  printf '       principal would match no token. The deployer and the condition were not changed.\n' >&2
+  --format=json 2> "$provider_err")" || provider_status=$?
+if [[ "$provider_status" -ne 0 ]] && ! grep -q "NOT_FOUND" "$provider_err"; then
+  rm -f "$provider_err"
+  printf 'FAIL   provider %s could not be read (gcloud exit %s). The deployer and the condition were not changed.\n' \
+    "$PROVIDER_ID" "$provider_status" >&2
   exit 1
+fi
+rm -f "$provider_err"
+if [[ "$provider_status" -ne 0 ]]; then
+  current_condition="<missing>"
+else
+  if ! current_condition="$(python3 -c '
+import json, sys
+doc = json.loads(sys.argv[1])
+mapping = doc.get("attributeMapping") or {}
+if mapping.get("attribute.environment") != "assertion.environment":
+    sys.exit(3)
+print(doc.get("attributeCondition") or "")' "$provider_json")"; then
+    printf 'FAIL   provider %s does not map attribute.environment = assertion.environment: an environment\n' "$PROVIDER_ID" >&2
+    printf '       principal would match no token. The deployer and the condition were not changed.\n' >&2
+    exit 1
+  fi
 fi
 policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
 for index in "${!DEPLOYER_PRINCIPALS[@]}"; do
@@ -341,13 +365,14 @@ if has_member "$policy" roles/iam.workloadIdentityUser "$REPOSITORY_PRINCIPALS";
     gcloud iam service-accounts remove-iam-policy-binding "$DEPLOY_SA" --project "$PROJECT_ID" \
     --member "$REPOSITORY_PRINCIPALS" --role roles/iam.workloadIdentityUser
 fi
-expected_members="$(printf '%s\n' "${DEPLOYER_PRINCIPALS[@]}" | sort)"
+expected_members="$(printf '%s\n' "${DEPLOYER_PRINCIPALS[@]}" | LC_ALL=C sort)"
 DEPLOYER_NARROWED=0
 if [[ "$MODE" == "apply" ]]; then
   policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
-  if [[ "$(wif_members "$policy")" == "$expected_members" ]]; then
-    printf 'PASS   %s workloadIdentityUser members read back: exactly principalSet attribute.environment/production and attribute.environment/production-kill-switch of pool %s\n' \
-      "$DEPLOY_ACCOUNT_ID" "$POOL_ID"
+  if [[ "$(wif_members "$policy" | LC_ALL=C sort)" == "$expected_members" ]]; then
+    printf 'PASS   %s workloadIdentityUser members read back: exactly principalSet %s of pool %s\n' \
+      "$DEPLOY_ACCOUNT_ID" "$(printf 'attribute.environment/%s\n' "${DEPLOYER_ENVIRONMENTS[@]}" | sed '$!s/$/ and/' | paste -sd' ' -)" \
+      "$POOL_ID"
     DEPLOYER_NARROWED=1
   else
     printf 'FAIL   %s workloadIdentityUser members are not exactly the production and production-kill-switch\n' "$DEPLOY_ACCOUNT_ID" >&2
@@ -356,11 +381,13 @@ if [[ "$MODE" == "apply" ]]; then
     exit 1
   fi
 else
-  others="$(wif_members "$policy" | grep -vxF -e "$REPOSITORY_PRINCIPALS" -e "${DEPLOYER_PRINCIPALS[0]}" \
-    -e "${DEPLOYER_PRINCIPALS[1]}" || true)"
+  known=(-e "$REPOSITORY_PRINCIPALS")
+  for principal in "${DEPLOYER_PRINCIPALS[@]}"; do known+=(-e "$principal"); done
+  others="$(wif_members "$policy" | grep -vxF "${known[@]}" || true)"
   if [[ -n "$others" ]]; then
-    printf 'WARN   %s has %s other workloadIdentityUser member(s): --apply will stop before the provider condition\n' \
+    printf 'WARN   %s has %s other workloadIdentityUser member(s): --apply will bind and unbind as listed, then FAIL\n' \
       "$DEPLOY_ACCOUNT_ID" "$(grep -c . <<< "$others")"
+    printf '       before the provider condition. Remove them first.\n'
   fi
 fi
 
@@ -371,9 +398,7 @@ if [[ "$MODE" == "apply" && "$DEPLOYER_NARROWED" -ne 1 ]]; then
   printf 'FAIL   the deployer is not narrowed; the provider condition was not changed.\n' >&2
   exit 1
 fi
-current_condition="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
-  --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
-  --format='value(attributeCondition)' 2> /dev/null || printf '%s' '<missing>')"
+# current_condition: read once, in 4 ("<missing>" only for NOT_FOUND).
 provider_args=(--workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID"
                --issuer-uri "https://token.actions.githubusercontent.com"
                --attribute-mapping "$MAPPING" --attribute-condition "$CONDITION")

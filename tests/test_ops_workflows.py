@@ -450,7 +450,7 @@ if args[:3] == ["iam", "workload-identity-pools", "create"]:
     state["pools"].append(args[3]); save(); sys.exit(0)
 if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:
     if args[4] not in state["providers"]:
-        sys.exit(1)
+        sys.stderr.write("ERROR: (gcloud) NOT_FOUND: Requested entity was not found.\n"); sys.exit(1)
     if "--format=json" in args:
         print(json.dumps({"attributeCondition": state["providers"][args[4]],
                           "attributeMapping": state.get("mappings", {}).get(args[4], {})}))
@@ -846,7 +846,8 @@ def test_a_provider_without_the_environment_mapping_changes_nothing(tmp_path):
 
 
 def test_no_workflow_outside_production_and_the_kill_switch_uses_the_deployer():
-    for path in sorted(WORKFLOWS.glob("*.yml")):
+    assert not list((REPO / ".github").glob("actions/**/*.y*ml")), "a composite action would need this check too"
+    for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]):
         text = path.read_text(encoding="utf-8")
         if "GCP_DEPLOY_SERVICE_ACCOUNT" not in text:
             continue
@@ -854,3 +855,42 @@ def test_no_workflow_outside_production_and_the_kill_switch_uses_the_deployer():
         assert job["environment"] in ("production", "production-kill-switch"), path.name
     backup = (WORKFLOWS / "backup-supabase-scheduled.yml").read_text(encoding="utf-8")
     assert "GCP_DEPLOY_SERVICE_ACCOUNT" not in backup
+
+
+def test_an_unreadable_provider_is_a_failure_before_anything_changes(tmp_path):
+    tree, env = production_today(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:',
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"] and "--format=json" in args:\n'
+        '    sys.stderr.write("PERMISSION_DENIED\\n"); sys.exit(1)\n'
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1 and "could not be read" in result.stderr
+    assert not [c for c in tree.tool_calls() if "iam-policy-binding" in c and "workloadIdentityUser" in c
+                or "update-oidc" in c]
+
+
+def test_a_failed_removal_leaves_the_condition_unchanged(tmp_path):
+    tree, env = production_today(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:3] == ["iam", "service-accounts", "remove-iam-policy-binding"]:',
+        'if args[:3] == ["iam", "service-accounts", "remove-iam-policy-binding"]:\n'
+        '    sys.stderr.write("PERMISSION_DENIED\\n"); sys.exit(1)\n'
+        'if False:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode != 0
+    assert not [c for c in tree.tool_calls() if "update-oidc" in c]
+    assert json.loads(state_path_of(tmp_path).read_text())["providers"]["github-actions"] == OLD_CONDITION
+
+
+def test_a_conditional_environment_binding_is_not_the_exact_member(tmp_path):
+    tree, env = production_today(tmp_path)
+    # Present, but only under an IAM condition: it must not count.
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]}))',
+        'print(json.dumps({"bindings": [dict({"role": r, "members": [m]}, **({"condition": {"title": "t"}} '
+        'if "attribute.environment/production-kill-switch" in m else {})) for r, m in bindings]}))'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert "members are not exactly the production and production-kill-switch" in result.stderr
+    assert not [c for c in tree.tool_calls() if "update-oidc" in c]

@@ -154,7 +154,7 @@ only then writes the provider condition), with these roles and nothing else:
 | `roles/storage.bucketViewer` | project | `gcloud builds submit` proves the default source bucket belongs to the project (`storage.buckets.list`) |
 | `roles/storage.admin` | the `gs://<project>_cloudbuild` bucket only | Cloud Build source upload |
 | `roles/iam.serviceAccountUser` | the API, worker, capture **and build** service accounts only | deploying AS those identities; starting builds AS the build identity |
-| `roles/iam.workloadIdentityUser` | the deploy SA, for this repository's principals only | the keyless login |
+| `roles/iam.workloadIdentityUser` | the deploy SA, for the `production` and `production-kill-switch` environment principalSets only (never repository-wide, never `production-backup`) | the keyless login |
 
 and the build identity `CLOUD_BUILD_SERVICE_ACCOUNT`
 (`milo-cloudbuild@<project>.iam.gserviceaccount.com`) with exactly:

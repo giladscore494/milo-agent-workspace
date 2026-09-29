@@ -34,6 +34,11 @@ OLD_PROVIDER_CONDITION = (f"assertion.repository == '{REPOSITORY}' && assertion.
                           "assertion.environment in ['production', 'production-kill-switch']")
 
 
+POOL = "principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/milo-github"
+DEPLOYER_KEY = f"sa:milo-github-deployer@{PROJECT}.iam.gserviceaccount.com"
+NARROWED = [f"{POOL}/attribute.environment/production", f"{POOL}/attribute.environment/production-kill-switch"]
+
+
 class Env:
     def __init__(self, tmp_path: Path):
         self.home = tmp_path / "home"
@@ -58,9 +63,12 @@ class Env:
         ro.write_text(RO_URL + "\n")
         ro.chmod(0o600)
         # The existing deploy pool and provider (setup-wif.sh owns them).
+        # ...and the deployer already narrowed by setup-wif.sh --apply.
         self.state.write_text(json.dumps({
             "pools": ["milo-github"],
-            "providers": {"github-actions": {"condition": PROVIDER_CONDITION}}}))
+            "providers": {"github-actions": {"condition": PROVIDER_CONDITION}},
+            "policies": {DEPLOYER_KEY: {"bindings": [{"role": "roles/iam.workloadIdentityUser",
+                                                      "members": NARROWED}]}}}))
 
     def run(self, script: Path, *args: str) -> subprocess.CompletedProcess:
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.home),
@@ -350,13 +358,17 @@ def test_setup_backup_fails_when_someone_else_can_impersonate_a_backup_identity(
 
 
 
-def test_setup_backup_refuses_while_the_deployer_holds_the_repository_wide_binding(env):
+def _deployer_members(env, members, *, condition=None):
     data = env.data()
-    data.setdefault("policies", {})[f"sa:milo-github-deployer@{PROJECT}.iam.gserviceaccount.com"] = {"bindings": [{
-        "role": "roles/iam.workloadIdentityUser",
-        "members": ["principalSet://iam.googleapis.com/projects/123456789/locations/global/"
-                    f"workloadIdentityPools/milo-github/attribute.repository/{REPOSITORY}"]}]}
+    binding = {"role": "roles/iam.workloadIdentityUser", "members": members}
+    if condition:
+        binding["condition"] = condition
+    data["policies"][DEPLOYER_KEY] = {"bindings": [binding]}
     env.state.write_text(json.dumps(data))
+
+
+def test_setup_backup_refuses_while_the_deployer_holds_the_repository_wide_binding(env):
+    _deployer_members(env, NARROWED + [f"{POOL}/attribute.repository/{REPOSITORY}"])
     for args in ((), ("--check",)):
         result = env.run(SETUP_BACKUP, *args, "--pg-major", "17")
         assert result.returncode == 1
@@ -365,13 +377,34 @@ def test_setup_backup_refuses_while_the_deployer_holds_the_repository_wide_bindi
         assert env.mutations() == [], "nothing may change before the deployer is narrowed"
 
 
+@pytest.mark.parametrize("members, condition", [
+    ([f"{POOL}/*"], None),                                             # pool-wide
+    (NARROWED + [f"{POOL}/attribute.environment/production-backup"], None),
+    (NARROWED[:1], None),                                              # only one of the two
+    ([], None),                                                        # none at all
+    (NARROWED, {"title": "expires", "expression": "request.time < timestamp('2030-01-01T00:00:00Z')"}),
+])
+def test_setup_backup_refuses_unless_the_deployer_has_exactly_the_two_environments(env, members, condition):
+    _deployer_members(env, members, condition=condition)
+    result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
+    assert result.returncode == 1
+    assert "FAIL milo-github-deployer workloadIdentityUser members are not exactly the production and " \
+           "production-kill-switch environment principalSets" in result.stdout
+    assert env.mutations() == []
+
+
 def test_setup_backup_proceeds_once_the_deployer_is_narrowed(env):
-    pool = "principalSet://iam.googleapis.com/projects/123456789/locations/global/workloadIdentityPools/milo-github"
-    data = env.data()
-    data.setdefault("policies", {})[f"sa:milo-github-deployer@{PROJECT}.iam.gserviceaccount.com"] = {"bindings": [{
-        "role": "roles/iam.workloadIdentityUser",
-        "members": [f"{pool}/attribute.environment/production", f"{pool}/attribute.environment/production-kill-switch"]}]}
-    env.state.write_text(json.dumps(data))
     result = env.run(SETUP_BACKUP, "--pg-major", "17")
     assert result.returncode == 0, result.stdout
-    assert "PASS milo-github-deployer holds no repository-wide workloadIdentityUser binding" in result.stdout
+    assert ("PASS milo-github-deployer is impersonable only from the production and "
+            "production-kill-switch environments") in result.stdout
+
+
+def test_setup_backup_refuses_when_the_deployer_policy_cannot_be_read(env):
+    data = env.data()
+    data["unreadable_policies"] = [DEPLOYER_KEY]
+    env.state.write_text(json.dumps(data))
+    result = env.run(SETUP_BACKUP, "--pg-major", "17")
+    assert result.returncode == 1
+    assert "FAIL the IAM policy of milo-github-deployer could not be read" in result.stdout
+    assert env.mutations() == []

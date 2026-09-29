@@ -149,7 +149,23 @@ if has_member "$deployer_policy" roles/iam.workloadIdentityUser "$REPOSITORY_PRI
   printf 'FAIL %s still holds workloadIdentityUser for the repository-wide principalSet: run scripts/ops/setup-wif.sh --apply first (it narrows the deployer to production and production-kill-switch). Nothing was changed.\n' "$DEPLOYER_ID"
   exit 1
 fi
-pass "${DEPLOYER_ID} holds no repository-wide workloadIdentityUser binding (narrowed by setup-wif.sh)"
+# Exactly the two environment principals, unconditional -- the rule
+# setup-wif.sh reads back. Any other member (a pool-wide principalSet, the
+# production-backup environment, another attribute) could let a
+# production-backup job impersonate the deployer.
+if ! python3 -c '
+import json, sys
+policy = json.loads(sys.argv[1] or "{}")
+members = {m + (" [conditional]" if b.get("condition") else "")
+           for b in policy.get("bindings") or []
+           if b.get("role") == "roles/iam.workloadIdentityUser" for m in b.get("members") or []}
+sys.exit(0 if members == set(sys.argv[2:]) else 1)' "$deployer_policy" \
+     "principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/production" \
+     "principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/production-kill-switch"; then
+  printf 'FAIL %s workloadIdentityUser members are not exactly the production and production-kill-switch environment principalSets: run scripts/ops/setup-wif.sh --apply first. Nothing was changed.\n' "$DEPLOYER_ID"
+  exit 1
+fi
+pass "${DEPLOYER_ID} is impersonable only from the production and production-kill-switch environments"
 
 # 1. APIs ---------------------------------------------------------------------
 for api in storage.googleapis.com iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com; do
