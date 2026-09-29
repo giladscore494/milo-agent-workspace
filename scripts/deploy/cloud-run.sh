@@ -835,6 +835,26 @@ API_REPORT_BEFORE=$(binding_report service "$API_SERVICE")
 WORKER_REPORT_BEFORE=$(binding_report job "$WORKER_JOB")
 API_BINDINGS_BEFORE=$(binding_identities "$API_REPORT_BEFORE")
 WORKER_BINDINGS_BEFORE=$(binding_identities "$WORKER_REPORT_BEFORE")
+# An OPTIONAL secret (deployment-contract.sh) this deploy does not bind because
+# it has no enabled version, but that a live surface still binds from an
+# earlier deploy: --update-secrets never removes a binding, and a binding to
+# `latest` with no enabled version stops new revisions and executions from
+# starting. Refused before anything is built or deployed.
+refuse_stale_optional_bindings() {
+  local label="$1" bindings="$2" entry env_name binding bound
+  for entry in "${MILO_OPTIONAL_RUNTIME_SECRETS[@]}"; do
+    env_name="${entry%%=*}"
+    bound=0
+    for binding in "${API_SECRETS[@]}"; do
+      [[ "$binding" == "$env_name="* ]] && bound=1
+    done
+    if [[ "$bound" == "0" && -n "$(secret_reference_for "$bindings" "$env_name")" ]]; then
+      fail "$label still binds $env_name, but secret ${entry#*=} has no enabled version, so a new revision or execution could not start. Turn it off by storing the value 'disabled' as a new version (scripts/ops/setup-sentry.sh --disable), never by disabling or destroying its last version. Nothing was built or deployed."
+    fi
+  done
+}
+refuse_stale_optional_bindings "API service '$API_SERVICE'" "$API_BINDINGS_BEFORE"
+refuse_stale_optional_bindings "Worker job '$WORKER_JOB'" "$WORKER_BINDINGS_BEFORE"
 if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
   # A stage can only be preserved on resources that exist and state one.
   [[ -n "$(report_field "$API_REPORT_BEFORE" image)" && -n "$(report_field "$WORKER_REPORT_BEFORE" image)" ]] || \

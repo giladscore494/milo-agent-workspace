@@ -22,13 +22,14 @@
 #                            (create; no read, no overwrite, no delete)
 #        milo-backup-reader  roles/storage.objectViewer on THAT bucket only
 #                            (the monthly restore test)
-#   4. A dedicated Workload Identity pool (milo-github-backup) whose OIDC
-#      provider admits ONLY this repository, on main, in the GitHub
-#      environment production-backup; each account's workloadIdentityUser
-#      goes to that environment's principalSet only. It is a SEPARATE pool on
-#      purpose: the deploy pool's deployer binding is repository-wide, so
-#      admitting this reviewer-less environment there would let it reach the
-#      deployer. Nothing in the existing pool is changed.
+#   4. Workload Identity: the EXISTING pool milo-github / provider
+#      github-actions (scripts/ops/setup-wif.sh), whose attribute condition
+#      pins this repository and refs/heads/main and must admit the environment
+#      production-backup -- this script only READS that condition (run
+#      setup-wif.sh --apply first) and never changes the pool or provider.
+#      Each backup account's workloadIdentityUser goes to the principalSet of
+#      that environment only (attribute.environment/production-backup), never
+#      to the repository-wide principalSet the deployer uses.
 #   5. The backup passphrase: a NEW random value in ~/.milo_backup_passphrase
 #      (mode 600), created once and never printed. It is NOT the manual
 #      workflow's SUPABASE_BACKUP_PASSPHRASE. Keep a copy in the operator's
@@ -39,8 +40,8 @@
 #      ~/.milo_ro_url, the read-only role), MILO_BACKUP_PASSPHRASE,
 #      MILO_BACKUP_WRITER_SA, MILO_BACKUP_READER_SA -- each set with
 #      `gh secret set --env production-backup` reading STDIN, never argv --
-#      and its variables MILO_BACKUP_BUCKET, MILO_BACKUP_WIF_PROVIDER,
-#      MILO_BACKUP_PG_MAJOR.
+#      and its variables MILO_BACKUP_BUCKET and MILO_BACKUP_PG_MAJOR (the
+#      provider is the repository variable GCP_WORKLOAD_IDENTITY_PROVIDER).
 #
 # Options:
 #   --bucket NAME            backup bucket (default <project>-milo-supabase-backups)
@@ -58,8 +59,9 @@ source "${SCRIPT_DIR}/common.sh"
 MODE="apply"
 GITHUB_REPOSITORY_NAME="${MILO_GITHUB_REPOSITORY:-giladscore494/milo-agent-workspace}"
 ENVIRONMENT_NAME="production-backup"
-POOL_ID="milo-github-backup"
-PROVIDER_ID="github-backup"
+# The existing pool and provider (scripts/ops/setup-wif.sh), read only.
+POOL_ID="milo-github"
+PROVIDER_ID="github-actions"
 WRITER_ID="milo-backup-writer"
 READER_ID="milo-backup-reader"
 RETENTION_SECONDS=604800   # 7 days
@@ -112,11 +114,7 @@ PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(project
 WRITER_SA="${WRITER_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 READER_SA="${READER_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 POOL_NAME="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}"
-PROVIDER_NAME="${POOL_NAME}/providers/${PROVIDER_ID}"
 PRINCIPAL="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/${ENVIRONMENT_NAME}"
-CONDITION="assertion.repository == '${GITHUB_REPOSITORY_NAME}' && assertion.ref == 'refs/heads/main' && assertion.environment == '${ENVIRONMENT_NAME}'"
-MAPPING="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.environment=assertion.environment"
-
 has_member() {
   # has_member POLICY_JSON ROLE MEMBER
   python3 -c '
@@ -244,33 +242,25 @@ for pair in "${WRITER_ID}:roles/storage.objectCreator" "${READER_ID}:roles/stora
   fi
 done
 
-# 4. The dedicated Workload Identity pool -------------------------------------------
-if ! quiet gcloud iam workload-identity-pools describe "$POOL_ID" --location global --project "$PROJECT_ID" && applying; then
-  quiet gcloud iam workload-identity-pools create "$POOL_ID" --location global --project "$PROJECT_ID" \
-    --display-name "MILO GitHub scheduled backup" || true
-fi
-if quiet gcloud iam workload-identity-pools describe "$POOL_ID" --location global --project "$PROJECT_ID"; then
-  pass "workload identity pool ${POOL_ID}"
+# 4. Workload Identity: the existing provider must admit production-backup --
+#    read only; setup-wif.sh owns the condition.
+provider_condition="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+  --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+  --format='value(attributeCondition)' 2> /dev/null || true)"
+if python3 -c '
+import re, sys
+condition, repository, environment = sys.argv[1:4]
+q = chr(39)
+clauses = [c.strip() for c in condition.split("&&")]
+envs = re.fullmatch(r"assertion\.environment in \[(.*)\]", clauses[-1] if clauses else "")
+listed = re.findall(q + "([^" + q + "]*)" + q, envs.group(1)) if envs else []
+sys.exit(0 if len(clauses) == 3
+         and clauses[0] == "assertion.repository == " + q + repository + q
+         and clauses[1] == "assertion.ref == " + q + "refs/heads/main" + q
+         and environment in listed else 1)' "$provider_condition" "$GITHUB_REPOSITORY_NAME" "$ENVIRONMENT_NAME"; then
+  pass "provider ${PROVIDER_ID} admits ${ENVIRONMENT_NAME} (still pinned to ${GITHUB_REPOSITORY_NAME} and refs/heads/main)"
 else
-  fail_line "workload identity pool ${POOL_ID} is missing"
-fi
-provider_condition() {
-  gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" --workload-identity-pool "$POOL_ID" \
-    --location global --project "$PROJECT_ID" --format='value(attributeCondition)' 2> /dev/null || printf '<missing>'
-}
-provider_args=(--workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID"
-               --issuer-uri "https://token.actions.githubusercontent.com"
-               --attribute-mapping "$MAPPING" --attribute-condition "$CONDITION")
-current="$(provider_condition)"
-if [[ "$current" == "<missing>" ]] && applying; then
-  quiet gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" "${provider_args[@]}" || true
-elif [[ "$current" != "$CONDITION" ]] && applying; then
-  quiet gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" "${provider_args[@]}" || true
-fi
-if [[ "$(provider_condition)" == "$CONDITION" ]]; then
-  pass "provider ${PROVIDER_ID} admits only ${GITHUB_REPOSITORY_NAME}, refs/heads/main, environment ${ENVIRONMENT_NAME}"
-else
-  fail_line "provider ${PROVIDER_ID} is missing or admits more than ${GITHUB_REPOSITORY_NAME}/main/${ENVIRONMENT_NAME}"
+  fail_line "provider ${PROVIDER_ID} does not admit ${ENVIRONMENT_NAME}: run scripts/ops/setup-wif.sh --apply first"
 fi
 for account_id in "$WRITER_ID" "$READER_ID"; do
   email="${account_id}@${PROJECT_ID}.iam.gserviceaccount.com"
@@ -280,7 +270,7 @@ for account_id in "$WRITER_ID" "$READER_ID"; do
       --member "$PRINCIPAL" --role roles/iam.workloadIdentityUser || true
   fi
   if has_member "$(sa_policy)" roles/iam.workloadIdentityUser "$PRINCIPAL"; then
-    pass "${account_id}: workloadIdentityUser for environment ${ENVIRONMENT_NAME} of pool ${POOL_ID} only"
+    pass "${account_id}: workloadIdentityUser for principalSet attribute.environment/${ENVIRONMENT_NAME} of pool ${POOL_ID} only"
   else
     fail_line "${account_id}: the ${ENVIRONMENT_NAME} principal cannot impersonate it"
   fi
@@ -306,8 +296,11 @@ fi
 
 # 6. The server major (restore-test container) -------------------------------------------
 if [[ -z "$PG_MAJOR" && -s "$RO_URL_FILE" ]] && command -v psql > /dev/null 2>&1; then
-  version_num="$(psql "$(tr -d '\r\n' < "$RO_URL_FILE")" -X -A -t -c 'show server_version_num' 2> /dev/null || true)"
-  [[ "$version_num" =~ ^[0-9]{5,6}$ ]] && PG_MAJOR="$((version_num / 10000))"
+  # The URL reaches psql through libpq environment variables (supabase_backup.py
+  # pg_env), never a command line.
+  detected="$(MILO_BACKUP_DB_URL="$(tr -d '\r\n' < "$RO_URL_FILE")" \
+    python3 "${SCRIPT_DIR}/supabase_backup.py" server-major 2> /dev/null || true)"
+  [[ "$detected" =~ ^[0-9]{2}$ ]] && PG_MAJOR="$detected"
 fi
 if [[ "$PG_MAJOR" =~ ^[0-9]{2}$ ]]; then
   pass "server PostgreSQL major ${PG_MAJOR}"
@@ -373,7 +366,7 @@ if applying; then
   [[ -s "$RO_URL_FILE" ]] && { tr -d '\r\n' < "$RO_URL_FILE" | set_secret_from_stdin MILO_BACKUP_DB_URL || true; }
   printf '%s' "$WRITER_SA" | set_secret_from_stdin MILO_BACKUP_WRITER_SA || true
   printf '%s' "$READER_SA" | set_secret_from_stdin MILO_BACKUP_READER_SA || true
-  for pair in "MILO_BACKUP_BUCKET=${BUCKET}" "MILO_BACKUP_WIF_PROVIDER=${PROVIDER_NAME}" "MILO_BACKUP_PG_MAJOR=${PG_MAJOR}"; do
+  for pair in "MILO_BACKUP_BUCKET=${BUCKET}" "MILO_BACKUP_PG_MAJOR=${PG_MAJOR}"; do
     [[ -n "${pair#*=}" ]] && { quiet gh variable set "${pair%%=*}" --env "$ENVIRONMENT_NAME" \
       --repo "$GITHUB_REPOSITORY_NAME" --body "${pair#*=}" || true; }
   done
@@ -388,7 +381,7 @@ for name in MILO_BACKUP_DB_URL MILO_BACKUP_PASSPHRASE MILO_BACKUP_WRITER_SA MILO
 done
 variables="$(gh variable list --env "$ENVIRONMENT_NAME" --repo "$GITHUB_REPOSITORY_NAME" --json name,value \
   --jq '.[] | "\(.name)=\(.value)"' 2> /dev/null || true)"
-for pair in "MILO_BACKUP_BUCKET=${BUCKET}" "MILO_BACKUP_WIF_PROVIDER=${PROVIDER_NAME}" "MILO_BACKUP_PG_MAJOR=${PG_MAJOR}"; do
+for pair in "MILO_BACKUP_BUCKET=${BUCKET}" "MILO_BACKUP_PG_MAJOR=${PG_MAJOR}"; do
   if [[ -n "${pair#*=}" ]] && grep -qxF "$pair" <<< "$variables"; then
     pass "environment variable ${pair%%=*} is set"
   else

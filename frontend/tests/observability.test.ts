@@ -81,3 +81,14 @@ describe('frontend error reporting (PR-OBS, OBS-5)', () => {
     expect('tags' in odd).toBe(false);
   });
 });
+
+describe('review follow-ups', () => {
+  it('tags a run named in the request path and drops logentry parameters', () => {
+    const event = scrubEvent({
+      request: { method: 'GET', url: 'https://milo.example/api/gateway/runs/0F8FAD5B-D9CB-469F-A165-70867728950E/events?after=3' },
+      logentry: { message: 'x', params: [SENTINEL], formatted: SENTINEL },
+    }) as Record<string, any>;
+    expect(event.tags).toEqual({ run_id: '0f8fad5b-d9cb-469f-a165-70867728950e' });
+    expect(JSON.stringify(event)).not.toContain(SENTINEL);
+  });
+});

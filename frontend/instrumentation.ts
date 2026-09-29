@@ -13,9 +13,13 @@ function options() {
   });
 }
 
+// Node.js runtime only: the gateway routes run there; the edge runtime (if
+// any route ever used it) gets no SDK.
+const NODE = () => process.env.NEXT_RUNTIME === 'nodejs';
+
 export async function register(): Promise<void> {
   const config = options();
-  if (!config) return;
+  if (!config || !NODE()) return;
   const Sentry = await import('@sentry/nextjs');
   // No default integrations beyond error capture: no HTTP/console
   // instrumentation that could attach request or response material.
@@ -27,7 +31,7 @@ export async function register(): Promise<void> {
 }
 
 export async function onRequestError(...args: unknown[]): Promise<void> {
-  if (!configuredDsn(process.env.NEXT_PUBLIC_SENTRY_DSN)) return;
+  if (!configuredDsn(process.env.NEXT_PUBLIC_SENTRY_DSN) || !NODE()) return;
   const Sentry = await import('@sentry/nextjs');
   // The request's path, method and headers the SDK attaches are reduced to
   // method + path by beforeSend (scrubEvent).

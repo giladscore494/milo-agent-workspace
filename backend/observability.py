@@ -49,6 +49,9 @@ DISABLED_DSN_VALUES = frozenset({"", "disabled", "off", "none", "false", "0"})
 REDACTED = "[redacted]"
 _CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,63}$")
 _RUN_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+#: A run named in a request path (API routes /runs/{run_id}/...).
+_PATH_RUN_ID_RE = re.compile(
+    r"/runs/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:/|$)")
 _SERVICE_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 #: Contexts the SDK fills from the host, not from request or model material.
 _SAFE_CONTEXTS = frozenset({"runtime", "os", "trace"})
@@ -135,6 +138,10 @@ def scrub_event(event: dict[str, Any], hint: Any = None) -> dict[str, Any]:
     if not isinstance(event, dict):
         return event
     request = event.get("request")
+    path_run_id = None
+    if isinstance(request, dict) and isinstance(request.get("url"), str):
+        match = _PATH_RUN_ID_RE.search(urlsplit(request["url"]).path)
+        path_run_id = match.group(1).lower() if match else None
     if isinstance(request, dict):
         # Method and path only: no body, headers, cookies, query or env.
         event["request"] = {key: value for key, value in (
@@ -156,6 +163,10 @@ def scrub_event(event: dict[str, Any], hint: Any = None) -> dict[str, Any]:
         event["tags"] = {key: value for key, value in tags.items() if key in _SAFE_TAGS}
     elif tags is not None:
         event.pop("tags", None)
+    if path_run_id:
+        # An API event about one run carries THAT run's id (the path is kept
+        # anyway); it wins over any scope-level tag.
+        event.setdefault("tags", {})["run_id"] = path_run_id
     exception = event.get("exception")
     values = exception.get("values") if isinstance(exception, dict) else None
     for value in values or []:

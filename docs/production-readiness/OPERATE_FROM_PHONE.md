@@ -132,7 +132,9 @@ if the project has none yet, and the workload identity pool `milo-github`, the O
 `github-actions` whose attribute condition admits **only**
 `assertion.repository == 'giladscore494/milo-agent-workspace' && assertion.ref ==
 'refs/heads/main' && assertion.environment in ['production',
-'production-kill-switch']`, and the deploy service account
+'production-kill-switch', 'production-backup']` (`production-backup`: the
+scheduled Supabase backup, PR-OBS; its identities are bound to that
+environment's principalSet only), and the deploy service account
 `milo-github-deployer@<project>.iam.gserviceaccount.com` with these roles and
 nothing else:
 
@@ -175,8 +177,8 @@ project-wide, is planned as `UNBIND` (the deployer's binding only).
   deployment branches = `main` only. Secret `VERCEL_TOKEN` (see Vercel below).
 - **Environments → `production-backup`** (PR-OBS, created by
   `scripts/ops/setup-backup.sh`): **no** required reviewer (it runs on a
-  schedule); deployment branches = `main` only; its own WIF pool
-  `milo-github-backup`. See [SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).
+  schedule); deployment branches = `main` only; admitted by the same WIF
+  provider (`setup-wif.sh --apply` first). See [SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).
 - **Repository variables**: `GCP_WORKLOAD_IDENTITY_PROVIDER`,
   `GCP_DEPLOY_SERVICE_ACCOUNT`, `GCP_PROJECT_ID` (printed by `setup-wif.sh`);
   `MILO_OPERATOR_CONFIG` (the contents of your `production-operator.env` --

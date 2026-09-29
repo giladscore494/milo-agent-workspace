@@ -62,8 +62,11 @@ import re
 import shutil
 import subprocess
 import sys
+import http.client
+import socket
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -80,6 +83,13 @@ MANIFEST_SUFFIX = ".manifest.json"
 REQUIRED_NONEMPTY_TABLES = ("catalog_raw_records", "catalog_variant_coverage", "runs")
 DEFAULT_GCS_ENDPOINT = "https://storage.googleapis.com"
 HTTP_TIMEOUT_SECONDS = 300
+#: Cloud Storage calls: attempts, and the backoff before each retry (seconds).
+HTTP_ATTEMPTS = 4
+HTTP_BACKOFF_SECONDS = (2, 4, 8)
+RETRYABLE_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
+#: The restore test refuses a newest backup older than this: a silently
+#: stopped daily backup must not pass the monthly test on an old bundle.
+DEFAULT_MAX_BACKUP_AGE_HOURS = 48
 
 #: The objects Supabase provides outside ``public`` that the public schema
 #: references (auth.users foreign keys, auth.uid() in policies, the API
@@ -147,8 +157,11 @@ _REDACTIONS = [
 
 
 def redact(text: str, limit: int = 240) -> str:
-    """One line, with anything connection-, identity- or token-shaped removed."""
-    first = next((line.strip() for line in (text or "").splitlines() if line.strip()), "")
+    """One line -- the first that says ``error:``/``FATAL:``, else the first --
+    with anything connection-, identity- or token-shaped removed."""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    first = next((line for line in lines if re.search(r"\b(error|fatal):", line, re.I)),
+                 lines[0] if lines else "")
     for pattern, replacement in _REDACTIONS:
         first = pattern.sub(replacement, first)
     return first[:limit]
@@ -191,9 +204,63 @@ def _run(cmd: list[str], code: str, *, env: dict[str, str] | None = None,
     return result.stdout if isinstance(result.stdout, str) else ""
 
 
+#: libpq URL query parameters and the environment variable each becomes.
+_LIBPQ_PARAMS = {
+    "host": "PGHOST", "hostaddr": "PGHOSTADDR", "port": "PGPORT", "dbname": "PGDATABASE",
+    "user": "PGUSER", "password": "PGPASSWORD", "sslmode": "PGSSLMODE",
+    "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY",
+    "connect_timeout": "PGCONNECT_TIMEOUT", "application_name": "PGAPPNAME", "options": "PGOPTIONS",
+    "target_session_attrs": "PGTARGETSESSIONATTRS", "channel_binding": "PGCHANNELBINDING",
+    "gssencmode": "PGGSSENCMODE",
+}
+
+
+def pg_env(url: str) -> dict[str, str]:
+    """The connection URL as libpq ENVIRONMENT variables, so it never reaches
+    a command line (argv is readable by other processes of the same user).
+
+    Refuses (by parameter NAME only) anything it cannot translate exactly.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in {"postgres", "postgresql"}:
+        raise BackupError("CONFIG_INVALID", "the database URL is not a postgresql:// URL")
+    netloc = parts.netloc
+    userinfo, _, hostport = netloc.rpartition("@") if "@" in netloc else ("", "", netloc)
+    if "," in hostport:
+        raise BackupError("CONFIG_INVALID", "multi-host database URLs are not supported")
+    env = {key: value for key, value in os.environ.items() if not key.startswith("PG")}
+    values: dict[str, str] = {}
+    if userinfo:
+        user, _, password = userinfo.partition(":")
+        values["user"] = urllib.parse.unquote(user)
+        if password:
+            values["password"] = urllib.parse.unquote(password)
+    if hostport:
+        host, _, port = hostport.rpartition(":") if not hostport.endswith("]") and ":" in hostport \
+            else (hostport, "", "")
+        values["host"] = urllib.parse.unquote(host.strip("[]"))
+        if port:
+            values["port"] = port
+    dbname = urllib.parse.unquote(parts.path.lstrip("/"))
+    if dbname:
+        values["dbname"] = dbname
+    for name, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+        if name not in _LIBPQ_PARAMS:
+            raise BackupError("CONFIG_INVALID", f"unsupported database URL parameter {name!r}")
+        values[name] = value
+    for name, value in values.items():
+        if value:
+            env[_LIBPQ_PARAMS[name]] = value
+    return env
+
+
+def _pg(tool: str, args: list[str], url: str, code: str, *, input_text: str | None = None) -> str:
+    """Run a PostgreSQL client tool against ``url`` (passed via the environment)."""
+    return _run([_tool(tool), *args], code, env=pg_env(url), input_text=input_text)
+
+
 def _psql(url: str, sql: str, code: str) -> str:
-    return _run([_tool("psql"), "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-d", url],
-                code, input_text=sql).strip()
+    return _pg("psql", ["-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1"], url, code, input_text=sql).strip()
 
 
 def tool_major(name: str) -> int:
@@ -269,6 +336,11 @@ def _safe_extract(archive: Path, target: Path) -> None:
 
 # -- create --------------------------------------------------------------------
 
+def _scratch_dir() -> str | None:
+    runner_temp = (os.environ.get("RUNNER_TEMP") or "").strip()
+    return runner_temp if runner_temp and os.path.isdir(runner_temp) else None
+
+
 def _public_sequences(url: str) -> list[str]:
     raw = _psql(url, "select c.relname from pg_class c join pg_namespace n on n.oid = c.relnamespace "
                      "where n.nspname = 'public' and c.relkind = 'S' order by 1;", "SOURCE_QUERY_FAILED")
@@ -292,16 +364,16 @@ def create(out: Path) -> dict:
     stamp = created_at.strftime("%Y%m%dT%H%M%SZ")
     run_id = os.environ.get("GITHUB_RUN_ID", "local")
     stem = f"milo-supabase-public-{stamp}-{run_id}"
-    work = Path(tempfile.mkdtemp(prefix="milo-backup-plain-"))
-    verify = Path(tempfile.mkdtemp(prefix="milo-backup-verify-"))
+    # Plaintext only under the runner's own temp dir (cleaned with the job).
+    work = Path(tempfile.mkdtemp(prefix="milo-backup-plain-", dir=_scratch_dir()))
+    verify = Path(tempfile.mkdtemp(prefix="milo-backup-verify-", dir=_scratch_dir()))
     try:
         sequences = _public_sequences(url)
-        cmd = [_tool("pg_dump"), "--format=custom", "--schema=public", "--no-password",
+        cmd = ["--format=custom", "--schema=public", "--no-password",
                "--lock-wait-timeout=120s", f"--file={work / DUMP_NAME}"]
         for name in sequences:
             cmd.append("--exclude-table-data=public.\"" + name.replace('"', '""') + "\"")
-        cmd += ["-d", url]
-        _run(cmd, "PG_DUMP_FAILED")
+        _pg("pg_dump", cmd, url, "PG_DUMP_FAILED")
         listing = _run([_tool("pg_restore"), "--list", str(work / DUMP_NAME)], "DUMP_UNREADABLE")
         tables = sum(1 for line in listing.splitlines() if re.search(r"\sTABLE public \S+ ", line))
         table_data = sum(1 for line in listing.splitlines() if " TABLE DATA public " in line)
@@ -375,15 +447,50 @@ def _bucket(name: str) -> str:
     return name
 
 
-def _request(method: str, url: str, *, data=None, headers: dict | None = None):
-    request = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {_token()}", **(headers or {})})
-    try:
-        return urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS)
-    except urllib.error.HTTPError as exc:
-        return exc
-    except urllib.error.URLError as exc:
-        raise BackupError("GCS_UNREACHABLE", f"Cloud Storage request failed: {redact(str(exc.reason))}")
+_TRANSIENT = (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
+              http.client.HTTPException)
+
+
+def _call(method: str, url: str, *, body_path: Path | None = None, headers: dict | None = None,
+          sink: Path | None = None) -> tuple[int, bytes, int]:
+    """One Cloud Storage call with bounded retries on transient failures.
+
+    Returns (status, body, attempt). The body is streamed to ``sink`` when
+    given (a download). A retryable status or a connection error is retried
+    up to HTTP_ATTEMPTS times; anything else is returned as is. Never raises a
+    raw network exception: exhaustion is GCS_UNREACHABLE, by class name only.
+    """
+    last = ""
+    for attempt in range(1, HTTP_ATTEMPTS + 1):
+        if attempt > 1:
+            # MILO_GCS_BACKOFF_SCALE exists for tests only (0 = no wait).
+            scale = float(os.environ.get("MILO_GCS_BACKOFF_SCALE") or 1)
+            time.sleep(HTTP_BACKOFF_SECONDS[min(attempt - 2, len(HTTP_BACKOFF_SECONDS) - 1)] * scale)
+        handle = body_path.open("rb") if body_path is not None else None
+        try:
+            request = urllib.request.Request(url, data=handle, method=method, headers={
+                "Authorization": f"Bearer {_token()}", **(headers or {})})
+            try:
+                response = urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            status = getattr(response, "status", None) or response.getcode()
+            if status in RETRYABLE_STATUSES:
+                response.read()
+                last = f"HTTP {status}"
+                continue
+            if sink is not None and status == 200:
+                with sink.open("wb") as out:
+                    shutil.copyfileobj(response, out, 1 << 20)
+                return status, b"", attempt
+            return status, response.read(), attempt
+        except _TRANSIENT as exc:
+            last = type(exc).__name__
+            continue
+        finally:
+            if handle is not None:
+                handle.close()
+    raise BackupError("GCS_UNREACHABLE", f"Cloud Storage {method} failed after {HTTP_ATTEMPTS} attempts ({last})")
 
 
 def upload_object(bucket: str, name: str, path: Path) -> dict:
@@ -391,11 +498,13 @@ def upload_object(bucket: str, name: str, path: Path) -> dict:
     query = urllib.parse.urlencode({"uploadType": "media", "name": name, "ifGenerationMatch": "0"})
     url = f"{_endpoint()}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o?{query}"
     size = path.stat().st_size
-    with path.open("rb") as handle:
-        response = _request("POST", url, data=handle, headers={
-            "Content-Type": "application/octet-stream", "Content-Length": str(size)})
-        status = getattr(response, "status", None) or response.getcode()
-        body = response.read()
+    status, body, attempt = _call("POST", url, body_path=path, headers={
+        "Content-Type": "application/octet-stream", "Content-Length": str(size)})
+    if status == 412 and attempt > 1:
+        # A retried create may have landed the first time; the writer cannot
+        # read the object to tell. Fail visibly rather than guess.
+        raise BackupError("GCS_UPLOAD_UNCERTAIN", f"gs://{bucket}/{name} exists after a retried upload; "
+                          "an earlier attempt may have stored it (the writer cannot read it to check)")
     if status == 412:
         raise BackupError("BACKUP_OBJECT_EXISTS", f"gs://{bucket}/{name} already exists (create-only upload refused)")
     if status != 200:
@@ -437,12 +546,13 @@ def _list(bucket: str, prefix: str) -> list[dict]:
         if token:
             params["pageToken"] = token
         url = f"{_endpoint()}/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o?{urllib.parse.urlencode(params)}"
-        response = _request("GET", url)
-        status = getattr(response, "status", None) or response.getcode()
-        body = response.read()
+        status, body, _ = _call("GET", url)
         if status != 200:
             raise BackupError("GCS_LIST_FAILED", f"listing gs://{bucket}/{prefix} failed with HTTP {status}")
-        page = json.loads(body or b"{}")
+        try:
+            page = json.loads(body or b"{}")
+        except ValueError:
+            raise BackupError("GCS_LIST_FAILED", "the listing was not readable")
         items += page.get("items") or []
         token = page.get("nextPageToken")
         if not token:
@@ -453,16 +563,12 @@ def _list(bucket: str, prefix: str) -> list[dict]:
 def download_object(bucket: str, name: str, target: Path) -> None:
     url = (f"{_endpoint()}/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o/"
            f"{urllib.parse.quote(name, safe='')}?alt=media")
-    response = _request("GET", url)
-    status = getattr(response, "status", None) or response.getcode()
+    status, _, _ = _call("GET", url, sink=target)
     if status != 200:
-        response.read()
         raise BackupError("GCS_DOWNLOAD_FAILED", f"download of {name} failed with HTTP {status}")
-    with target.open("wb") as handle:
-        shutil.copyfileobj(response, handle, 1 << 20)
 
 
-def fetch_latest(bucket: str, out: Path) -> dict:
+def fetch_latest(bucket: str, out: Path, max_age_hours: float = DEFAULT_MAX_BACKUP_AGE_HOURS) -> dict:
     bucket = _bucket(bucket)
     out.mkdir(parents=True, exist_ok=True)
     manifests = sorted(item["name"] for item in _list(bucket, PREFIX)
@@ -472,9 +578,21 @@ def fetch_latest(bucket: str, out: Path) -> dict:
     latest = manifests[-1]
     manifest_path = out / Path(latest).name
     download_object(bucket, latest, manifest_path)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("format") != FORMAT or not re.fullmatch(r"[A-Za-z0-9._-]+", manifest.get("encrypted_file", "")):
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except ValueError:
+        manifest = {}
+    if not isinstance(manifest, dict) or manifest.get("format") != FORMAT \
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", str(manifest.get("encrypted_file", ""))):
         raise BackupError("MANIFEST_INVALID", f"{latest} is not a {FORMAT} manifest")
+    try:
+        created = datetime.strptime(manifest["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except (KeyError, TypeError, ValueError):
+        raise BackupError("MANIFEST_INVALID", f"{latest} has no valid created_at")
+    age_hours = (datetime.now(UTC) - created).total_seconds() / 3600
+    if age_hours > max_age_hours:
+        raise BackupError("BACKUP_STALE", f"the newest backup ({manifest['created_at']}) is {age_hours:.0f}h old; "
+                          f"more than {max_age_hours:.0f}h means the daily backup has stopped")
     bundle_name = latest.rsplit("/", 1)[0] + "/" + manifest["encrypted_file"]
     bundle = out / manifest["encrypted_file"]
     download_object(bucket, bundle_name, bundle)
@@ -534,8 +652,20 @@ def _quote(identifier: str) -> str:
     return '"' + identifier.replace('"', '""') + '"'
 
 
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _require_local_target(url: str) -> None:
+    """The restore DROPS schema public: only a local throwaway database."""
+    host = pg_env(url).get("PGHOST", "")
+    if not (host in _LOCAL_HOSTS or host.startswith("/")):
+        raise BackupError("RESTORE_TARGET_NOT_LOCAL",
+                          "the restore target must be a local throwaway database (localhost or a unix socket)")
+
+
 def restore(directory: Path, migrations: Path) -> dict[str, int]:
     target = _env("MILO_RESTORE_DB_URL")
+    _require_local_target(target)
     manifests = sorted(directory.glob(f"*{MANIFEST_SUFFIX}"))
     if len(manifests) != 1:
         raise BackupError("MANIFEST_MISSING", "exactly one manifest is expected in the restore directory")
@@ -554,7 +684,7 @@ def restore(directory: Path, migrations: Path) -> dict[str, int]:
         raise BackupError("PG_RESTORE_VERSION_MISMATCH",
                           f"pg_restore major {restore_major} does not match the backup's {expected_major}")
     expected_tables = migration_tables(migrations)
-    work = Path(tempfile.mkdtemp(prefix="milo-restore-"))
+    work = Path(tempfile.mkdtemp(prefix="milo-restore-", dir=_scratch_dir()))
     try:
         _openssl(True, bundle, work / "bundle.tar.gz")
         _safe_extract(work / "bundle.tar.gz", work)
@@ -571,9 +701,17 @@ def restore(directory: Path, migrations: Path) -> dict[str, int]:
                               "the restore database already holds public tables; use a fresh database")
         _psql(target, "drop schema if exists public cascade;", "RESTORE_SHIM_FAILED")
         _psql(target, RESTORE_SHIM_SQL, "RESTORE_SHIM_FAILED")
-        base = [_tool("pg_restore"), "--no-owner", "--no-privileges", "--exit-on-error", "-d", target]
-        _run(base[:1] + ["--section=pre-data"] + base[1:] + [str(dump)], "RESTORE_SCHEMA_FAILED")
-        _run(base[:1] + ["--section=data"] + base[1:] + [str(dump)], "RESTORE_DATA_FAILED")
+        # pg_restore needs -d to restore into a database (without it, it
+        # writes SQL to stdout). Only the database NAME goes on argv; host,
+        # user and password come from the environment (pg_env).
+        database = pg_env(target).get("PGDATABASE", "postgres")
+
+        def _restore(section: str, code: str) -> None:
+            _pg("pg_restore", [f"--section={section}", "--no-owner", "--no-privileges",
+                               "--exit-on-error", "-d", database, str(dump)], target, code)
+
+        _restore("pre-data", "RESTORE_SCHEMA_FAILED")
+        _restore("data", "RESTORE_DATA_FAILED")
         # auth.users is outside the backup: the ids public rows reference are
         # given stand-in rows so the foreign keys can be re-created.
         post_data = _run([_tool("pg_restore"), "--section=post-data", "-f", "-", str(dump)], "DUMP_UNREADABLE")
@@ -583,7 +721,7 @@ def restore(directory: Path, migrations: Path) -> dict[str, int]:
                          f"where {column} is not null on conflict do nothing;")
         if seeds:
             _psql(target, "\n".join(seeds), "RESTORE_AUTH_SEED_FAILED")
-        _run(base[:1] + ["--section=post-data"] + base[1:] + [str(dump)], "RESTORE_POST_DATA_FAILED")
+        _restore("post-data", "RESTORE_POST_DATA_FAILED")
         _psql(target, RESET_SEQUENCES_SQL, "RESTORE_SEQUENCE_RESET_FAILED")
     finally:
         shutil.rmtree(work, ignore_errors=True)
@@ -620,6 +758,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("fetch-latest")
     p.add_argument("--bucket", required=True)
     p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_BACKUP_AGE_HOURS)
     p = sub.add_parser("restore")
     p.add_argument("--dir", required=True, type=Path)
     p.add_argument("--migrations", required=True, type=Path)
@@ -632,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "upload":
             upload(args.dir, args.bucket)
         elif args.command == "fetch-latest":
-            fetch_latest(args.bucket, args.out)
+            fetch_latest(args.bucket, args.out, args.max_age_hours)
         else:
             restore(args.dir, args.migrations)
     except BackupError as exc:

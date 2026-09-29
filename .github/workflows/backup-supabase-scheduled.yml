@@ -13,10 +13,13 @@ name: backup-supabase-scheduled
 #                   PostgreSQL of the same major, then verified. Counts only.
 #
 # Environment `production-backup`: NO required reviewer (a reviewer would
-# block every scheduled run), deployments from main only. Its own Workload
-# Identity pool admits only this repository, main, and this environment, and
-# its two service accounts can only CREATE objects (backup) or READ them
-# (restore-test) in the backup bucket. Set up by scripts/ops/setup-backup.sh.
+# block every scheduled run), deployments from main only. It authenticates
+# through the deploy provider (GCP_WORKLOAD_IDENTITY_PROVIDER), whose condition
+# pins this repository and main and admits production-backup
+# (scripts/ops/setup-wif.sh); its two service accounts are bound to THIS
+# environment's principalSet only and can only CREATE objects (backup) or READ
+# them (restore-test) in the backup bucket. Set up by
+# scripts/ops/setup-wif.sh, then scripts/ops/setup-backup.sh.
 #
 # A failure is red, and, when the environment secret SENTRY_DSN is set,
 # reported to Sentry as ONE event naming the job (no secret, no log text).
@@ -38,10 +41,6 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: supabase-scheduled-backup
-  cancel-in-progress: false
-
 jobs:
   backup:
     if: >-
@@ -53,7 +52,17 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # One run of this job at a time; never cancelled mid-way.
+    concurrency:
+      group: supabase-scheduled-backup
+      cancel-in-progress: false
     steps:
+      # Checkout first (no secret is involved) so the failure report below
+      # exists even when the main-only guard refuses.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Refuse anything but main
         shell: bash
         run: |
@@ -61,10 +70,6 @@ jobs:
             echo "FAIL: the scheduled backup runs from refs/heads/main only."
             exit 1
           fi
-
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
 
       - name: Install the PostgreSQL client of the server's major
         shell: bash
@@ -94,7 +99,7 @@ jobs:
       - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.MILO_BACKUP_WIF_PROVIDER }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.MILO_BACKUP_WRITER_SA }}
 
       - uses: google-github-actions/setup-gcloud@v2
@@ -135,6 +140,10 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # One run of this job at a time; never cancelled mid-way.
+    concurrency:
+      group: supabase-scheduled-restore-test
+      cancel-in-progress: false
     services:
       postgres:
         # The major of the backups (MILO_BACKUP_PG_MAJOR, written by
@@ -152,6 +161,12 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
+      # Checkout first (no secret is involved) so the failure report below
+      # exists even when the main-only guard refuses.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
       - name: Refuse anything but main
         shell: bash
         run: |
@@ -160,14 +175,10 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v5
-        with:
-          persist-credentials: false
-
       - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ vars.MILO_BACKUP_WIF_PROVIDER }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ secrets.MILO_BACKUP_READER_SA }}
 
       - uses: google-github-actions/setup-gcloud@v2

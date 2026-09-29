@@ -59,7 +59,17 @@ class FakeGcs:
 
     def __init__(self):
         self.objects: dict[tuple[str, str], bytes] = {}
+        #: Scripted answers, consumed in order: (METHOD, status, store). A
+        #: POST with store=True keeps the object AND answers `status` (an
+        #: upload that landed but was reported as failed).
+        self.forced: list[tuple[str, int, bool]] = []
+        self.wrong_md5 = False
         fake = self
+
+        def forced(method):
+            if fake.forced and fake.forced[0][0] == method:
+                return fake.forced.pop(0)
+            return None
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
@@ -88,18 +98,27 @@ class FakeGcs:
                 key = (bucket, query["name"])
                 if query.get("ifGenerationMatch") != "0":
                     return self._reply(400)
+                scripted = forced("POST")
+                if scripted:
+                    if scripted[2]:
+                        fake.objects[key] = data
+                    return self._reply(scripted[1], b"{}")
                 if key in fake.objects:
                     return self._reply(412, b'{"error": {"code": 412}}')
                 fake.objects[key] = data
                 import base64
                 import hashlib
+                digest = hashlib.md5(data + (b"x" if fake.wrong_md5 else b"")).digest()
                 meta = {"name": query["name"], "size": str(len(data)),
-                        "md5Hash": base64.b64encode(hashlib.md5(data).digest()).decode()}
+                        "md5Hash": base64.b64encode(digest).decode()}
                 self._reply(200, json.dumps(meta).encode())
 
             def do_GET(self):
                 if not self._authorized():
                     return
+                scripted = forced("GET")
+                if scripted:
+                    return self._reply(scripted[1], b"{}")
                 parts = urllib.parse.urlsplit(self.path)
                 query = dict(urllib.parse.parse_qsl(parts.query))
                 segments = parts.path.split("/")
@@ -167,7 +186,7 @@ def _env(pg_bin, **extra) -> dict[str, str]:
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("MILO_BACKUP", "MILO_RESTORE", "MILO_GCS"))}
     env.update({"MILO_PG_BIN": pg_bin, "MILO_BACKUP_PASSPHRASE": PASSPHRASE,
-                "GITHUB_RUN_ID": "4242", "GITHUB_SHA": "b" * 40})
+                "GITHUB_RUN_ID": "4242", "GITHUB_SHA": "b" * 40, "MILO_GCS_BACKOFF_SCALE": "0"})
     env.update(extra)
     return env
 
@@ -444,3 +463,256 @@ def test_redaction_removes_connection_identity_and_token_material(raw):
     for secret in ("supabase.co", "10.1.2.3", "milo_ro", "secretpw", "ops@example.com", "ya29.a0AfH6SMsecret",
                    "someone", "db.example"):
         assert secret not in line
+
+
+
+# -- review follow-ups: every refusal path -------------------------------------------
+
+import shutil as _shutil  # noqa: E402
+import tarfile as _tarfile  # noqa: E402
+from datetime import UTC as _UTC, datetime as _datetime, timedelta as _timedelta  # noqa: E402
+
+
+def _gcs_env(pg_bin, gcs):
+    return _env(pg_bin, MILO_GCS_ENDPOINT=gcs.endpoint, MILO_GCS_ACCESS_TOKEN=FakeGcs.TOKEN)
+
+
+def _copy(out: Path, tmp_path: Path) -> Path:
+    copy = tmp_path / "copy"
+    _shutil.copytree(out, copy)
+    return copy
+
+
+def test_the_connection_url_never_reaches_a_command_line(monkeypatch):
+    seen = []
+
+    def fake_run(cmd, code, *, env=None, **kwargs):
+        seen.append((cmd, env))
+        return "170006"
+
+    monkeypatch.setattr(backup, "_run", fake_run)
+    monkeypatch.setattr(backup, "_tool", lambda name: f"/usr/bin/{name}")
+    url = "postgresql://milo_ro.ref:p%40ss-SENTINEL@db.example.test:6543/postgres?sslmode=require"
+    assert backup.server_major(url) == 17
+    cmd, env = seen[0]
+    assert all("SENTINEL" not in part and "db.example.test" not in part for part in cmd)
+    assert env["PGPASSWORD"] == "p@ss-SENTINEL" and env["PGUSER"] == "milo_ro.ref"
+    assert env["PGHOST"] == "db.example.test" and env["PGPORT"] == "6543"
+    assert env["PGDATABASE"] == "postgres" and env["PGSSLMODE"] == "require"
+
+
+@pytest.mark.parametrize("url,code", [
+    ("mysql://u@h/db", "CONFIG_INVALID"),
+    ("postgresql://u@h1,h2/db", "CONFIG_INVALID"),
+    ("postgresql://u@h/db?weird=1", "CONFIG_INVALID"),
+])
+def test_urls_that_cannot_be_translated_exactly_are_refused(url, code):
+    with pytest.raises(backup.BackupError) as exc:
+        backup.pg_env(url)
+    assert exc.value.code == code
+    assert "h1" not in exc.value.message and "@" not in exc.value.message
+
+
+def test_a_unix_socket_url_maps_to_the_socket_directory():
+    env = backup.pg_env("postgresql://role@/milo?host=/tmp/sock&port=5555")
+    assert (env["PGHOST"], env["PGPORT"], env["PGDATABASE"], env["PGUSER"]) == ("/tmp/sock", "5555", "milo", "role")
+
+
+def test_a_tampered_bundle_member_fails_its_checksum(tmp_path):
+    (tmp_path / "public.dump").write_bytes(b"dump")
+    backup._write_checksums(tmp_path, ["public.dump"])
+    (tmp_path / "public.dump").write_bytes(b"dump!")
+    with pytest.raises(backup.BackupError) as exc:
+        backup._verify_checksums(tmp_path)
+    assert exc.value.code == "CHECKSUM_MISMATCH"
+    (tmp_path / "checksums.sha256").write_text("not a checksum line\n")
+    with pytest.raises(backup.BackupError) as exc:
+        backup._verify_checksums(tmp_path)
+    assert exc.value.code == "CHECKSUMS_INVALID"
+
+
+def test_a_bundle_with_an_unexpected_entry_is_refused(tmp_path):
+    (tmp_path / "evil").mkdir()
+    (tmp_path / "evil" / "x").write_text("x")
+    archive = tmp_path / "b.tar.gz"
+    with _tarfile.open(archive, "w:gz") as tar:
+        tar.add(tmp_path / "evil" / "x", arcname="../escape")
+    with pytest.raises(backup.BackupError) as exc:
+        backup._safe_extract(archive, tmp_path / "out")
+    assert exc.value.code == "BUNDLE_INVALID"
+
+
+def test_a_transient_upload_failure_is_retried(created, gcs, pg_bin):
+    out, _ = created
+    gcs.forced = [("POST", 503, False)]
+    result = _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups")
+    assert result.returncode == 0, result.stdout
+    assert len(gcs.objects) == 2
+
+
+def test_an_upload_that_landed_before_a_retry_fails_visibly(created, gcs, pg_bin):
+    out, _ = created
+    gcs.forced = [("POST", 503, True)]
+    result = _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups")
+    assert result.returncode == 1
+    assert result.stdout.startswith("FAIL GCS_UPLOAD_UNCERTAIN")
+
+
+@pytest.mark.parametrize("forced,code", [
+    ([("POST", 403, False)], "FAIL GCS_UPLOAD_FAILED"),
+    ([("POST", 503, False)] * 4, "FAIL GCS_UNREACHABLE"),
+])
+def test_upload_refusals(created, gcs, pg_bin, forced, code):
+    out, _ = created
+    gcs.forced = list(forced)
+    result = _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups")
+    assert result.returncode == 1 and result.stdout.startswith(code), result.stdout
+    _assert_nothing_secret(result)
+
+
+def test_a_stored_object_that_does_not_match_is_refused(created, gcs, pg_bin):
+    out, _ = created
+    gcs.wrong_md5 = True
+    result = _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups")
+    assert result.returncode == 1 and result.stdout.startswith("FAIL GCS_UPLOAD_MISMATCH")
+
+
+def test_an_invalid_bucket_name_is_refused(created, pg_bin):
+    out, _ = created
+    result = _tool(_env(pg_bin), "upload", "--dir", str(out), "--bucket", "Not_A_Bucket!")
+    assert result.returncode == 1 and result.stdout.startswith("FAIL BUCKET_INVALID")
+
+
+def _uploaded(created, gcs, pg_bin):
+    out, _ = created
+    assert _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups").returncode == 0
+
+
+@pytest.mark.parametrize("forced,code", [
+    ([("GET", 403, False)], "FAIL GCS_LIST_FAILED"),
+    ([("GET", 500, False)] * 4, "FAIL GCS_UNREACHABLE"),
+])
+def test_list_refusals(created, gcs, pg_bin, tmp_path, forced, code):
+    _uploaded(created, gcs, pg_bin)
+    gcs.forced = list(forced)
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and result.stdout.startswith(code), result.stdout
+
+
+def test_a_download_refusal_is_reported(created, gcs, pg_bin, tmp_path):
+    # The manifest is listed and readable; the bundle it names is not there.
+    _uploaded(created, gcs, pg_bin)
+    bundle_key = next(key for key in gcs.objects if key[1].endswith(".tar.gz.enc"))
+    gcs.objects.pop(bundle_key)
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups",
+                   "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL GCS_DOWNLOAD_FAILED"), result.stdout
+
+
+def test_a_manifest_that_is_not_ours_is_refused(gcs, pg_bin, tmp_path):
+    gcs.objects[("milo-test-backups", "supabase/2099-01-01/x.manifest.json")] = b'{"format": "other"}'
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL MANIFEST_INVALID")
+
+
+def test_a_stale_newest_backup_fails_the_restore_test(created, gcs, pg_bin, tmp_path):
+    out, _ = created
+    old = _copy(out, tmp_path)
+    manifest_path = next(old.glob("*.manifest.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["created_at"] = (_datetime.now(_UTC) - _timedelta(hours=72)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    manifest_path.write_text(json.dumps(manifest))
+    assert _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(old), "--bucket", "milo-test-backups").returncode == 0
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL BACKUP_STALE"), result.stdout
+    ok = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out",
+               str(tmp_path / "g"), "--max-age-hours", "100")
+    assert ok.returncode == 0, ok.stdout
+
+
+@pytest.fixture
+def fresh_target(pg_bin):
+    server = pgm.EphemeralPostgres(pg_bin, port=SECOND_TARGET_PORT)
+    server.start()
+    try:
+        server.create_database()
+        yield server
+    finally:
+        server.stop()
+
+
+def test_a_remote_restore_target_is_refused_before_connecting(created, pg_bin):
+    out, _ = created
+    env = _env(pg_bin, MILO_RESTORE_DB_URL="postgresql://postgres:x@db.production.example:5432/postgres")
+    result = _tool(env, "restore", "--dir", str(out), "--migrations", str(MIGRATIONS))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL RESTORE_TARGET_NOT_LOCAL")
+
+
+def test_a_backup_of_another_major_is_refused(created, pg_bin, fresh_target, tmp_path):
+    out = _copy(created[0], tmp_path)
+    manifest_path = next(out.glob("*.manifest.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["server_major"] = 99
+    manifest_path.write_text(json.dumps(manifest))
+    result = _tool(_env(pg_bin, MILO_RESTORE_DB_URL=_url(fresh_target)), "restore", "--dir", str(out),
+                   "--migrations", str(MIGRATIONS))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL RESTORE_MAJOR_MISMATCH")
+    assert "MILO_BACKUP_PG_MAJOR=99" in result.stdout
+
+
+def test_a_pg_restore_of_another_major_is_refused(created, pg_bin, fresh_target, tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "psql").symlink_to(Path(pg_bin) / "psql")
+    (fake_bin / "pg_restore").write_text("#!/bin/sh\necho 'pg_restore (PostgreSQL) 99.0'\n")
+    (fake_bin / "pg_restore").chmod(0o755)
+    env = _env(pg_bin, MILO_PG_BIN=str(fake_bin), MILO_RESTORE_DB_URL=_url(fresh_target))
+    result = _tool(env, "restore", "--dir", str(created[0]), "--migrations", str(MIGRATIONS))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL PG_RESTORE_VERSION_MISMATCH")
+
+
+def test_a_migration_table_missing_from_the_backup_fails(created, pg_bin, fresh_target, tmp_path):
+    migrations = tmp_path / "migrations"
+    _shutil.copytree(MIGRATIONS, migrations)
+    (migrations / "99999999999999_new_table.sql").write_text("create table if not exists public.not_in_backup (id int);\n")
+    result = _tool(_env(pg_bin, MILO_RESTORE_DB_URL=_url(fresh_target)), "restore", "--dir", str(created[0]),
+                   "--migrations", str(migrations))
+    assert result.returncode == 1
+    assert result.stdout.strip().splitlines()[-1] == \
+        "FAIL RESTORE_TABLE_MISSING: tables the migrations create are missing after restore: not_in_backup"
+
+
+def test_an_empty_required_table_fails(source, pg_bin, fresh_target, tmp_path):
+    # A tiny SYNTHETIC source whose `runs` is empty.
+    base = ["psql", "-h", source.dir, "-p", source.port, "-U", "postgres", "-X", "-q", "-v", "ON_ERROR_STOP=1"]
+    subprocess.run(base + ["-d", "postgres", "-c", "drop database if exists tiny", "-c", "create database tiny"],
+                   check=True, capture_output=True)
+    subprocess.run(base + ["-d", "tiny", "-c",
+                           "create table public.runs (id int); "
+                           "create table public.catalog_raw_records (id int); "
+                           "create table public.catalog_variant_coverage (id int); "
+                           "insert into public.catalog_raw_records values (1); "
+                           "insert into public.catalog_variant_coverage values (1); "
+                           f"grant usage on schema public to {RO_ROLE}; "
+                           f"grant select on all tables in schema public to {RO_ROLE};"],
+                   check=True, capture_output=True)
+    out = tmp_path / "out"
+    env = _env(pg_bin, MILO_BACKUP_DB_URL=f"postgresql://{RO_ROLE}@/tiny?host={source.dir}&port={source.port}")
+    assert _tool(env, "create", "--out", str(out)).returncode == 0
+    migrations = tmp_path / "m"
+    migrations.mkdir()
+    (migrations / "001.sql").write_text("create table public.runs (id int);\ncreate table public.catalog_raw_records (id int);\n"
+                                        "create table public.catalog_variant_coverage (id int);\n")
+    result = _tool(_env(pg_bin, MILO_RESTORE_DB_URL=_url(fresh_target)), "restore", "--dir", str(out),
+                   "--migrations", str(migrations))
+    assert result.returncode == 1
+    lines = result.stdout.strip().splitlines()
+    assert lines[:3] == ["COUNT catalog_raw_records 1", "COUNT catalog_variant_coverage 1", "COUNT runs 0"]
+    assert lines[-1] == "FAIL RESTORE_TABLE_EMPTY: restored tables are empty: runs"
+
+
+def test_pg_restore_errors_name_the_error_line_not_the_toc_header():
+    stderr = ('pg_restore: while PROCESSING TOC:\n'
+              'pg_restore: from TOC entry 215; 1259 16390 TABLE runs postgres\n'
+              'pg_restore: error: could not execute query: ERROR:  relation "runs" already exists\n')
+    assert backup.redact(stderr).startswith("pg_restore: error: could not execute query")

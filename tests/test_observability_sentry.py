@@ -46,6 +46,9 @@ def sentry_off():
     import sentry_sdk
 
     sentry_sdk.init()  # an inactive client (no DSN)
+    for scope in (sentry_sdk.get_global_scope(), sentry_sdk.get_isolation_scope(),
+                  sentry_sdk.get_current_scope()):
+        scope.clear()
     observability._enabled = False
 
 
@@ -185,19 +188,24 @@ def test_the_api_integration_reports_a_5xx_without_request_material(sentry_off):
     assert observability.init_sentry("milo-agent-api", env=_env(), web=True, transport=sink.transport)
     app = FastAPI()
 
-    @app.post("/boom")
-    async def boom(payload: dict):
+    @app.post("/runs/{run_id}/boom")
+    async def boom(run_id: str, payload: dict):
         raise RuntimeError(f"tool result {payload}")
 
+    run_id = "0f8fad5b-d9cb-469f-a165-70867728950e"
     client = TestClient(app, raise_server_exceptions=False)
-    response = client.post(f"/boom?secret={SENTINEL}", json={"prompt": SENTINEL},
+    response = client.post(f"/runs/{run_id}/boom?secret={SENTINEL}", json={"prompt": SENTINEL},
                            headers={"Authorization": f"Bearer {SENTINEL}", "Cookie": f"s={SENTINEL}"})
     assert response.status_code == 500
     observability.flush()
     assert sink.events(), "the unhandled 5xx was not reported"
     assert SENTINEL not in sink.text()
-    request = sink.events()[0].get("request", {})
-    assert set(request) <= {"method", "url"}
+    event = sink.events()[0]
+    assert set(event.get("request", {})) <= {"method", "url"}
+    assert event["release"] == RELEASE_SHA
+    assert event["tags"]["service"] == "milo-agent-api"
+    # A run named in the path is tagged on the event (review follow-up).
+    assert event["tags"]["run_id"] == run_id
 
 
 # -- the worker reports a failed run exactly once --------------------------------
@@ -276,3 +284,47 @@ def test_report_run_failed_through_the_sdk_is_one_tagged_event(sentry_off):
     assert events[0]["tags"] == {"service": "milo-agent-worker", "run_id": "11111111-2222-3333-4444-555555555555",
                                  "error_code": "SWARM_V2_EXECUTION_FAILED", "workflow_key": "swarm_v2"}
     assert events[0]["release"] == RELEASE_SHA
+
+
+
+def test_the_scrubber_tags_a_run_named_in_the_request_path():
+    event = observability.scrub_event({"request": {
+        "method": "GET", "url": "https://api/runs/0F8FAD5B-D9CB-469F-A165-70867728950E/events?after=1"}})
+    assert event["tags"] == {"run_id": "0f8fad5b-d9cb-469f-a165-70867728950e"}
+    assert event["request"]["url"] == "https://api/runs/0F8FAD5B-D9CB-469F-A165-70867728950E/events"
+    assert "tags" not in observability.scrub_event({"request": {"method": "GET", "url": "https://api/health"}})
+
+
+def test_the_capture_job_reports_a_failed_capture_once_and_keeps_its_status(monkeypatch):
+    from backend.catalog import operator_capture
+
+    calls = []
+    monkeypatch.setattr(observability, "init_sentry", lambda service, **kw: calls.append(("init", service)))
+    monkeypatch.setattr(observability, "report_run_failed",
+                        lambda run_id, code, workflow_key=None: calls.append(("failed", code, workflow_key)))
+    monkeypatch.setattr(observability, "flush", lambda timeout=2.0: None)
+    monkeypatch.setattr(operator_capture, "main", lambda argv: operator_capture.EXIT_FAILED)
+    assert operator_capture._process_main([]) == operator_capture.EXIT_FAILED
+    assert calls == [("init", "milo-catalog-capture"),
+                     ("failed", "CATALOG_CAPTURE_FAILED", "operator_capture")]
+    calls.clear()
+    monkeypatch.setattr(operator_capture, "main", lambda argv: operator_capture.EXIT_OK)
+    assert operator_capture._process_main([]) == operator_capture.EXIT_OK
+    assert calls == [("init", "milo-catalog-capture")]
+
+
+def test_the_capture_job_reports_a_crash_and_reraises_it(monkeypatch):
+    from backend.catalog import operator_capture
+
+    reported = []
+    monkeypatch.setattr(observability, "init_sentry", lambda service, **kw: None)
+    monkeypatch.setattr(observability, "report_exception", lambda exc: reported.append(type(exc).__name__))
+    monkeypatch.setattr(observability, "flush", lambda timeout=2.0: None)
+
+    def boom(argv):
+        raise RuntimeError(SENTINEL)
+
+    monkeypatch.setattr(operator_capture, "main", boom)
+    with pytest.raises(RuntimeError):
+        operator_capture._process_main([])
+    assert reported == ["RuntimeError"]

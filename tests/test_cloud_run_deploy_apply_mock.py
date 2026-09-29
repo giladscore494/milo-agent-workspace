@@ -1202,3 +1202,16 @@ def test_a_bound_sentry_dsn_that_did_not_land_fails_verification(deployment):
     (deployment.dir / "optional-secret-versions").write_text("projects/p/secrets/SENTRY_DSN/versions/1\n")
     result = deployment.run()
     assert result.returncode != 0
+
+
+def test_a_live_sentry_binding_without_an_enabled_version_is_refused_before_any_build(deployment):
+    # An earlier deploy bound SENTRY_DSN; its versions were then disabled.
+    # --update-secrets would leave the binding in place and new revisions
+    # could not start, so the deploy stops first.
+    _container_env(deployment.service_before).append(secret_entry("SENTRY_DSN", "SENTRY_DSN"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "still binds SENTRY_DSN" in result.stderr
+    assert "setup-sentry.sh --disable" in result.stderr
+    log = "\n".join(deployment.invocations())
+    assert "builds submit" not in log and "run deploy" not in log and "run jobs deploy" not in log

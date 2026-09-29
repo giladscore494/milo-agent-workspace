@@ -289,6 +289,18 @@ for key in GCP_PROJECT_NUMBER GATEWAY_SERVICE_ACCOUNT MILO_GATEWAY_AUDIENCE MILO
   fi
 done
 
+# PR-OBS: the deploy WIF provider must admit production-backup for the
+# scheduled Supabase backup to authenticate. Until the operator has run
+# scripts/ops/setup-wif.sh --apply this is a GAP -- reported (WARN), never a
+# reason to stop the deploy, which does not depend on it.
+WIF_BACKUP_CHECK="$(bash "${SCRIPT_DIR}/check-wif-environment.sh" "$PROJECT_ID" production-backup 2> /dev/null \
+  || printf 'UNREADABLE the check did not run')"
+case "$WIF_BACKUP_CHECK" in
+  PASS\ *) record_check PASS "wif:admits-production-backup" "${WIF_BACKUP_CHECK#PASS }" ;;
+  *) record_check WARN "wif:admits-production-backup" \
+       "${WIF_BACKUP_CHECK#* } Remediation: bash scripts/ops/setup-wif.sh --apply (then scripts/ops/setup-backup.sh)" ;;
+esac
+
 # No worker execution may be in flight: a capture or deploy during a live run
 # would change the release under a running claim.
 if EXECUTION_CHECK="$(python3 "${SCRIPT_DIR}/check-worker-executions.py" \

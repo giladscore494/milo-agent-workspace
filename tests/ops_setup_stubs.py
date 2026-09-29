@@ -91,12 +91,15 @@ if tool == "gcloud":
     if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:
         bind("sa:" + args[3], opt("--member"), opt("--role")); mutate("bind", args[3], opt("--role")); done()
     if args[:3] == ["iam", "workload-identity-pools", "describe"]:
-        done("") if args[3] in state.setdefault("pools", []) else done("", 1)
+        if args[3] not in state.setdefault("pools", []): done("", 1)
+        done(state.setdefault("pool_state", {}).get(args[3], "ACTIVE") if opt("--format") == "value(state)" else "")
     if args[:3] == ["iam", "workload-identity-pools", "create"]:
         state["pools"].append(args[3]); mutate("create-pool", args[3]); done()
     if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:
         p = state.setdefault("providers", {}).get(args[4])
-        done(p["condition"]) if p else done("", 1)
+        if not p: done("", 1)
+        done(p["condition"] if opt("--format") == "value(attributeCondition)" else json.dumps(
+            {"attributeCondition": p["condition"], "state": "ACTIVE"}))
     if args[:4] in (["iam", "workload-identity-pools", "providers", "create-oidc"],
                     ["iam", "workload-identity-pools", "providers", "update-oidc"]):
         state.setdefault("providers", {})[args[4]] = {"condition": opt("--attribute-condition"),
@@ -126,6 +129,8 @@ elif tool == "gh":
         method = opt("-X", "GET")
         path = [a for a in args[1:] if a.startswith("repos/")][0]
         parts = path.split("/")
+        if len(parts) == 3:
+            done("424242" if "--jq" in args else json.dumps({"id": 424242}))
         name = parts[4]
         if path.endswith("/deployment-branch-policies") or "/deployment-branch-policies/" in path:
             env = envs.get(name)

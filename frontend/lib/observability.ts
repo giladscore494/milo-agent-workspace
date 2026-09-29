@@ -24,6 +24,7 @@ const SAFE_CONTEXTS = new Set(['runtime', 'os', 'browser', 'trace']);
 const SAFE_TAGS = new Set(['service', 'run_id', 'error_code']);
 const DSN_SHAPE = /^https:\/\/[^/@\s]+@[^/\s]+\/\d+$/;
 const RUN_ID_SHAPE = /^[0-9a-fA-F-]{8,64}$/;
+const PATH_RUN_ID = /\/runs\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:\/|$)/;
 
 type Json = Record<string, unknown>;
 
@@ -70,6 +71,11 @@ export function scrubEvent<T>(event: T): T {
   if (!event || typeof event !== 'object') return event;
   const e = event as unknown as Json;
   const request = e.request as Json | undefined;
+  let pathRunId: string | undefined;
+  if (request && typeof request === 'object' && typeof request.url === 'string') {
+    const path = stripQuery(request.url) ?? '';
+    pathRunId = PATH_RUN_ID.exec(path)?.[1]?.toLowerCase();
+  }
   if (request && typeof request === 'object') {
     const kept: Json = {};
     if (typeof request.method === 'string') kept.method = request.method;
@@ -96,6 +102,13 @@ export function scrubEvent<T>(event: T): T {
     e.tags = tags;
   } else {
     delete e.tags;
+  }
+  if (pathRunId) {
+    e.tags = { ...((e.tags as Json | undefined) ?? {}), run_id: pathRunId };
+  }
+  if (e.logentry && typeof e.logentry === 'object') {
+    delete (e.logentry as Json).params;
+    delete (e.logentry as Json).formatted;
   }
   const exception = e.exception as Json | undefined;
   const values = exception && Array.isArray(exception.values) ? exception.values : [];

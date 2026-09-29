@@ -9,8 +9,8 @@ remains the procedure before a migration.
 
 | Workflow / job | Schedule (UTC) | Environment | Identity | Output |
 | --- | --- | --- | --- | --- |
-| `backup-supabase-scheduled.yml` / `backup` | daily 02:17 (`17 2 * * *`) + manual | `production-backup` (no reviewer, `main` only) | `milo-backup-writer` via WIF (pool `milo-github-backup`) — `roles/storage.objectCreator` on the backup bucket only | `gs://<bucket>/supabase/<UTC date>/milo-supabase-public-<stamp>-<run>.tar.gz.enc` + `.manifest.json`, create-only |
-| `backup-supabase-scheduled.yml` / `restore-test` | monthly, 3rd, 04:41 (`41 4 3 * *`) + manual | `production-backup` | `milo-backup-reader` via WIF — `roles/storage.objectViewer` on the backup bucket only | counts only (`COUNT <table> <n>`, `PASS ...`) |
+| `backup-supabase-scheduled.yml` / `backup` | daily 02:17 (`17 2 * * *`) + manual | `production-backup` (no reviewer, `main` only) | `milo-backup-writer` via WIF (the deploy provider `milo-github`/`github-actions`, whose condition pins this repository and `main` and admits `production-backup`; the account is bound to `principalSet://…/attribute.environment/production-backup` only) — `roles/storage.objectCreator` on the backup bucket only | `gs://<bucket>/supabase/<UTC date>/milo-supabase-public-<stamp>-<run>.tar.gz.enc` + `.manifest.json`, create-only |
+| `backup-supabase-scheduled.yml` / `restore-test` | monthly, 3rd, 04:41 (`41 4 3 * *`) + manual | `production-backup` | `milo-backup-reader` via WIF (same provider and principalSet) — `roles/storage.objectViewer` on the backup bucket only | counts only (`COUNT <table> <n>`, `PASS ...`) |
 | `ci.yml` | every pull request **and every push to `main`** | none | none | the four mandatory jobs, unchanged |
 | Dependabot | weekly, Monday 05:23 | — | — | ≤ 3 open PRs per ecosystem (pip `/backend`, npm `/frontend`, github-actions); minor+patch grouped; never auto-merged |
 
@@ -27,6 +27,10 @@ remains the procedure before a migration.
   -pbkdf2 -iter 600000 -md sha256`, passphrase from the environment. The bundle
   is decrypted again and its checksums verified **before** the plaintext is
   deleted; the output directory then holds exactly the bundle and its manifest.
+* The connection URL reaches `pg_dump`/`psql` as libpq environment variables,
+  never on a command line. Cloud Storage calls retry transient failures
+  (408/429/5xx, connection errors) up to 4 times; a create that may have landed
+  before a retry fails visibly (`GCS_UPLOAD_UNCERTAIN`) rather than guessing.
 * Uploaded with `ifGenerationMatch=0` (create-only). The bucket's unlocked
   7-day retention policy means no backup can be deleted or replaced for 7 days;
   lifecycle deletes objects after 30 days.
@@ -39,11 +43,14 @@ remains the procedure before a migration.
 ### The restore test
 
 Downloads the newest manifest and the bundle it names (size and sha256 must
-match), decrypts, verifies checksums, and restores into a `postgres:<major>`
+match; the newest backup must be at most **48 hours** old, else
+`FAIL BACKUP_STALE` -- a silently stopped daily backup cannot pass), decrypts, verifies checksums, and restores into a `postgres:<major>`
 service container (`MILO_BACKUP_PG_MAJOR`; the restore refuses a container
 whose major differs from the manifest's). Supabase's own objects that `public`
 references (`auth.users`, `auth.uid()`, the `anon` / `authenticated` /
-`service_role` roles, `pgcrypto`) get inert stand-ins first. It then checks that
+`service_role` roles, `pgcrypto`) get inert stand-ins first. The restore only
+ever targets a local throwaway database (`localhost` or a unix socket;
+anything else is `FAIL RESTORE_TARGET_NOT_LOCAL`). It then checks that
 **every table the migrations create exists** and that `catalog_raw_records`,
 `catalog_variant_coverage` and `runs` are **non-empty**, and prints the counts.
 
@@ -58,7 +65,28 @@ workflow, job, run id and commit — never a log line or a secret.
 All in Cloud Shell, from a checkout of `main`, with `gh auth login` done as a
 repository admin and `~/.milo_ro_url` (mode 600) in place.
 
-1. **Backup setup** (idempotent; prints only `PASS` / `FAIL`):
+1. **Admit `production-backup` in the deploy WIF provider** (idempotent):
+
+   ```bash
+   bash scripts/ops/setup-wif.sh --plan     # expect exactly one UPDATE: the provider condition
+   bash scripts/ops/setup-wif.sh --apply
+   ```
+
+   `ALLOWED_ENVIRONMENTS` is now `production`, `production-kill-switch`,
+   `production-backup`; the repository and `refs/heads/main` clauses are
+   unchanged, and no binding of the deployer or the kill switch changes. The
+   existing provider is updated in place (`update-oidc`) and read back:
+
+   ```
+   PASS   provider github-actions condition read back: repository giladscore494/milo-agent-workspace, ref refs/heads/main, environments production, production-kill-switch, production-backup
+   ```
+
+   Until this has run, the deploy preflight reports
+   `WARN wif:admits-production-backup` (a gap, never a blocked deploy) and
+   `setup-backup.sh` refuses with `FAIL provider github-actions does not admit
+   production-backup: run scripts/ops/setup-wif.sh --apply first`.
+
+2. **Backup setup** (idempotent; prints only `PASS` / `FAIL`):
 
    ```bash
    bash scripts/ops/setup-backup.sh            # converge
@@ -68,10 +96,14 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    Options: `--bucket NAME` (default `<project>-milo-supabase-backups`),
    `--pg-major N` (default: read through `~/.milo_ro_url`).
    It creates the bucket, the two service accounts and their bucket-level
-   roles, the dedicated WIF pool/provider and bindings, the passphrase file,
-   and the `production-backup` environment with its secrets and variables.
+   roles, their `workloadIdentityUser` binding for
+   `principalSet://…/workloadIdentityPools/milo-github/attribute.environment/production-backup`
+   (never the repository-wide principalSet the deployer uses), the passphrase
+   file, and the `production-backup` environment with its secrets and
+   variables. It only READS the provider condition; it never changes the pool
+   or the provider.
 
-2. **Keep the passphrase.** `~/.milo_backup_passphrase` is the only readable
+3. **Keep the passphrase.** `~/.milo_backup_passphrase` is the only readable
    copy of `MILO_BACKUP_PASSPHRASE` (GitHub secrets cannot be read back, and a
    Cloud Shell home is deleted after long inactivity). Copy it into the
    operator password manager now, next to — and labelled differently from —
@@ -80,14 +112,15 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    `setup-backup.sh` refuses to continue; `--rotate-passphrase` starts a new one
    (older backups then need the old passphrase).
 
-3. **Sentry projects.** Create two projects in Sentry: `milo-backend`
+4. **Sentry projects.** Create two projects in Sentry: `milo-backend`
    (platform Python) and `milo-frontend` (platform Next.js). With data
    scrubbing on and IP addresses not stored.
 
-4. **Backend DSN** (Secret Manager, bound by the existing deploy):
+5. **Backend DSN** (Secret Manager, bound by the existing deploy):
 
    ```bash
-   umask 077; printf '%s' '<milo-backend DSN>' > ~/.milo_sentry_dsn
+   # Paste the DSN at the prompt: it is not echoed and not kept in shell history.
+   umask 077; read -rs -p 'milo-backend DSN: ' dsn; printf '%s' "$dsn" > ~/.milo_sentry_dsn; unset dsn; echo
    bash scripts/ops/setup-sentry.sh --dsn-file ~/.milo_sentry_dsn
    ```
 
@@ -99,12 +132,18 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    the capture job — both only because the secret now has an enabled version
    (`MILO_OPTIONAL_RUNTIME_SECRETS`); without one they bind nothing and say so.
 
-5. **Frontend DSN** (Vercel → Project → Settings → Environment Variables,
+   **Turning it off later:** `bash scripts/ops/setup-sentry.sh --disable` stores
+   the value `disabled` as a new version (reporting off, binding still valid).
+   Never disable or destroy the secret's last version while it is bound: a
+   binding to `latest` without an enabled version stops new revisions and
+   executions from starting, and `cloud-run.sh` refuses to deploy in that state.
+
+6. **Frontend DSN** (Vercel → Project → Settings → Environment Variables,
    Production): `NEXT_PUBLIC_SENTRY_DSN` = the `milo-frontend` DSN, then
    redeploy. Optional: `NEXT_PUBLIC_MILO_SENTRY_TRACES_SAMPLE_RATE` (≤ 0.05;
    empty = off). The site builds and runs without either.
 
-6. **First backup, by hand:**
+7. **First backup, by hand:**
 
    ```bash
    gh workflow run backup-supabase-scheduled.yml --ref main -f job=backup
@@ -113,7 +152,7 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
 
    Expect `PASS backup created: ...` and `PASS uploaded gs://.../supabase/<date>/...`.
 
-7. **Restore test, by hand** (after step 6):
+8. **Restore test, by hand** (after step 7):
 
    ```bash
    gh workflow run backup-supabase-scheduled.yml --ref main -f job=restore-test

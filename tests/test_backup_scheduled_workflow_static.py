@@ -49,13 +49,19 @@ def test_each_job_runs_on_exactly_its_own_schedule_or_dispatch():
 def test_both_jobs_use_the_reviewerless_backup_environment_and_minimal_permissions():
     workflow = load()
     assert workflow["permissions"] == {"contents": "read"}
-    assert workflow["concurrency"]["cancel-in-progress"] is False
-    for job in workflow["jobs"].values():
+    for name, job in workflow["jobs"].items():
         assert job["environment"] == "production-backup"
         assert job["permissions"] == {"contents": "read", "id-token": "write"}
+        assert job["concurrency"] == {"group": f"supabase-scheduled-{name}", "cancel-in-progress": False}
         assert "env" not in job, "secrets reach a step through that step's env only"
-        first = job["steps"][0]
-        assert 'refs/heads/main' in first["run"]
+        steps = job["steps"]
+        assert str(steps[0].get("uses", "")).startswith("actions/checkout@")
+        assert steps[0]["with"] == {"persist-credentials": False}
+        # The main-only guard runs before any step that sees a secret.
+        assert "refs/heads/main" in steps[1]["run"]
+        first_sensitive = min(i for i, step in enumerate(steps)
+                              if "secrets." in str(step.get("env", "")) or "secrets." in str(step.get("with", "")))
+        assert first_sensitive > 1
 
 
 def test_authentication_is_keyless_and_uses_the_dedicated_identities():
@@ -67,7 +73,7 @@ def test_authentication_is_keyless_and_uses_the_dedicated_identities():
     for name, account in expected.items():
         auth = [s for s in jobs[name]["steps"] if str(s.get("uses", "")).startswith("google-github-actions/auth@")]
         assert len(auth) == 1
-        assert auth[0]["with"] == {"workload_identity_provider": "${{ vars.MILO_BACKUP_WIF_PROVIDER }}",
+        assert auth[0]["with"] == {"workload_identity_provider": "${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}",
                                    "service_account": account}
     # The deploy identity is never used here.
     assert "GCP_DEPLOY_SERVICE_ACCOUNT" not in text
@@ -131,3 +137,20 @@ def test_the_manual_backup_workflow_is_unchanged_by_this_pr():
     text = MANUAL.read_text()
     assert re.search(r"^on:\n  workflow_dispatch:", text, re.M)
     assert "environment: production" in text
+
+
+def test_the_backup_workflow_runs_in_production_backup_and_never_production():
+    # The scheduled workflow: every job, production-backup only.
+    workflow = load()
+    assert {job["environment"] for job in workflow["jobs"].values()} == {"production-backup"}
+    assert not re.search(r"^\s*environment:\s*production\s*$", WORKFLOW.read_text(), re.M)
+    # And no OTHER workflow runs in production-backup: the reviewer-less
+    # environment belongs to the scheduled backup alone.
+    for path in sorted(WORKFLOW.parent.glob("*.yml")):
+        if path == WORKFLOW:
+            continue
+        jobs = (yaml.safe_load(path.read_text()) or {}).get("jobs") or {}
+        for name, job in jobs.items():
+            environment = job.get("environment")
+            environment = environment.get("name") if isinstance(environment, dict) else environment
+            assert environment != "production-backup", f"{path.name}:{name} runs in production-backup"

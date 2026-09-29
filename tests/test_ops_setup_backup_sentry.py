@@ -26,6 +26,12 @@ PROJECT = "milo-test-project"
 RO_URL = "postgresql://milo_ro.secretref:ro-password-SENTINEL@db.example.test:5432/postgres"
 DSN = "https://dsnpublickeySENTINEL@o1.ingest.sentry.io/4242"
 REPOSITORY = "giladscore494/milo-agent-workspace"
+#: The deploy provider's condition after `setup-wif.sh --apply` (PR-OBS)...
+PROVIDER_CONDITION = (f"assertion.repository == '{REPOSITORY}' && assertion.ref == 'refs/heads/main' && "
+                      "assertion.environment in ['production', 'production-kill-switch', 'production-backup']")
+#: ...and before it (production today).
+OLD_PROVIDER_CONDITION = (f"assertion.repository == '{REPOSITORY}' && assertion.ref == 'refs/heads/main' && "
+                          "assertion.environment in ['production', 'production-kill-switch']")
 
 
 class Env:
@@ -51,6 +57,10 @@ class Env:
         ro = self.home / ".milo_ro_url"
         ro.write_text(RO_URL + "\n")
         ro.chmod(0o600)
+        # The existing deploy pool and provider (setup-wif.sh owns them).
+        self.state.write_text(json.dumps({
+            "pools": ["milo-github"],
+            "providers": {"github-actions": {"condition": PROVIDER_CONDITION}}}))
 
     def run(self, script: Path, *args: str) -> subprocess.CompletedProcess:
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "HOME": str(self.home),
@@ -107,13 +117,12 @@ def test_setup_backup_converges_least_privilege(env):
         "roles/storage.objectCreator": [writer], "roles/storage.objectViewer": [reader]}
     # No project-level role, for anyone.
     assert data["policies"].get("project", {"bindings": []})["bindings"] == []
-    # The dedicated pool admits only this repository, main, production-backup.
-    assert data["pools"] == ["milo-github-backup"]
-    condition = data["providers"]["github-backup"]["condition"]
-    assert condition == (f"assertion.repository == '{REPOSITORY}' && assertion.ref == 'refs/heads/main' "
-                         "&& assertion.environment == 'production-backup'")
+    # The existing pool and provider are READ, never created or changed.
+    assert data["pools"] == ["milo-github"]
+    assert data["providers"] == {"github-actions": {"condition": PROVIDER_CONDITION}}
+    assert not [m for m in env.mutations() if m[0] in ("create-pool", "create-oidc", "update-oidc")]
     principal = ("principalSet://iam.googleapis.com/projects/123456789/locations/global/"
-                 "workloadIdentityPools/milo-github-backup/attribute.environment/production-backup")
+                 "workloadIdentityPools/milo-github/attribute.environment/production-backup")
     for account in ("milo-backup-writer", "milo-backup-reader"):
         bindings = data["policies"][f"sa:{account}@{PROJECT}.iam.gserviceaccount.com"]["bindings"]
         assert bindings == [{"role": "roles/iam.workloadIdentityUser", "members": [principal]}]
@@ -131,11 +140,8 @@ def test_setup_backup_converges_least_privilege(env):
     assert environment["secrets"]["MILO_BACKUP_WRITER_SA"] == writer.split(":", 1)[1]
     assert environment["variables"] == {
         "MILO_BACKUP_BUCKET": f"{PROJECT}-milo-supabase-backups",
-        "MILO_BACKUP_PG_MAJOR": "17",
-        "MILO_BACKUP_WIF_PROVIDER": "projects/123456789/locations/global/workloadIdentityPools/"
-                                    "milo-github-backup/providers/github-backup"}
-    # The deploy pool is never touched.
-    assert "milo-github" not in data["pools"]
+        "MILO_BACKUP_PG_MAJOR": "17"}
+    # The deployer is never touched.
     assert not any("milo-github-deployer" in json.dumps(m) for m in env.mutations())
 
 
@@ -267,3 +273,60 @@ def test_a_missing_operator_configuration_is_a_fail_line(env, script):
     assert result.returncode == 2
     assert result.stdout.startswith("FAIL the operator configuration could not be loaded")
     assert env.mutations() == []
+
+
+def test_setup_sentry_disable_stores_disabled_and_keeps_the_binding_valid(env):
+    dsn_file = _dsn_file(env)
+    assert env.run(SETUP_SENTRY, "--dsn-file", str(dsn_file), "--no-github").returncode == 0
+    off = env.run(SETUP_SENTRY, "--disable", "--no-github")
+    assert off.returncode == 0, off.stdout
+    _only_pass_fail(off)
+    assert env.data()["secrets"]["SENTRY_DSN"] == [DSN, "disabled"]
+    again = env.run(SETUP_SENTRY, "--disable", "--no-github")
+    assert again.returncode == 0
+    assert env.data()["secrets"]["SENTRY_DSN"] == [DSN, "disabled"]
+
+
+
+def test_setup_backup_reports_drift_it_must_not_fix_silently(env):
+    assert env.run(SETUP_BACKUP, "--pg-major", "17").returncode == 0
+    data = env.data()
+    bucket = data["buckets"][f"gs://{PROJECT}-milo-supabase-backups"]
+    bucket["location"] = "EU"
+    bucket["retention_policy"]["isLocked"] = True
+    env.state.write_text(json.dumps(data))
+    count = len(data["mutations"])
+    result = env.run(SETUP_BACKUP, "--pg-major", "17")
+    assert result.returncode == 1
+    assert "(location retention-locked)" in result.stdout
+    # A wrong location or a locked policy is never "fixed" by recreating anything.
+    assert not [m for m in env.data()["mutations"][count:] if m[0].endswith("-bucket")]
+
+
+def test_setup_backup_refuses_until_setup_wif_admits_production_backup(env):
+    data = env.data()
+    data["providers"]["github-actions"]["condition"] = OLD_PROVIDER_CONDITION
+    env.state.write_text(json.dumps(data))
+    result = env.run(SETUP_BACKUP, "--pg-major", "17")
+    assert result.returncode == 1
+    assert ("FAIL provider github-actions does not admit production-backup: "
+            "run scripts/ops/setup-wif.sh --apply first") in result.stdout
+    # It never changes the provider itself.
+    assert env.data()["providers"]["github-actions"]["condition"] == OLD_PROVIDER_CONDITION
+    assert not [m for m in env.mutations() if m[0] in ("create-oidc", "update-oidc", "create-pool")]
+
+
+@pytest.mark.parametrize("condition", [
+    # repository or ref clause loosened: refused even though the env is listed
+    "assertion.ref == 'refs/heads/main' && assertion.environment in ['production-backup']",
+    f"assertion.repository == '{REPOSITORY}' && assertion.environment in ['production-backup']",
+    f"assertion.repository == '{REPOSITORY}' && assertion.ref == 'refs/heads/dev' && "
+    "assertion.environment in ['production-backup']",
+])
+def test_setup_backup_refuses_a_provider_that_does_not_pin_repository_and_main(env, condition):
+    data = env.data()
+    data["providers"]["github-actions"]["condition"] = condition
+    env.state.write_text(json.dumps(data))
+    result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
+    assert result.returncode == 1
+    assert "FAIL provider github-actions does not admit production-backup" in result.stdout

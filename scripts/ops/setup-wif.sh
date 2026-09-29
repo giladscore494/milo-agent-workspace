@@ -15,8 +15,10 @@
 #      Run, Cloud Build, Artifact Registry, Service Usage and Cloud Logging
 #      (where the builds log);
 #   2. a workload identity pool and a GitHub OIDC provider whose ATTRIBUTE
-#      CONDITION admits only this repository, on main, in the `production` or
-#      `production-kill-switch` GitHub environment -- a token from a fork, a
+#      CONDITION admits only this repository, on main, in the `production`,
+#      `production-kill-switch` or `production-backup` GitHub environment (an
+#      existing provider's condition is updated IN PLACE and read back on
+#      --apply) -- a token from a fork, a
 #      branch, a pull request or any other repository is refused by Google
 #      before any role is consulted;
 #   3. a deploy service account with the MINIMUM roles the deploy scripts use
@@ -46,7 +48,11 @@ GITHUB_REPOSITORY_NAME="${MILO_GITHUB_REPOSITORY:-giladscore494/milo-agent-works
 POOL_ID="milo-github"
 PROVIDER_ID="github-actions"
 DEPLOY_ACCOUNT_ID="milo-github-deployer"
-ALLOWED_ENVIRONMENTS=("production" "production-kill-switch")
+# production-backup (PR-OBS): the scheduled Supabase backup and its restore
+# test. It has no required reviewer (it runs on a schedule); its identities
+# (milo-backup-writer / milo-backup-reader, scripts/ops/setup-backup.sh) are
+# bound to this environment's principalSet only.
+ALLOWED_ENVIRONMENTS=("production" "production-kill-switch" "production-backup")
 
 usage() {
   cat << 'EOF'
@@ -208,6 +214,32 @@ elif [[ "$current_condition" != "$CONDITION" ]]; then
     gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" "${provider_args[@]}"
 else
   ok "provider ${PROVIDER_ID} admits only ${GITHUB_REPOSITORY_NAME}, main, ${ALLOWED_ENVIRONMENTS[*]}"
+fi
+# 2b. Read-back (--apply): the LIVE condition must still pin this repository
+#     and refs/heads/main, and admit every allowed environment. PASS only then.
+if [[ "$MODE" == "apply" ]]; then
+  readback="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+    --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+    --format='value(attributeCondition)' 2> /dev/null || true)"
+  if python3 -c '
+import re, sys
+condition, repository, allowed = sys.argv[1], sys.argv[2], sys.argv[3:]
+q = chr(39)
+clauses = [c.strip() for c in condition.split("&&")]
+envs = re.fullmatch(r"assertion\.environment in \[(.*)\]", clauses[-1] if clauses else "")
+listed = re.findall(q + "([^" + q + "]*)" + q, envs.group(1)) if envs else []
+sys.exit(0 if len(clauses) == 3
+         and clauses[0] == "assertion.repository == " + q + repository + q
+         and clauses[1] == "assertion.ref == " + q + "refs/heads/main" + q
+         and set(listed) == set(allowed) else 1)' \
+      "$readback" "$GITHUB_REPOSITORY_NAME" "${ALLOWED_ENVIRONMENTS[@]}"; then
+    printf 'PASS   provider %s condition read back: repository %s, ref refs/heads/main, environments %s\n' \
+      "$PROVIDER_ID" "$GITHUB_REPOSITORY_NAME" "$(IFS=,; printf '%s' "${ALLOWED_ENVIRONMENTS[*]}" | sed 's/,/, /g')"
+  else
+    printf 'FAIL   provider %s condition read back does not pin %s + refs/heads/main with exactly the environments %s\n' \
+      "$PROVIDER_ID" "$GITHUB_REPOSITORY_NAME" "${ALLOWED_ENVIRONMENTS[*]}" >&2
+    exit 1
+  fi
 fi
 
 # 3. The deploy service account and its minimum roles.
