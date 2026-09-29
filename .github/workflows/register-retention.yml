@@ -1,0 +1,134 @@
+name: Register retention
+
+# Register snapshot retention (scripts/ops/register-retention.sh, PR-D1 D1-5).
+# DRY-RUN FIRST: mode=dry-run (the default) is read-only and prints every
+# prunable register snapshot, its rows and estimated bytes, and the DIGEST of
+# that exact list. mode=apply prunes exactly the list that digest names, and
+# only with confirm=PRUNE; a list that changed since the dry-run refuses.
+# Always kept: per tozar the active snapshot and the one before it, and every
+# snapshot referenced by evidence, claims, runs, work-scope revisions or the
+# coverage ledger. Database rows only: no archive object is ever deleted.
+# Runs in the `production` environment, whose required reviewers approve each
+# dispatch before it starts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "dry-run lists and changes nothing; apply prunes exactly the dry-run's list"
+        required: true
+        default: dry-run
+        type: choice
+        options:
+          - dry-run
+          - apply
+      confirm:
+        description: "apply only: type PRUNE"
+        required: false
+        default: ""
+        type: string
+      digest:
+        description: "apply only: the 64-character DIGEST the dry-run printed"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  register-retention:
+    name: Register retention
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 90
+    steps:
+      - name: Refuse anything but main, an unconfirmed apply and a malformed digest
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          DIGEST_INPUT: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          case "${MODE_INPUT}" in
+            dry-run)
+              if [[ -n "${CONFIRM_INPUT}" || -n "${DIGEST_INPUT}" ]]; then
+                echo "confirm and digest belong to mode=apply; a dry-run takes neither."
+                exit 1
+              fi ;;
+            apply)
+              if [[ "${CONFIRM_INPUT}" != "PRUNE" ]]; then
+                echo "mode=apply needs confirm=PRUNE exactly."
+                exit 1
+              fi
+              if [[ ! "${DIGEST_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
+                echo "mode=apply needs the 64-character lowercase digest the dry-run printed."
+                exit 1
+              fi ;;
+            *) echo "mode must be dry-run or apply."; exit 1 ;;
+          esac
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: The checkout is still clean after authenticating
+        # google-github-actions/auth writes gha-creds-*.json into the workspace.
+        # It must be ignored (.gitignore, .dockerignore, .gcloudignore) so it
+        # is neither a local change nor uploaded by gcloud builds submit.
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [[ -n "${dirty}" ]]; then
+            echo "::error::The checkout changed while authenticating to Google Cloud. Only ignored files may appear (the auth step's gha-creds-*.json credentials file). Not ignored:"
+            printf '%s\n' "${dirty}"
+            exit 1
+          fi
+          if ! grep -qxF 'gha-creds-*.json' .gcloudignore; then
+            echo "::error::.gcloudignore does not exclude gha-creds-*.json: gcloud builds submit would upload the credentials file."
+            exit 1
+          fi
+          echo "Clean: the credentials file is ignored and nothing else changed."
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: PostgreSQL client
+        run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
+
+      - name: Register retention
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          DIGEST_INPUT: ${{ inputs.digest }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+        run: |
+          set -euo pipefail
+          if [[ "${MODE_INPUT}" == "apply" ]]; then
+            bash scripts/ops/register-retention.sh --apply --confirm "${CONFIRM_INPUT}" --digest "${DIGEST_INPUT}"
+          else
+            bash scripts/ops/register-retention.sh --list
+          fi

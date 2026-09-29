@@ -1069,3 +1069,23 @@ class WorkScopeControlResult(BaseModel):
     changed: bool
     paused: bool
     progress: WorkScopeProgress
+
+
+# --- PR-D1: register capture (backend/catalog/register/service.py) ----------
+
+class RegisterCaptureRequest(BaseModel):
+    """Capture these exact tozar values of this exact directory version."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    register_version: str = Field(pattern=r"^[0-9a-f]{64}$")
+    tozars: list[str] = Field(min_length=1, max_length=1000)
+    conversation_id: UUID
+
+
+class RegisterDirectoryRequest(BaseModel):
+    """Refresh the register directory (metadata reads only)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: UUID

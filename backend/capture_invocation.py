@@ -56,6 +56,10 @@ SCHEMA_REPORT_ACKNOWLEDGEMENT = "I ACKNOWLEDGE OPERATOR-0 SCHEMA REPORT REVIEWED
 #: ONE override below turns it on for one execution.
 PREPARATION_SWITCH = "MILO_ENABLE_WORK_SCOPE_PREPARATION"
 PREPARATION_SWITCH_ON = "true"
+#: PR-D1: the per-execution switch of the register modes (directory refresh
+#: and group capture). Set ONLY by these invocations, like the one above.
+REGISTER_SWITCH = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
+REGISTER_SWITCH_ON = "true"
 
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _REVISION = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -126,6 +130,22 @@ def work_scope_preparation(*, project_ref: str, run_id: str, work_scope_id: str,
                          "--work-scope-revision", _checked(_REVISION, revision, "revision"),
                          "--work-scope-digest", _checked(_DIGEST, digest, "digest")),
         env_overrides=((PREPARATION_SWITCH, PREPARATION_SWITCH_ON),))
+
+
+def register_capture(*, project_ref: str, run_id: str, group_id: str) -> Invocation:
+    """PR-D1: the ONE execution that captures one register capture group."""
+    return Invocation(
+        entrypoint_args=(*capture_arguments(project_ref=project_ref, run_id=run_id),
+                         "--register-group-id", _checked(_UUID, group_id, "register group id")),
+        env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
+
+
+def register_directory(*, project_ref: str, run_id: str) -> Invocation:
+    """PR-D1: the ONE execution that refreshes the register directory."""
+    return Invocation(
+        entrypoint_args=(*capture_arguments(project_ref=project_ref, run_id=run_id),
+                         "--register-directory"),
+        env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
 
 
 def main(argv: list[str] | None = None) -> int:

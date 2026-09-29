@@ -94,7 +94,8 @@ class FixtureTransport:
     Every failure mode a test needs is a constructor argument rather than a
     subclass, so a test reads as one statement about one condition:
 
-    *   `bodies` replaces the body served for one offset (or `"package"`),
+    *   `bodies` replaces the body served for one offset (or `"package"`, or
+        `"count"` for a ``limit=0`` count request),
         which is how a missing, short, reordered, duplicated or inconsistent
         page is expressed;
     *   `statuses` is consumed one entry per request and returned INSTEAD of
@@ -141,11 +142,23 @@ class FixtureTransport:
                                 content_type=self._content_type, final_url=final)
         if action == src.PACKAGE_SHOW:
             body = self._bodies.get("package", package_body())
+        elif str(params.get("limit")) == "0":
+            # A count request (the register directory's and register
+            # capture's fresh count): `bodies["count"]`, else the offset-0
+            # page's own total and filters with no records.
+            body = self._bodies.get("count") or _count_body(self._bodies.get(0, _default_page_body(0)))
         else:
             offset = int(params["offset"])
             body = self._bodies.get(offset, _default_page_body(offset))
         return HttpResponse(status=200, body=body, content_type=self._content_type,
                             final_url=final, truncated=self._truncated)
+
+
+def _count_body(page: bytes) -> bytes:
+    document = json.loads(page)
+    document["result"]["limit"], document["result"]["records"] = 0, []
+    document["result"].pop("offset", None)
+    return encode(document)
 
 
 def _default_page_body(offset: int) -> bytes:

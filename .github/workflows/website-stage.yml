@@ -8,6 +8,11 @@ name: Website stage
 #                    --ensure-job --enable-catalog-execution, then
 #                    website-execution-activate.sh --apply-web-preparation
 #   both             the two above, in that order
+#   register-capture PR-D1, the Register page: government-production-capture.sh
+#                    --ensure-job --enable-catalog-execution, then
+#                    website-execution-activate.sh --apply-register-capture
+#                    (refused until scripts/ops/setup-register-archive.sh ran)
+#   all              both, then register-capture (the capture job ensured once)
 # Each canonical tool runs behind its own deployed gate, from the DEPLOYED
 # release (both act on `git rev-parse HEAD`): the sha input, or, left empty,
 # the release the API and the worker run. It never touches Stage 2 -- run
@@ -26,6 +31,8 @@ on:
           - both
           - plan-authoring
           - web-preparation
+          - register-capture
+          - all
       sha:
         description: "The deployed release SHA (empty: the release production runs)"
         required: false
@@ -63,8 +70,8 @@ jobs:
             exit 1
           fi
           case "${STAGE_INPUT}" in
-            plan-authoring | web-preparation | both) ;;
-            *) echo "stage must be plan-authoring, web-preparation or both."; exit 1 ;;
+            plan-authoring | web-preparation | both | register-capture | all) ;;
+            *) echo "stage must be plan-authoring, web-preparation, both, register-capture or all."; exit 1 ;;
           esac
           if [[ -n "${SHA_INPUT}" && ! "${SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "sha must be empty or exactly 40 lowercase hexadecimal characters."

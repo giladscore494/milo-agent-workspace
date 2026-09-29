@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
+from backend.testing.register_memory import RegisterMemoryMixin
 from backend.catalog import coverage as catalog_coverage
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
                                        CANONICAL_DIMENSION_PREFIX,
@@ -131,7 +132,7 @@ def _support_set(support: Any) -> frozenset[tuple[str, Any, Any]]:
                      for link in (support or []) if isinstance(link, Mapping))
 
 
-class MemoryRepository:
+class MemoryRepository(RegisterMemoryMixin):
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.users: set[str] = set()

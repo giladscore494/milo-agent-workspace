@@ -119,6 +119,15 @@ const SAFE_RULES: GatewayRule[] = [
     method: 'GET',
     path: new RegExp(`^/work-scopes/${UUID}/preparation$`, 'i'),
   },
+  /**
+   * PR-D1: the Register page -- the register directory, each tozar's capture
+   * state and the capacity bar. A membership-gated READ, GET only, answered
+   * 404 while register capture is off; the two writes are execution rules.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/register$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [
@@ -147,6 +156,10 @@ const EXECUTION_RULES: GatewayRule[] = [
   // that revision; it starts no run, so it is NOT a run-start rule. The
   // backend gates it again (MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS).
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/preparations$`, 'i') },
+  // PR-D1: capture register tozars, and refresh the register directory. The
+  // API executes the capture job; nothing starts a run, so neither is a
+  // run-start rule. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE).
+  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory)$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [

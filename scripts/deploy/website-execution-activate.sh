@@ -24,6 +24,15 @@
 #                           anything -- each read back). Starts nothing,
 #                           creates no product run and enables no paid
 #                           execution or promotion.
+#   --apply-register-capture PR-D1. The website's Register page: the API may
+#                           execute the EXISTING capture job with the register
+#                           switch for one directory refresh or one capture
+#                           group (MILO_REGISTER_CAPTURE_API_ENABLE_FLAGS and
+#                           CLOUD_RUN_CAPTURE_JOB on the API; the same job
+#                           bindings as E', read back). Needs no run creation,
+#                           no run-start gateway flag and no Arm: capture is
+#                           $0 and not a run. Refused until the register
+#                           archive bucket is set up (setup-register-archive.sh).
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -85,7 +94,7 @@ WS_ARGS=()
 
 usage() {
   cat << 'EOF'
-Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-backend] [options]
+Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-backend] [options]
 
 Default --plan changes nothing and prints both stages.
 
@@ -101,6 +110,13 @@ Modes:
                           on the capture and worker jobs only (read back).
                           Gate: production-verify.sh --gate deployed, and the
                           capture job on the release image.
+  --apply-register-capture PR-D1: the website's Register page (API only) and
+                          the same capture-job bindings as E'. Gate:
+                          production-verify.sh --gate deployed, the capture
+                          job on the release image, and the register archive
+                          (setup-register-archive.sh --check PASS, or
+                          PARTIAL -- the bucket's posture verified, its IAM
+                          left to the operator's Cloud Shell check -- WARN).
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
                           production-verify.sh --gate prepared for the named
                           plan revision. The Vercel half is printed, never
@@ -126,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --apply-runtime-policy) MODE="apply-runtime-policy"; shift ;;
     --apply-plan-authoring) MODE="apply-plan-authoring"; shift ;;
     --apply-web-preparation) MODE="apply-web-preparation"; shift ;;
+    --apply-register-capture) MODE="apply-register-capture"; shift ;;
     --apply-backend) MODE="apply-backend"; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
@@ -226,6 +243,10 @@ API_SA="$(milo_op API_SERVICE_ACCOUNT)"
 WEB_PREP_API_VARS="$(pairs "$ENABLED" "${MILO_WEB_PREPARATION_API_ENABLE_FLAGS[@]}")"
 WEB_PREP_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB}"
 
+# PR-D1: the website's Register page on the API, and the capture job it executes.
+REGISTER_API_VARS="$(pairs "$ENABLED" "${MILO_REGISTER_CAPTURE_API_ENABLE_FLAGS[@]}")"
+REGISTER_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB}"
+
 # Stage 2.
 S2_API_VARS="$(pairs "$ENABLED" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}")"
 S2_API_VARS+="${MILO_ENV_VAR_DELIMITER}$(pairs "$DISABLED" "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}")"
@@ -284,6 +305,29 @@ gcloud run jobs add-iam-policy-binding ${WORKER_JOB} \\
 gcloud run services update ${API_SERVICE} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${WEB_PREP_API_VARS}'
+EOC
+}
+
+print_register_capture_commands() {
+  cat << EOC
+# --- PR-D1, capture job + both jobs: the same bindings as E' (run THIS job
+# with overrides; read the capture and worker jobs), each only when absent.
+# <API_SERVICE_ACCOUNT> is the operator configuration's key: no address is
+# printed.
+gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role roles/run.jobsExecutorWithOverrides
+gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role ${MILO_API_JOB_READ_ROLE}
+gcloud run jobs add-iam-policy-binding ${WORKER_JOB} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role ${MILO_API_JOB_READ_ROLE}
+# --- PR-D1, API only: the Register page and the job it executes. Run
+# creation, batches, paid execution and promotion stay exactly as they are.
+gcloud run services update ${API_SERVICE} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${REGISTER_API_VARS}'
 EOC
 }
 
@@ -480,6 +524,8 @@ if [[ "$MODE" == "plan" ]]; then
   print_frontend_commands
   printf '\n== The last step: open run starts (Vercel), only after --gate armed passes ==\n'
   print_run_start_commands
+  printf '\n== PR-D1 — register capture from the website (Cloud Run API + capture job IAM) ==\n'
+  print_register_capture_commands
   printf '\nPLAN ONLY — nothing was changed.\n'
   exit 0
 fi
@@ -585,6 +631,72 @@ if [[ "$MODE" == "apply-web-preparation" ]]; then
   fi
   printf '\nPreparing from the website is enabled and read back. Nothing was prepared,\n'
   printf 'no run was started and no provider call was made.\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --apply-register-capture (PR-D1)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "apply-register-capture" ]]; then
+  if [[ -z "$CAPTURE_JOB" || -z "$API_SA" ]]; then
+    printf 'FAIL: --apply-register-capture needs CLOUD_RUN_CAPTURE_JOB and API_SERVICE_ACCOUNT in %s.\n' "$CONFIG_PATH" >&2
+    exit 2
+  fi
+  printf '== Gate: the release is deployed and the database carries the exact migration set ==\n'
+  if ! bash "${SCRIPT_DIR}/production-verify.sh" --operator-config "$CONFIG_PATH" --gate deployed; then
+    printf '\nFAIL: the deployed gate did not pass; nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Gate: the register archive bucket and the capture identity'"'"'s grant ==\n'
+  archive_state="$(bash "${REPO_ROOT}/scripts/ops/setup-register-archive.sh" --check \
+    --operator-config "$CONFIG_PATH" 2> /dev/null || printf 'UNREADABLE the check did not run')"
+  printf '%s\n' "$archive_state"
+  if [[ "$archive_state" == PARTIAL\ * ]]; then
+    # The deployer reads the bucket (describe) but holds no IAM read on the
+    # bucket or the project, by design: the capture grant and the absence of
+    # a delete-capable role are the operator's to verify in Cloud Shell.
+    printf 'WARN: the bucket posture is verified; its IAM is not readable by this identity.\n'
+    printf '      Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check (expect PASS).\n'
+  elif [[ "$archive_state" != PASS\ * ]]; then
+    printf '\nFAIL: the register archive is not set up (above). Every capture would refuse\n' >&2
+    printf '      CATALOG_ARCHIVE_NOT_CONFIGURED. Run scripts/ops/setup-register-archive.sh --apply,\n' >&2
+    printf '      then government-production-capture.sh --ensure-job. Nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Gate: the capture job runs the deployed release image ==\n'
+  worker_image="$(gcloud run jobs describe "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(spec.template.spec.template.spec.containers[0].image)' 2> /dev/null || true)"
+  capture_image="$(gcloud run jobs describe "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(spec.template.spec.template.spec.containers[0].image)' 2> /dev/null || true)"
+  printf 'worker job:  %s\ncapture job: %s\n' "${worker_image:-<unreadable>}" "${capture_image:-<missing>}"
+  if [[ -z "$worker_image" || "$capture_image" != "$worker_image" ]]; then
+    printf '\nFAIL: the capture job does not run the release image the worker runs. Ensure it\n' >&2
+    printf '      first (government-production-capture.sh --ensure-job --enable-catalog-execution).\n' >&2
+    printf '      Nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Applying register capture (capture job IAM, then the API) ==\n'
+  print_register_capture_commands
+  # ensure_job_binding's own lines name the member: not shown here.
+  if ! ensure_job_binding "$CAPTURE_JOB" roles/run.jobsExecutorWithOverrides "serviceAccount:${API_SA}" > /dev/null \
+     || ! ensure_job_binding "$CAPTURE_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" > /dev/null \
+     || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" > /dev/null; then
+    printf 'FAIL: the API identity cannot run and read the jobs (above); the API was NOT changed.\n' >&2
+    exit 1
+  fi
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${REGISTER_API_VARS}" > /dev/null
+  printf 'The API identity runs and reads the capture job (read back); the API carries the register flag.\n'
+  split_pairs "$REGISTER_API_VARS"
+  # Paid execution stays OFF on the API, and the job's register switch is
+  # never the API's: the API only EXECUTES the capture job.
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
+       "${MILO_REGISTER_CAPTURE_JOB_FLAG_NAME}=${DISABLED}"; then
+    printf 'FAIL: the API does not carry the register capture posture (above).\n' >&2
+    exit 1
+  fi
+  printf '\nRegister capture from the website is enabled and read back. Nothing was\n'
+  printf 'captured, no run was started and no provider call was made.\n'
   exit 0
 fi
 

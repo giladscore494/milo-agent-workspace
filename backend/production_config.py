@@ -187,6 +187,15 @@ EXECUTION_FLAGS = (
     # run and no model call; pinned off here like every other stage flag, and
     # turned on only by `website-execution-activate.sh --apply-web-preparation`.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
+    # API-only (PR-D1): the Register page and its Capture / directory-refresh
+    # writes, which execute the EXISTING capture job. $0 and not a run; pinned
+    # off here like every other stage flag, turned on only by
+    # `website-execution-activate.sh --apply-register-capture`.
+    "MILO_ENABLE_REGISTER_CAPTURE",
+    # Capture-job only (PR-D1): the register modes of the capture entrypoint.
+    # The job definition pins it false; the API's invocation turns it on for
+    # ONE execution (backend/capture_invocation.py REGISTER_SWITCH).
+    "MILO_ENABLE_REGISTER_CAPTURE_JOB",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

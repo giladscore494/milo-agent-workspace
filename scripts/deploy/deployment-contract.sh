@@ -44,6 +44,8 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_BATCHES=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=false
+  MILO_ENABLE_REGISTER_CAPTURE=false
+  MILO_ENABLE_REGISTER_CAPTURE_JOB=false
 )
 
 # PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
@@ -431,6 +433,7 @@ MILO_CAPTURE_PINNED_OFF_FLAGS=(
   MILO_ENABLE_RUN_CREATION=false
   MILO_ENABLE_EXECUTION_CONTROL=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
+  MILO_ENABLE_REGISTER_CAPTURE_JOB=false
 )
 
 # Scoped catalog PR2: the scoped-preparation switch, BY NAME ONLY. The job
@@ -486,6 +489,18 @@ MILO_PLAN_AUTHORING_API_ENABLE_FLAGS=(
 MILO_WEB_PREPARATION_API_ENABLE_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS
 )
+
+# PR-D1 — register capture from the website. API only: the Register page and
+# its Capture / directory-refresh writes, which execute the EXISTING capture
+# job with the register switch (MILO_ENABLE_REGISTER_CAPTURE_JOB) on for that
+# one execution; the API never carries the job's switch. $0 and not a run: it
+# needs no run creation, no run-start gateway flag and no Arm. Applied by
+# website-execution-activate.sh --apply-register-capture (website-stage.sh
+# --stage register-capture), closed by the kill switch like every opened flag.
+MILO_REGISTER_CAPTURE_API_ENABLE_FLAGS=(
+  MILO_ENABLE_REGISTER_CAPTURE
+)
+MILO_REGISTER_CAPTURE_JOB_FLAG_NAME="MILO_ENABLE_REGISTER_CAPTURE_JOB"
 
 # Stage 2 (website execution), API service.
 #

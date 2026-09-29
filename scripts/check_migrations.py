@@ -220,6 +220,22 @@ REQUIRED_PER_FILE["20260928000100_catalog_work_scope_preparation_requests.sql"] 
     "coalesce(v_run.run_identity->>'workflow_key', '') <> 'operator_capture'",
     "revoke delete on table public.catalog_work_scope_preparation_requests from service_role",
 ]
+REQUIRED_PER_FILE["20260929000100_catalog_register_capture.sql"] = [
+    # PR-D1: register capture is service-path only (RLS, no policies), its
+    # directory and archives are append-only, the capacity guard refuses with
+    # its numbers before anything is written, the prune refuses any list but
+    # the one its digest names, and the read-only role is granted explicitly.
+    "enable row level security",
+    "create table if not exists public.catalog_register_capture_units (",
+    "create unique index if not exists catalog_register_capture_units_version_tozar_uidx",
+    "forbid_catalog_register_rewrite",
+    "raise exception 'catalog_capacity_threshold_exceeded: current=% projected=% limit=%'",
+    "raise exception 'catalog_prune_digest_mismatch",
+    "lock table public.catalog_source_snapshots, public.catalog_raw_records,",
+    "revoke delete, truncate on table %s from service_role",
+    "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
+    "execute format('grant execute on function %s to %i', fn, ro.rolname);",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

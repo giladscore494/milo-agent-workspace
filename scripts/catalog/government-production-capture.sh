@@ -209,6 +209,11 @@ build_env_args() {
     "${MILO_CAPTURE_MASTER_FLAG_NAME}=${CATALOG_EXECUTION_VALUE:-false}"
   )
   pairs+=("${MILO_CAPTURE_PINNED_OFF_FLAGS[@]}" "${MILO_REPLAY_CAPTURE_PINNED_OFF[@]}")
+  # PR-D1: the register archive bucket (a name, not a secret). Absent, every
+  # register capture refuses CATALOG_ARCHIVE_NOT_CONFIGURED.
+  local archive_bucket
+  archive_bucket="$(milo_op REGISTER_ARCHIVE_BUCKET)"
+  [[ -z "$archive_bucket" ]] || pairs+=("MILO_REGISTER_ARCHIVE_BUCKET=${archive_bucket}")
   local joined
   joined="$(IFS="$MILO_ENV_VAR_DELIMITER"; printf '%s' "${pairs[*]}")"
   printf '^%s^%s' "$MILO_ENV_VAR_DELIMITER" "$joined"

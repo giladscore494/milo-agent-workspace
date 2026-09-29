@@ -174,6 +174,13 @@ UNFENCED_BY_DESIGN = {
     # the request's row lock, and it can bind only an operator capture run of
     # the plan's own conversation.
     "record_work_scope_preparation_trigger",
+    # PR-D1: the register capture group's trigger record is the same API-side
+    # compare-and-set as E''s, written before any capture claims the run.
+    "record_register_capture_trigger",
+    # PR-D1: a register directory version is REGISTER metadata, not run
+    # state: append-only, derived from its own content (register_version) and
+    # idempotent -- a replaced worker could only record what the register says.
+    "record_register_directory",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

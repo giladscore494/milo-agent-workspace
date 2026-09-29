@@ -43,6 +43,10 @@ EXECUTION_FLAGS = [
     # E': the website's Prepare route (executes the capture job once for one
     # plan revision). Never a default; one explicit activation step turns it on.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
+    # PR-D1: register capture from the website (API), and the capture job's
+    # per-execution register switch. Never a default.
+    "MILO_ENABLE_REGISTER_CAPTURE",
+    "MILO_ENABLE_REGISTER_CAPTURE_JOB",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "GATEWAY_ALLOW_RUN_START_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",

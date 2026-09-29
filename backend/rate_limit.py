@@ -6,7 +6,9 @@ and per-user before requests reach this service):
 - ``run_creation_user``   run creation per authenticated user;
 - ``run_creation_project`` run creation per project;
 - ``cancellation``        cancellation requests per user;
-- ``worker_mutations``    internal worker mutation routes per service identity.
+- ``worker_mutations``    internal worker mutation routes per service identity;
+- ``register_actions_user`` register capture / directory refresh per user (PR-D1:
+  $0 capture-job executions, never run creation).
 
 Production must use the shared Upstash Redis store
 (``UPSTASH_REDIS_REST_URL`` / ``UPSTASH_REDIS_REST_TOKEN``). When the store
@@ -31,6 +33,7 @@ DEFAULT_LIMITS: dict[str, tuple[int, int]] = {
     "run_creation_project": (20, 60),
     "cancellation": (10, 60),
     "worker_mutations": (600, 60),
+    "register_actions_user": (10, 60),
 }
 
 ENV_KEYS: dict[str, str] = {
@@ -38,6 +41,7 @@ ENV_KEYS: dict[str, str] = {
     "run_creation_project": "MILO_RATE_LIMIT_RUN_CREATION_PROJECT",
     "cancellation": "MILO_RATE_LIMIT_CANCELLATION",
     "worker_mutations": "MILO_RATE_LIMIT_WORKER_MUTATIONS",
+    "register_actions_user": "MILO_RATE_LIMIT_REGISTER_ACTIONS_USER",
 }
 
 

@@ -86,6 +86,7 @@ INVENTORY=(
   "MILO_RATE_LIMIT_RUN_CREATION_USER|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_RUN_CREATION_PROJECT|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_CANCELLATION|cloud-run-api-only|no|backend/rate_limit.py"
+  "MILO_RATE_LIMIT_REGISTER_ACTIONS_USER|cloud-run-api-only|no|backend/rate_limit.py"
   "MILO_RATE_LIMIT_WORKER_MUTATIONS|cloud-run-api-only|no|backend/rate_limit.py"
   "UPSTASH_REDIS_REST_URL|shared-api-worker|no|backend/rate_limit.py"
   "UPSTASH_REDIS_REST_TOKEN|shared-api-worker|yes|backend/rate_limit.py"
@@ -101,6 +102,17 @@ INVENTORY=(
   "MILO_ENABLE_CATALOG_EXECUTION|cloud-run-worker-only|no|backend/catalog/execution.py"
   # Capture job only (worker image): preparing a Mapping Plan revision.
   "MILO_ENABLE_WORK_SCOPE_PREPARATION|cloud-run-worker-only|no|backend/catalog/operator_capture.py"
+  # PR-D1 register capture: the Register page (API), the capture job's
+  # per-execution switch, the capacity guard (API) and the job's archive.
+  "MILO_ENABLE_REGISTER_CAPTURE|cloud-run-api-only|no|backend/catalog/register/service.py"
+  "MILO_ENABLE_REGISTER_CAPTURE_JOB|cloud-run-worker-only|no|backend/catalog/operator_capture.py"
+  "MILO_DB_CAPACITY_BYTES|cloud-run-api-only|no|backend/catalog/register/config.py"
+  "MILO_DB_CAPACITY_THRESHOLD|cloud-run-api-only|no|backend/catalog/register/config.py"
+  "MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE|cloud-run-api-only|no|backend/catalog/register/config.py"
+  "MILO_REGISTER_GROUP_MAX_ROWS|cloud-run-api-only|no|backend/catalog/register/config.py"
+  "MILO_REGISTER_ARCHIVE_BUCKET|cloud-run-worker-only|no|backend/catalog/register/config.py"
+  "MILO_REGISTER_DIRECTORY_MAX_REQUESTS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
+  "MILO_REGISTER_DIRECTORY_MAX_SECONDS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
   "MILO_DAILY_USER_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
   "MILO_DAILY_PROJECT_BUDGET|shared-api-worker|no|backend/runtime_policy.py"
   "MILO_MAX_COST_PER_RUN|shared-api-worker|no|backend/runtime_policy.py"
@@ -193,6 +205,8 @@ EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_MUTATIONS
   MILO_ENABLE_WORK_SCOPE_BATCHES
   MILO_ENABLE_WORK_SCOPE_PREPARATION
+  MILO_ENABLE_REGISTER_CAPTURE
+  MILO_ENABLE_REGISTER_CAPTURE_JOB
   GATEWAY_ALLOW_EXECUTION_ROUTES
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )
