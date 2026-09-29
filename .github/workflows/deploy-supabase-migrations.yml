@@ -54,7 +54,7 @@ jobs:
         before deciding whether a one-time migration history reconciliation is required.
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       # The manual authorization gate. It runs FIRST -- before the Supabase CLI
       # exists, before any production credential is present in ANY step

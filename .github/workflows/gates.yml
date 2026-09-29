@@ -59,7 +59,7 @@ jobs:
           fi
 
       - name: Check out main
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 

@@ -59,7 +59,7 @@ jobs:
     steps:
       # Checkout first (no secret is involved) so the failure report below
       # exists even when the main-only guard refuses.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 
@@ -163,7 +163,7 @@ jobs:
     steps:
       # Checkout first (no secret is involved) so the failure report below
       # exists even when the main-only guard refuses.
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
 

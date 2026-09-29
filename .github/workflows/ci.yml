@@ -29,7 +29,7 @@ jobs:
       JOB_LAUNCHER: disabled
       MILO_REQUIRE_PG_TESTS: '1'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # Full history (the repository is a few MB): the Stage D release
           # binding tests compare against a pinned release commit and walk
@@ -88,7 +88,7 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
@@ -131,7 +131,7 @@ jobs:
       JOB_LAUNCHER: disabled
       MILO_REQUIRE_PG_TESTS: '1'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -164,7 +164,7 @@ jobs:
       SUPABASE_SERVICE_ROLE_KEY: offline-placeholder
       JOB_LAUNCHER: disabled
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
