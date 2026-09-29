@@ -305,6 +305,9 @@ class RegisterMemoryMixin:
             if unit["status"] == "captured" and unit.get("snapshot_id"):
                 latest_unit[unit["tozar"]] = unit
         referenced_ids |= {str(u["snapshot_id"]) for u in latest_unit.values()}
+        # PR-L1: a snapshot with variant rows or a variant build is kept.
+        builds = (getattr(self, "_variants", None) or {}).get("builds") or {}
+        referenced_ids |= {str(snapshot_id) for snapshot_id, _mapper in builds}
         rows = retention.prunable(self.catalog_snapshots.values(), referenced_ids=referenced_ids,
                                   referenced_keys=referenced_keys, live_run_ids=live)
         return [{"snapshot_id": str(r["id"]), "snapshot_key": r["snapshot_key"],

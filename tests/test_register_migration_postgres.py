@@ -92,12 +92,16 @@ def regdb():
         server.psql(f"create role {RO_ROLE} login bypassrls; grant pg_read_all_data to {RO_ROLE}; "
                     f"create role {OTHER_READER} login bypassrls; grant pg_read_all_data to {OTHER_READER}; "
                     f"create role {NOT_A_READER} login bypassrls")
-        before = [m for m in MIGRATIONS if m != _register_migration()]
-        assert len(before) == 45 and MIGRATIONS[-1] == _register_migration()
+        position = MIGRATIONS.index(_register_migration())
+        before, after = MIGRATIONS[:position], MIGRATIONS[position + 1:]
+        assert len(before) == 45
         for migration in before:
             server.psql(file=migration)
         assert server.psql("select to_regclass('public.catalog_register_capture_units') is null") == "t"
         server.psql(file=_register_migration())
+        # Later migrations (PR-L1's variants) apply on top, as in production.
+        for migration in after:
+            server.psql(file=migration)
         yield server
     finally:
         server.stop()

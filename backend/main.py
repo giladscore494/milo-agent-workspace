@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi import Depends, FastAPI, Path, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -13,6 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
+from backend.catalog.register import browser as catalog_browser
 from backend.catalog.register import service as register_service
 from backend.catalog.scope import batches as work_scope_batches
 from backend.catalog.scope import service as work_scopes
@@ -818,6 +819,15 @@ def request_register_directory(project_id: UUID, request: RegisterDirectoryReque
     # One refresh at a time: a refresh already in flight answers 200 with its ids.
     response.status_code = 202 if answer["started"] else 200
     return answer
+
+
+# PR-L1 (D2): the read-only discovery tree over the deterministic catalog
+# variants -- manufacturers, models, years, variants (paged in the database)
+# and the filter facets. GET only. Flag MILO_ENABLE_CATALOG_BROWSER off (the
+# default; every deploy pins it off): 404, the surface does not exist.
+@app.get("/projects/{project_id}/catalog/browser/{level}")
+def get_catalog_browser(project_id: UUID, request: Request, level: str = Path(pattern=r"^(manufacturers|models|years|variants|facets)$"), user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    return catalog_browser.browse(repo, user.user_id, project_id, level, request.query_params)
 
 
 @app.post("/work-scopes/{work_scope_id}/pause", response_model=WorkScopeControlResult)

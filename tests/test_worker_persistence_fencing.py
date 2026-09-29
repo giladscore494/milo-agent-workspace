@@ -181,6 +181,12 @@ UNFENCED_BY_DESIGN = {
     # state: append-only, derived from its own content (register_version) and
     # idempotent -- a replaced worker could only record what the register says.
     "record_register_directory",
+    # PR-L1: catalog variants are DERIVED, not run state: a deterministic,
+    # append-only mapping of an already active snapshot, idempotent per
+    # (snapshot, record, mapper version), with every provenance fact computed
+    # in the database. The operator backfill runs with no run at all, so there
+    # is no lease to present; a replaced worker could only write the same rows.
+    "record_catalog_variants",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

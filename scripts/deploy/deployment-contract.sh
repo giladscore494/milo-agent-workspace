@@ -46,6 +46,7 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS=false
   MILO_ENABLE_REGISTER_CAPTURE=false
   MILO_ENABLE_REGISTER_CAPTURE_JOB=false
+  MILO_ENABLE_CATALOG_BROWSER=false
 )
 
 # PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
@@ -501,6 +502,15 @@ MILO_REGISTER_CAPTURE_API_ENABLE_FLAGS=(
   MILO_ENABLE_REGISTER_CAPTURE
 )
 MILO_REGISTER_CAPTURE_JOB_FLAG_NAME="MILO_ENABLE_REGISTER_CAPTURE_JOB"
+
+# PR-L1 — the read-only catalog browser (the discovery tree over the
+# deterministic catalog variants). API only, GET only, $0: no run, no capture
+# job, no model. Applied by website-execution-activate.sh
+# --apply-catalog-browser (website-stage.sh --stage catalog-browser), closed
+# by the kill switch like every opened flag.
+MILO_CATALOG_BROWSER_API_ENABLE_FLAGS=(
+  MILO_ENABLE_CATALOG_BROWSER
+)
 
 # Stage 2 (website execution), API service.
 #

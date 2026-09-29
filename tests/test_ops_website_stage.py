@@ -39,7 +39,8 @@ from tests.test_ops_workflows import (
 )
 
 STAGES = ("plan-authoring", "web-preparation", "both")
-RESTORE_VALUES = ("none", "plan-authoring", "web-preparation", "both", "register-capture", "all")
+RESTORE_VALUES = ("none", "plan-authoring", "web-preparation", "both", "register-capture", "catalog-browser",
+                  "all")
 BUCKET_LINE = "REGISTER_ARCHIVE_BUCKET=test-project-milo-register-archive\n"
 STAGE2_MARKERS = ("--apply-backend", "--apply-runtime-policy", "--update-secrets", "KIMI_API_KEY=",
                   "MILO_ENABLE_PAID_EXECUTION=true", "MILO_ENABLE_RUN_CREATION=true", "arm.sh")
@@ -60,16 +61,17 @@ def assert_no_stage2(text: str) -> None:
 # 1. the workflows
 # =============================================================================
 
-def test_website_stage_workflow_offers_exactly_the_five_stages_and_validates_them():
+def test_website_stage_workflow_offers_exactly_the_six_stages_and_validates_them():
     doc = workflow("website-stage.yml")
     inputs = triggers(doc)["workflow_dispatch"]["inputs"]
     assert inputs["stage"]["type"] == "choice"
-    assert inputs["stage"]["options"] == ["both", "plan-authoring", "web-preparation", "register-capture", "all"]
+    assert inputs["stage"]["options"] == ["both", "plan-authoring", "web-preparation", "register-capture",
+                                         "catalog-browser", "all"]
     assert inputs["dry_run"]["type"] == "boolean" and inputs["dry_run"]["default"] is False
     assert inputs["sha"]["required"] is False
     first = steps(doc)[0]
     assert first["env"]["STAGE_INPUT"] == "${{ inputs.stage }}"
-    assert "plan-authoring | web-preparation | both | register-capture | all) ;;" in first["run"]
+    assert "plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;" in first["run"]
     assert "refs/heads/main" in first["run"] and "^[0-9a-f]{40}$" in first["run"]
     assert doc["concurrency"] == {"group": "milo-production-operations", "cancel-in-progress": False}
     (job,) = doc["jobs"].values()
@@ -147,12 +149,13 @@ def test_website_stage_refuses_an_unknown_stage(tmp_path, bad):
     tree = OpsTree(tmp_path)
     result = tree.run("website-stage.sh", "--stage", bad, "--dry-run")
     assert result.returncode == 2
-    assert "--stage must be plan-authoring, web-preparation, both, register-capture, all or none" in result.stderr
+    assert ("--stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, all or none"
+            in result.stderr)
     assert tree.tool_calls() == []
     assert tree.run("website-stage.sh", "--dry-run").returncode == 2
 
 
-def test_website_stage_all_is_both_then_the_register_page_with_one_capture_job_ensure(tmp_path):
+def test_website_stage_all_is_both_then_the_register_page_then_the_catalog_browser(tmp_path):
     tree = OpsTree(tmp_path)
     assert tree.run("website-stage.sh", "--stage", "all", "--dry-run").returncode == 2, \
         "all ran without the register archive bucket"
@@ -162,10 +165,10 @@ def test_website_stage_all_is_both_then_the_register_page_with_one_capture_job_e
     assert tree.tool_calls() == []
     plan = [line for line in result.stdout.splitlines() if line.startswith("DRY-RUN:")]
     needles = ["--apply-plan-authoring", "--ensure-job --enable-catalog-execution", "--apply-web-preparation",
-               "--apply-register-capture"]
+               "--apply-register-capture", "--apply-catalog-browser"]
     assert len(plan) == len(needles) and all(n in line for line, n in zip(plan, needles))
     assert re.findall(r"^SUMMARY\|([^|]+)\|DRY-RUN\|", result.stdout, re.M) == [
-        "1 plan-authoring", "2 capture-job", "3 web-preparation", "4 register-capture"]
+        "1 plan-authoring", "2 capture-job", "3 web-preparation", "4 register-capture", "5 catalog-browser"]
     assert_no_stage2(result.stdout + result.stderr)
     assert_no_secret(tree, result.stdout, result.stderr)
 
@@ -316,11 +319,13 @@ def test_a_successful_deploy_restores_exactly_the_named_stage_after_the_deployed
         "register-capture": [
             "government-production-capture.sh --operator-config {c} --ensure-job --enable-catalog-execution",
             "website-execution-activate.sh --operator-config {c} --apply-register-capture"],
+        "catalog-browser": ["website-execution-activate.sh --operator-config {c} --apply-catalog-browser"],
         "all": [
             "website-execution-activate.sh --operator-config {c} --apply-plan-authoring",
             "government-production-capture.sh --operator-config {c} --ensure-job --enable-catalog-execution",
             "website-execution-activate.sh --operator-config {c} --apply-web-preparation",
-            "website-execution-activate.sh --operator-config {c} --apply-register-capture"],
+            "website-execution-activate.sh --operator-config {c} --apply-register-capture",
+            "website-execution-activate.sh --operator-config {c} --apply-catalog-browser"],
     }[restore]
     assert restore_calls(tree) == [line.format(c=tree.config) for line in expected]
     # Every restore call comes after the deployed gate passed.
@@ -332,13 +337,15 @@ def test_a_successful_deploy_restores_exactly_the_named_stage_after_the_deployed
     if restore == "none":
         assert "SUMMARY|11 website-stage|SKIPPED|restore_website_stage=none" in result.stdout
     else:
-        steps_passed = set(re.findall(r"^SUMMARY\|(11[a-d] [^|]+)\|PASS\|", result.stdout, re.M))
+        steps_passed = set(re.findall(r"^SUMMARY\|(11[a-e] [^|]+)\|PASS\|", result.stdout, re.M))
         assert steps_passed == {
             "plan-authoring": {"11a plan-authoring"},
             "web-preparation": {"11b capture-job", "11c web-preparation"},
             "both": {"11a plan-authoring", "11b capture-job", "11c web-preparation"},
             "register-capture": {"11b capture-job", "11c register-capture"},
-            "all": {"11a plan-authoring", "11b capture-job", "11c web-preparation", "11d register-capture"},
+            "catalog-browser": {"11a catalog-browser"},
+            "all": {"11a plan-authoring", "11b capture-job", "11c web-preparation", "11d register-capture",
+                    "11e catalog-browser"},
         }[restore]
 
 
@@ -407,9 +414,11 @@ def test_deploy_dry_run_with_each_restore_value(tmp_path, restore):
     after_gate = result.stdout.split("SUMMARY|10 deployed-gate|DRY-RUN|", 1)[1]
     assert_no_stage2(after_gate)
     assert ("--apply-plan-authoring" in after_gate) == (restore in ("plan-authoring", "both", "all"))
-    assert after_gate.count("--ensure-job --enable-catalog-execution") == (restore != "none" and restore != "plan-authoring")
+    assert after_gate.count("--ensure-job --enable-catalog-execution") == (
+        restore not in ("none", "plan-authoring", "catalog-browser"))
     assert ("--apply-web-preparation" in after_gate) == (restore in ("web-preparation", "both", "all"))
     assert ("--apply-register-capture" in after_gate) == (restore in ("register-capture", "all"))
+    assert ("--apply-catalog-browser" in after_gate) == (restore in ("catalog-browser", "all"))
     if restore == "none":
         assert "SUMMARY|11 website-stage|SKIPPED|" in result.stdout
     assert result.stdout.count("DRY RUN: nothing was called") == 1
@@ -429,8 +438,8 @@ def test_deploy_refuses_an_unknown_restore_value(tmp_path, bad):
     tree = OpsTree(tmp_path)
     result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", bad, "--dry-run")
     assert result.returncode == 2
-    assert ("--restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture"
-            " or all") in result.stderr
+    assert ("--restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture,"
+            " catalog-browser or all") in result.stderr
     assert tree.tool_calls() == []
 
 

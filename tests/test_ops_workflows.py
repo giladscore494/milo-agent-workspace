@@ -40,11 +40,11 @@ REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
 OPS = REPO / "scripts" / "ops"
 PRODUCTION_WORKFLOWS = ("deploy.yml", "kill-switch.yml", "capture-flag.yml", "gates.yml", "arm.yml",
-                        "website-stage.yml", "register-retention.yml")
+                        "website-stage.yml", "register-retention.yml", "register-variants.yml")
 OPS_SCRIPTS = ("common.sh", "deploy.sh", "kill-switch.sh", "capture-flag.sh", "gates.sh", "arm.sh",
                "setup-wif.sh", "write-operator-config.sh", "link-vercel.sh", "website-stage.sh",
                "deployed-release.sh", "preflight-deployer.sh", "register-retention.sh",
-               "setup-register-archive.sh")
+               "setup-register-archive.sh", "register-variants.sh")
 
 #: Sentinel secrets: if one of these ever reaches stdout, stderr or the job
 #: summary, a script printed a secret.

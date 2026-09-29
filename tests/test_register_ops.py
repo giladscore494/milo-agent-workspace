@@ -351,6 +351,65 @@ def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
 
 
 # =============================================================================
+# 2b. the catalog variant backfill (PR-L1)
+# =============================================================================
+
+VARIANTS_GCLOUD = RETENTION_GCLOUD.replace(
+    '"logging read"*) echo "PRUNED snapshots=1 raw_records=5 candidates=3 (archive objects untouched)" ;;',
+    '"logging read"*) echo "${OPS_TEST_OUTCOME:-BUILT snapshot_key=cs1.a status=built rows=5/5}" ;;')
+SNAPSHOT_KEY = "cs1." + "b" * 32
+
+
+def variants_tree(tmp_path: Path) -> OpsTree:
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", VARIANTS_GCLOUD)
+    return tree
+
+
+def test_the_variant_backfill_dry_run_calls_nothing(tmp_path):
+    tree = variants_tree(tmp_path)
+    result = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert tree.tool_calls() == []
+    assert "backend.catalog.register.variants" in result.stdout and SNAPSHOT_KEY in result.stdout
+
+
+def test_the_variant_backfill_runs_the_capture_job_for_one_snapshot(tmp_path):
+    tree = variants_tree(tmp_path)
+    result = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY,
+                      extra_env={"MILO_VARIANTS_POLL_SECONDS": "0"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    (execute,) = [c for c in tree.tool_calls() if "jobs execute" in c]
+    assert "test-capture" in execute
+    assert f"--args=-m,backend.catalog.register.variants,--snapshot-key,{SNAPSHOT_KEY}" in execute
+    assert "SUMMARY|register-variants|PASS|snapshot_key=cs1.a status=built rows=5/5" in result.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+    refused = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY,
+                       extra_env={"MILO_VARIANTS_POLL_SECONDS": "0",
+                                  "OPS_TEST_OUTCOME": "REFUSED CATALOG_VARIANT_SNAPSHOT_UNKNOWN: x"})
+    assert refused.returncode == 1 and "SUMMARY|register-variants|FAIL|" in refused.stdout
+
+
+def test_the_variant_backfill_refuses_a_malformed_key(tmp_path):
+    tree = variants_tree(tmp_path)
+    for key in ("", "bad key", "a,b", "-x"):
+        assert tree.run("register-variants.sh", "--snapshot-key", key).returncode == 2
+    assert tree.tool_calls() == []
+
+
+def test_the_variant_workflow_runs_from_main_in_production():
+    doc = workflow("register-variants.yml")
+    inputs = triggers(doc)["workflow_dispatch"]["inputs"]
+    assert inputs["snapshot_key"]["required"] is True
+    (job,) = doc["jobs"].values()
+    assert job["environment"] == "production"
+    assert doc["concurrency"] == {"group": "milo-production-operations", "cancel-in-progress": False}
+    first = steps(doc)[0]["run"]
+    assert "refs/heads/main" in first and "^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$" in first
+    assert 'register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}"' in steps(doc)[-1]["run"]
+
+
+# =============================================================================
 # 3. the register-capture website stage
 # =============================================================================
 

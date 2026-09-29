@@ -33,6 +33,10 @@
 #                           no run-start gateway flag and no Arm: capture is
 #                           $0 and not a run. Refused until the register
 #                           archive bucket is set up (setup-register-archive.sh).
+#   --apply-catalog-browser PR-L1. The website's read-only catalog browser
+#                           (MILO_CATALOG_BROWSER_API_ENABLE_FLAGS on the API
+#                           only, read back). GET only, $0: no run, no job,
+#                           no model; run creation stays off.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -94,7 +98,7 @@ WS_ARGS=()
 
 usage() {
   cat << 'EOF'
-Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-backend] [options]
+Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-catalog-browser|--apply-backend] [options]
 
 Default --plan changes nothing and prints both stages.
 
@@ -117,6 +121,8 @@ Modes:
                           (setup-register-archive.sh --check PASS, or
                           PARTIAL -- the bucket's posture verified, its IAM
                           left to the operator's Cloud Shell check -- WARN).
+  --apply-catalog-browser PR-L1: the read-only catalog browser (API only).
+                          Gate: production-verify.sh --gate deployed.
   --apply-backend         Stage 2: the API + worker flags for batch runs. Gate:
                           production-verify.sh --gate prepared for the named
                           plan revision. The Vercel half is printed, never
@@ -143,6 +149,7 @@ while [[ $# -gt 0 ]]; do
     --apply-plan-authoring) MODE="apply-plan-authoring"; shift ;;
     --apply-web-preparation) MODE="apply-web-preparation"; shift ;;
     --apply-register-capture) MODE="apply-register-capture"; shift ;;
+    --apply-catalog-browser) MODE="apply-catalog-browser"; shift ;;
     --apply-backend) MODE="apply-backend"; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
@@ -247,6 +254,9 @@ WEB_PREP_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB
 REGISTER_API_VARS="$(pairs "$ENABLED" "${MILO_REGISTER_CAPTURE_API_ENABLE_FLAGS[@]}")"
 REGISTER_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB}"
 
+# PR-L1: the read-only catalog browser on the API, nothing else.
+BROWSER_API_VARS="$(pairs "$ENABLED" "${MILO_CATALOG_BROWSER_API_ENABLE_FLAGS[@]}")"
+
 # Stage 2.
 S2_API_VARS="$(pairs "$ENABLED" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}")"
 S2_API_VARS+="${MILO_ENV_VAR_DELIMITER}$(pairs "$DISABLED" "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}")"
@@ -328,6 +338,16 @@ gcloud run jobs add-iam-policy-binding ${WORKER_JOB} \\
 gcloud run services update ${API_SERVICE} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${REGISTER_API_VARS}'
+EOC
+}
+
+print_catalog_browser_commands() {
+  cat << EOC
+# --- PR-L1, API only: the read-only catalog browser (GET only, \$0). Run
+# creation, batches, paid execution and promotion stay exactly as they are.
+gcloud run services update ${API_SERVICE} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${BROWSER_API_VARS}'
 EOC
 }
 
@@ -526,6 +546,8 @@ if [[ "$MODE" == "plan" ]]; then
   print_run_start_commands
   printf '\n== PR-D1 — register capture from the website (Cloud Run API + capture job IAM) ==\n'
   print_register_capture_commands
+  printf '\n== PR-L1 — the read-only catalog browser (Cloud Run API only) ==\n'
+  print_catalog_browser_commands
   printf '\nPLAN ONLY — nothing was changed.\n'
   exit 0
 fi
@@ -579,6 +601,30 @@ if [[ "$MODE" == "apply-plan-authoring" ]]; then
   printf 'Next: apply the Vercel half below so a person can author the plan in the website.\n\n'
   print_frontend_commands
   printf '\nNo run was started and no provider call was made.\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --apply-catalog-browser (PR-L1)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "apply-catalog-browser" ]]; then
+  printf '== Gate: the release is deployed and the database carries the exact migration set ==\n'
+  if ! bash "${SCRIPT_DIR}/production-verify.sh" --operator-config "$CONFIG_PATH" --gate deployed; then
+    printf '\nFAIL: the deployed gate did not pass; nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Applying the catalog browser (API only) ==\n'
+  print_catalog_browser_commands
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${BROWSER_API_VARS}"
+  split_pairs "$BROWSER_API_VARS"
+  # Read-only: run creation and paid execution must still be off.
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}" "MILO_ENABLE_RUN_CREATION=${DISABLED}" \
+       "MILO_ENABLE_PAID_EXECUTION=${DISABLED}"; then
+    printf 'FAIL: the API does not carry the catalog browser posture (above). Nothing else was changed.\n' >&2
+    exit 1
+  fi
+  printf '\nCatalog browser applied and read back. Run creation and paid execution are still OFF.\n'
   exit 0
 fi
 

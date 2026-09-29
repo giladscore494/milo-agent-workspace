@@ -110,6 +110,8 @@ INVENTORY=(
   "MILO_DB_CAPACITY_THRESHOLD|cloud-run-api-only|no|backend/catalog/register/config.py"
   "MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE|cloud-run-api-only|no|backend/catalog/register/config.py"
   "MILO_REGISTER_GROUP_MAX_ROWS|cloud-run-api-only|no|backend/catalog/register/config.py"
+  # PR-L1: the read-only catalog browser (API, GET only).
+  "MILO_ENABLE_CATALOG_BROWSER|cloud-run-api-only|no|backend/catalog/register/browser.py"
   "MILO_REGISTER_ARCHIVE_BUCKET|cloud-run-worker-only|no|backend/catalog/register/config.py"
   "MILO_REGISTER_DIRECTORY_MAX_REQUESTS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
   "MILO_REGISTER_DIRECTORY_MAX_SECONDS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
@@ -207,6 +209,7 @@ EXECUTION_FLAGS=(
   MILO_ENABLE_WORK_SCOPE_PREPARATION
   MILO_ENABLE_REGISTER_CAPTURE
   MILO_ENABLE_REGISTER_CAPTURE_JOB
+  MILO_ENABLE_CATALOG_BROWSER
   GATEWAY_ALLOW_EXECUTION_ROUTES
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )
