@@ -92,7 +92,7 @@ jobs:
           echo "Clean: the credentials file is ignored and nothing else changed."
 
       - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
