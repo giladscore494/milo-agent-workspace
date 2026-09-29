@@ -251,6 +251,20 @@ REQUIRED_PER_FILE["20260930000100_catalog_variants.sql"] = [
     "revoke delete, truncate on table public.catalog_variants from service_role",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20261001000100_catalog_variant_retention.sql"] = [
+    # PR-L1b: a superseded snapshot is pruned WITH its variants (the variants'
+    # trigger suspended only inside the digest-bound prune and re-enabled), the
+    # current build of a tozar is always kept, only rank 1 is built, and the
+    # compact equipment keeps the closed-list check.
+    "alter table public.catalog_variants disable trigger catalog_variants_append_only;",
+    "alter table public.catalog_variants enable trigger catalog_variants_append_only;",
+    "catalog_prune_digest_mismatch",
+    "where x.snapshot_key = sc.snapshot_key and x.level = 'register')",
+    "and sc.id not in (select distinct on (b.tozar) b.snapshot_id",
+    "catalog_variant_snapshot_superseded",
+    "not public.catalog_variant_equipment_valid(coalesce(t.equipment, '{}'::jsonb))",
+    "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
+]
 REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
     # P27: the queue build leaves PR-U's placeholder records out (never
     # eligible, never queued), records each with its reason and counts them.

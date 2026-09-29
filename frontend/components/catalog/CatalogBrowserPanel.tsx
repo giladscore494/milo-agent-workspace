@@ -1,6 +1,6 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api } from '@/lib/api';
+import { ApiError, api } from '@/lib/api';
 import {
   BrowserFilters, BrowserLevel, COVERAGE_LEVELS, COVERAGE_LEVEL_COPY, Facets, Manufacturer, Model, ModelYear,
   PAGE_SIZE, Page, SEGMENTS, SEGMENT_COPY, Segment, Variant, browserQuery, directoryKeyFor, parseFacets,
@@ -83,7 +83,8 @@ function parseListing(level: Listing['level'], body: unknown): Listing | undefin
  * PR-CAT (D5 + D6) -- the Catalog page: the deterministic catalog variants
  * as a tree, manufacturer -> model -> year -> variants, every level paged by
  * the server. It exists only while the server has the catalog browser on
- * (its first read answers 404 otherwise and this renders nothing). Reading
+ * (its first read answers 404 otherwise and this renders nothing; any other
+ * failure of that read is shown as an error). Reading
  * changes nothing; "Add to plan" only writes the conversation's Mapping Plan
  * through its existing routes -- it never prepares, arms or starts anything.
  */
@@ -102,6 +103,8 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
   const [message, setMessage] = useState('');
   const generation = useRef(0);
   const planGeneration = useRef(0);
+  // The facets' own guard: only a project change drops them, never a read.
+  const facetGeneration = useRef(0);
 
   const read = useCallback(async (project: string, where: Path, at: number, by: BrowserFilters, first: boolean) => {
     const mine = ++generation.current;
@@ -116,24 +119,28 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
       setShown({ kind: 'ready', listing });
     } catch (error) {
       if (mine !== generation.current) return;
-      // The page exists only once the server answered it: a first read that
-      // fails (404 while the browser is off) shows nothing at all.
-      if (first) setShown({ kind: 'hidden' });
-      else setShown({ kind: 'error', message: safeErrorText(error, READ_FALLBACK) });
+      // The page exists only once the server answered it: a 404 (the browser
+      // is off) shows nothing at all; any other failure is an error.
+      if (first && error instanceof ApiError && error.status === 404) {
+        setShown({ kind: 'hidden' });
+        return;
+      }
+      setExists(true);
+      setShown({ kind: 'error', message: safeErrorText(error, READ_FALLBACK) });
     }
   }, [client]);
 
   useEffect(() => {
     setExists(false); setPath({}); setOffset(0); setFilters({}); setFacets(undefined);
     setShown({ kind: 'hidden' });
+    const mine = ++facetGeneration.current;
     if (!projectId) return;
-    const mine = generation.current + 1;
     void read(projectId, {}, 0, {}, true);
     void (async () => {
       try {
         const body = await client.browse(projectId, 'facets', '');
         // Facets of a project the page has since left are dropped.
-        if (generation.current <= mine) setFacets(parseFacets(body));
+        if (facetGeneration.current === mine) setFacets(parseFacets(body));
       } catch {
         // No facets: the filters offer "Any" only.
       }
@@ -175,6 +182,11 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
   const canPlan = planWrites && conversationId !== undefined && plan.capabilities?.available === true
     && plan.directory !== undefined && plan.plan !== undefined;
   const otherFilters = filters.segment !== undefined || filters.delekCd !== undefined || filters.merkav !== undefined;
+  // An open plan keeps ITS year range (planAddition); only a new plan takes the filter's.
+  const openPlan = plan.plan?.plan;
+  const years = openPlan
+    ? `the plan's own ${openPlan.modelYearFrom ?? 'any'}–${openPlan.modelYearTo ?? 'any'}, kept when it is revised`
+    : `${filters.yearFrom ?? 'any'}–${filters.yearTo ?? 'any'}`;
 
   const add = async () => {
     if (!canPlan || !conversationId || busy || plan.capabilities === undefined || plan.plan === undefined) return;
@@ -244,11 +256,13 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
               <button type="button" className="button button--primary"
                 disabled={busy || selected.size === 0 || otherFilters} onClick={() => void add()}>
                 {busy ? 'Adding…' : `Add to plan (${selected.size})`}</button>
+              {selected.size > 0 && (
+                <span aria-label="Selected manufacturers">Selected: {[...selected].map(safeText).join(', ')}</span>)}
               <span className="muted">
                 {otherFilters
                   ? 'A plan selects whole manufacturers by model year: clear the segment, fuel and body filters to add.'
-                  : `Year range: ${filters.yearFrom ?? 'any'}–${filters.yearTo ?? 'any'}. Variants the catalog already `
-                    + 'enriched are left out when the plan is prepared.'}
+                  : `Year range: ${years}. Variants the catalog already enriched are left out when the plan is `
+                    + 'prepared.'}
               </span>
             </div>)}
           {message && <p className="muted" role="status">{safeText(message)}</p>}

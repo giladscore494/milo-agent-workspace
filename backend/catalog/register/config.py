@@ -5,8 +5,12 @@ environment -- never hard-coded at a call site -- with the reviewed defaults.
                                          plan's database size; decimal, the lower
                                          reading of "500 MB")
     MILO_DB_CAPACITY_THRESHOLD           default 0.80
-    MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE  default 3500 (measured in production;
-                                         PR-L will lower it)
+    MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE  default 5500: every register row costs
+                                         its raw record + candidate (3,512 B,
+                                         measured in production), its variant
+                                         (975 B) and two ledger levels (996 B),
+                                         tables and indexes, rounded up to the
+                                         next 500 (PR-L1b; PR-L2 lowers it)
     MILO_REGISTER_GROUP_MAX_ROWS         default 10000 (one request's cap)
     MILO_REGISTER_ARCHIVE_BUCKET         no default (the capture job's archive)
 
@@ -29,7 +33,7 @@ ARCHIVE_BUCKET_ENV = "MILO_REGISTER_ARCHIVE_BUCKET"
 
 DEFAULT_CAPACITY_BYTES = 500_000_000
 DEFAULT_CAPACITY_THRESHOLD = 0.80
-DEFAULT_BYTES_PER_ROW = 3500
+DEFAULT_BYTES_PER_ROW = 5500
 DEFAULT_GROUP_MAX_ROWS = 10_000
 
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")

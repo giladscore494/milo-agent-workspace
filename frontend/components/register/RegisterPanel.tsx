@@ -285,7 +285,7 @@ function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, 
               <th scope="col">Expected rows</th>
               <th scope="col">State</th>
               <th scope="col">Snapshot</th>
-              <th scope="col">Bytes per row</th>
+              <th scope="col" title="Measured: the snapshot's raw records, candidates, variants and their ledger rows (table data; indexes excluded)">Bytes per row</th>
               <th scope="col"><span className="sr-only">Action</span></th>
             </tr>
           </thead>

@@ -9,7 +9,10 @@ executed by scripts/ops/register-retention.sh with argument overrides:
 `--apply` recomputes the list, refuses unless its digest is the one given,
 and hands both to `public.prune_register_snapshots`, which recomputes and
 refuses again under a table lock. Database rows only: an archive object is
-never touched. Prints snapshot keys, counts and the digest -- nothing else.
+never touched. PR-L1b: a pruned snapshot's variants and variant builds go
+with it, and an old mapper version's variant build is listed (and pruned) on
+its own once the snapshot's build under the current mapper version is
+complete; its digest item is `<snapshot_key> <mapper_version>`. Prints snapshot keys, counts and the digest -- nothing else.
 Exit 0 on success, 2 on a refusal, 1 on a failure.
 """
 
@@ -34,9 +37,13 @@ def _open_repository() -> Any:  # pragma: no cover - production wiring
     return SupabaseRepository(get_settings())
 
 
+def _item(row: Mapping[str, Any]) -> str:
+    return str(row.get("item") or row["snapshot_key"])
+
+
 def listing(repository: Any) -> tuple[list[Mapping[str, Any]], str]:
     rows = list(repository.prunable_register_snapshots())
-    return rows, prune_digest(str(row["snapshot_key"]) for row in rows)
+    return rows, prune_digest(_item(row) for row in rows)
 
 
 def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
@@ -62,11 +69,17 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
     except Exception:
         print("FAILED CATALOG_PRUNE_LIST_UNAVAILABLE: the prunable list could not be read")
         return EXIT_FAILED
+    snapshots = [row for row in rows if not row.get("item")]
     for row in rows:
-        print(f"PRUNABLE {row['snapshot_key']} rows={int(row.get('raw_rows') or 0)} "
-              f"estimated_bytes={int(row.get('estimated_bytes') or 0)}")
-    print(f"TOTAL snapshots={len(rows)} rows={sum(int(r.get('raw_rows') or 0) for r in rows)} "
-          f"estimated_bytes={sum(int(r.get('estimated_bytes') or 0) for r in rows)}")
+        if row.get("item"):
+            print(f"PRUNABLE-VARIANTS {row['snapshot_key']} mapper_version={row.get('mapper_version')} "
+                  f"rows={int(row.get('variant_rows') or 0)} estimated_bytes={int(row.get('estimated_bytes') or 0)}")
+        else:
+            print(f"PRUNABLE {row['snapshot_key']} rows={int(row.get('raw_rows') or 0)} "
+                  f"estimated_bytes={int(row.get('estimated_bytes') or 0)}")
+    print(f"TOTAL snapshots={len(snapshots)} rows={sum(int(r.get('raw_rows') or 0) for r in snapshots)} "
+          f"estimated_bytes={sum(int(r.get('estimated_bytes') or 0) for r in rows)} "
+          f"variant_builds={len(rows) - len(snapshots)}")
     print(f"DIGEST {digest}")
     if args.list:
         return EXIT_OK
@@ -75,7 +88,7 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
               "run the dry-run again")
         return EXIT_REFUSED
     try:
-        result = repo.prune_register_snapshots([str(row["snapshot_key"]) for row in rows], digest)
+        result = repo.prune_register_snapshots([_item(row) for row in rows], digest)
     except AppError as refused:
         if refused.code == "CATALOG_PRUNE_DIGEST_MISMATCH":
             print("REFUSED CATALOG_PRUNE_DIGEST_MISMATCH: the list changed before the prune; run the dry-run again")
@@ -86,7 +99,8 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
         print("FAILED CATALOG_PRUNE_FAILED: the prune did not complete; nothing was deleted")
         return EXIT_FAILED
     print(f"PRUNED snapshots={int(result.get('snapshots') or 0)} raw_records={int(result.get('raw_records') or 0)} "
-          f"candidates={int(result.get('candidates') or 0)} (archive objects untouched)")
+          f"candidates={int(result.get('candidates') or 0)} variants={int(result.get('variants') or 0)} "
+          f"variant_builds={int(result.get('variant_builds') or 0)} (archive objects untouched)")
     return EXIT_OK
 
 

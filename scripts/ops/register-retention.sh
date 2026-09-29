@@ -15,8 +15,11 @@
 #           and nothing is deleted.
 #
 # Always kept (the rule is the database's): per tozar the active snapshot and
-# the one before it, and every snapshot referenced by evidence, claims, runs,
-# work-scope revisions or the coverage ledger. Unscoped (whole-register)
+# the one before it, its current variant build, and every snapshot referenced
+# by evidence, claims, runs, work-scope revisions or a `register` ledger row.
+# A pruned snapshot's variants go with it; an old mapper version's variant
+# rows are prunable once the current mapper's build of the snapshot is
+# complete. Unscoped (whole-register)
 # snapshots are never candidates. Prune deletes DATABASE ROWS ONLY: no archive
 # object is ever touched (the capture identity cannot delete one anyway).
 # --dry-run prints the commands and calls nothing. Prints snapshot keys,
@@ -64,14 +67,23 @@ ops_load_config
 summary_header "Register retention: ${MODE} (database rows only; archive objects untouched)"
 
 # One statement, so the rows and the digest describe the same list.
-LIST_SQL="with p as (select * from public.catalog_register_prunable_snapshots())
+# PR-L1b: old-mapper variant builds are listed too, and the digest covers both.
+LIST_SQL="with p as (select * from public.catalog_register_prunable_snapshots()),
+     b as (select * from public.catalog_register_prunable_variant_builds())
 select 'PRUNABLE ' || snapshot_key || ' rows=' || raw_rows || ' estimated_bytes=' || estimated_bytes
   from p
 union all
-select 'TOTAL snapshots=' || count(*) || ' rows=' || coalesce(sum(raw_rows), 0)
-       || ' estimated_bytes=' || coalesce(sum(estimated_bytes), 0) from p
+select 'PRUNABLE-VARIANTS ' || snapshot_key || ' mapper_version=' || mapper_version || ' rows=' || variant_rows
+       || ' estimated_bytes=' || estimated_bytes
+  from b
 union all
-select 'DIGEST ' || public.catalog_register_prune_digest(coalesce(array_agg(snapshot_key), '{}')) from p;"
+select 'TOTAL snapshots=' || (select count(*) from p) || ' rows=' || (select coalesce(sum(raw_rows), 0) from p)
+       || ' estimated_bytes=' || ((select coalesce(sum(estimated_bytes), 0) from p)
+                                  + (select coalesce(sum(estimated_bytes), 0) from b))
+       || ' variant_builds=' || (select count(*) from b)
+union all
+select 'DIGEST ' || public.catalog_register_prune_digest(
+         coalesce((select array_agg(snapshot_key) from p), '{}') || coalesce((select array_agg(item) from b), '{}'));"
 
 # read_list -- the list, as the read-only role. The URL is read from the named
 # variable and never printed; psql's stderr is dropped because it can quote
@@ -112,7 +124,7 @@ if [[ "$current" != "$DIGEST" ]]; then
   printf 'REFUSED CATALOG_PRUNE_DIGEST_MISMATCH: run the dry-run again and apply its digest\n' >&2
   exit 1
 fi
-if [[ "$totals" == snapshots=0\ * ]]; then
+if [[ "$totals" == snapshots=0\ * && "$totals" == *" variant_builds=0" ]]; then
   summary "register-retention apply" PASS "nothing is prunable; nothing was deleted"
   exit 0
 fi

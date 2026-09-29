@@ -143,11 +143,14 @@ def candidate_outcome(*, task_id: str, call_id: str, tool: str, operation: str,
                         if isinstance(record.get(name), str) and record[name]}
         if registration:
             typed["registration"] = registration
-        # P32: the evidence fields this row CANNOT state, read from the
-        # server-built identity projection (an unstated register value is
-        # absent there). Stated only when there is one.
-        absent = sorted(field for field, name in REGISTER_EVIDENCE_FIELDS.items()
-                        if record.get(name) is None or record.get(name) == "")
+        # P32: the evidence fields this row CANNOT state, decided from the
+        # tool's reading of the RAW register value (`register_unstated`),
+        # never from the typed projection: a present value of the wrong type
+        # stays a hard shortfall. A result without it states no absence.
+        # Stated only when there is one.
+        unstated = result.get("register_unstated")
+        unstated = {name for name in unstated if isinstance(name, str)} if isinstance(unstated, list) else set()
+        absent = sorted(field for field, name in REGISTER_EVIDENCE_FIELDS.items() if name in unstated)
         if absent:
             typed["register_fields_absent"] = absent
     return typed

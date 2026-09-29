@@ -34,7 +34,17 @@ projected, limit, in bytes) in the response body (`error.capacity`) and on the
 page. Measured bytes per snapshot are recorded when a unit finishes:
 `sum(pg_column_size(row))` over the snapshot's raw records and candidates
 (`measurement_method = pg_column_size(raw_records+candidates)`), shown on the
-page as bytes per row.
+page as bytes per row. PR-L1b: when the snapshot's variant build completes,
+the measurement is taken again over the raw records, candidates, variants and
+the ledger rows at `identity` / `government_fields` that name the snapshot
+(`measurement_method = pg_column_size(raw_records+candidates+variants+ledger)`,
+`catalog_register_measured_bytes`). Heap sizes only (a floor): the estimate
+below includes indexes.
+
+The estimate (PR-L1b, 5,500 B/row) is the measured total per register row,
+tables + TOAST + indexes, rounded up to the next 500: raw record + candidate
+3,512 B (production, 25,495 rows), variant 975 B, ledger at two levels 996 B
+(`tests/test_catalog_variants_postgres.py`, L1-6).
 
 ### Archive
 
@@ -62,13 +72,27 @@ be repeated).
 ### Retention (O22)
 
 Always kept: per tozar the active snapshot and the one before it; the
-snapshot of the latest captured register unit of each tozar; every
+snapshot of the latest captured register unit of each tozar; the snapshot of
+each tozar's CURRENT variant build (the one the discovery tree serves); every
 snapshot referenced by evidence, claims (field provenance), runs (adoptions,
-checkpoints), work-scope units / batches / queue items, the coverage ledger,
-or whose candidates are referenced; every snapshot whose writer run is live.
-Only scoped (per-tozar) Government snapshots are candidates. Prune deletes
-database rows only -- never an archive object -- and only the exact list the
-dry-run's digest names (SHA-256 of the sorted keys, one per line).
+checkpoints), work-scope units / batches / queue items, a `register`-level
+coverage-ledger row, or whose candidates are referenced; every snapshot whose
+writer run is live. Only scoped (per-tozar) Government snapshots are
+candidates. Prune deletes database rows only -- never an archive object --
+and only the exact list the dry-run's digest names (SHA-256 of the sorted
+items, one per line).
+
+PR-L1b (20261001000100): a pruned snapshot's variants and variant builds are
+deleted with it, in the same transaction (the variants' append-only trigger
+is suspended only inside `prune_register_snapshots` and re-enabled before it
+returns). Ledger rows at `identity` / `government_fields` that name it are
+kept unchanged as history: a newer build already re-points every key it
+states, so such a row names a key no newer build states; its snapshot key
+stays citable through the archive. They never block a prune. Also prunable,
+listed as `PRUNABLE-VARIANTS <snapshot_key> mapper_version=<v>`: the variant
+rows of a mapper version other than the current one, once the snapshot's
+build under the current mapper version is complete. Their digest item is
+`<snapshot_key> <mapper_version>`.
 
 ## Configuration (API unless noted)
 
@@ -77,7 +101,7 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
 | `MILO_ENABLE_REGISTER_CAPTURE` | off | the website stage flag |
 | `MILO_DB_CAPACITY_BYTES` | `500000000` (500 MB) | |
 | `MILO_DB_CAPACITY_THRESHOLD` | `0.80` | |
-| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `3500` | |
+| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `5500` | raw + candidate + variant + two ledger levels, per row (PR-L1b) |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |

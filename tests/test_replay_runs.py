@@ -234,6 +234,8 @@ def _t01_without_ramat_gimur() -> dict:
     del entry["arguments"]["trim"]
     del entry["result"]["variants"][0]["trim"]
     del entry["result"]["source_record"]["ramat_gimur"]
+    # P32 (PR-L1b): the tool states the raw absence beside the projection.
+    entry["result"]["register_unstated"] = ["ramat_gimur"]
     return manifest
 
 

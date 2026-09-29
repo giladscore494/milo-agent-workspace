@@ -284,6 +284,12 @@ class ReplayGovernmentTool(GovernmentVehicleTool):
                                            operation=operation,
                                            recorded={"match_mode": recorded["match_mode"]},
                                            real={"match_mode": real.get("match_mode")})
+            if "register_unstated" in recorded \
+                    and recorded["register_unstated"] != real.get("register_unstated"):
+                # P32 (PR-L1b): a recorded raw absence must be the row's own.
+                raise ReplayDivergence("TOOL_RESULT_CROSS_CHECK_FAILED", operation=operation,
+                                       recorded={"register_unstated": recorded["register_unstated"]},
+                                       real={"register_unstated": real.get("register_unstated")})
             if summary(real) != summary(recorded):
                 raise ReplayDivergence("TOOL_RESULT_CROSS_CHECK_FAILED", operation=operation,
                                        recorded=summary(recorded), real=summary(real))

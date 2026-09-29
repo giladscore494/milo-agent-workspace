@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from backend.catalog import coverage as catalog_coverage
+from backend.catalog.register import retention
 from backend.catalog.register import variants as mapper
 from backend.errors import AppError
 
@@ -50,6 +51,12 @@ class VariantsMemoryMixin:
                 or int(snapshot.get("stored_record_count") or 0) != int(snapshot.get("declared_record_count") or -1)
                 or not isinstance(filters, dict) or set(filters) != {"tozar"} or unverified):
             raise _refused("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE")
+        # PR-L1b: rank 1 only (activated_at desc, then id).
+        if any(retention.scoped_tozar(other) == filters["tozar"] and other.get("activated_at")
+               and other.get("source_family") == "government" and str(other["id"]) != str(snapshot["id"])
+               and (str(other["activated_at"]), str(snapshot["id"])) > (str(snapshot["activated_at"]), str(other["id"]))
+               for other in self.catalog_snapshots.values()):
+            raise _refused("CATALOG_VARIANT_SNAPSHOT_SUPERSEDED")
         return str(filters["tozar"])
 
     def record_catalog_variants(self, snapshot_id: str, mapper_version: str,
@@ -68,7 +75,10 @@ class VariantsMemoryMixin:
             if any(i not in records for i in ids):
                 raise _refused("CATALOG_VARIANT_ROWS_INVALID")
             for row in rows:
-                mapper.check_equipment(row.get("equipment") or {})
+                try:
+                    mapper.check_equipment(row.get("equipment") or {})
+                except mapper.VariantMappingError:
+                    raise _refused("CATALOG_VARIANT_EQUIPMENT_KEY_UNKNOWN") from None
             build = state["builds"].setdefault((str(snapshot_id), mapper_version), {
                 "snapshot_id": str(snapshot_id), "mapper_version": mapper_version,
                 "snapshot_key": snapshot["snapshot_key"], "tozar": tozar,
@@ -100,6 +110,12 @@ class VariantsMemoryMixin:
             build.update(built_rows=len(built), updated_at=_now())
             if len(built) == build["expected_rows"] and not build["completed_at"]:
                 build["completed_at"] = _now()
+            if build["completed_at"]:
+                # PR-L1b: a complete build re-measures the units that captured it.
+                for unit in self._register_state()["units"].values():
+                    if str(unit.get("snapshot_id")) == str(snapshot_id) and unit.get("status") == "captured":
+                        unit.update(measured_bytes=self._snapshot_bytes(str(snapshot_id)),
+                                    measurement_method="memory:json_length+variants")
             written = self._refresh_variant_ledger(snapshot, built, {
                 state["rows"][(str(snapshot_id), i, mapper_version)]["variant_identity_key"] for i in ids})
             return {"snapshot_key": snapshot["snapshot_key"], "mapper_version": mapper_version,
@@ -144,17 +160,21 @@ class VariantsMemoryMixin:
         return written
 
     # -- the discovery tree ----------------------------------------------------------------
-    def _current_variants(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
-        state = self._variants_state()
+    def _current_variant_snapshots(self) -> set[str]:
+        """Per tozar, the newest-activated complete build under this mapper."""
         newest: dict[str, dict[str, Any]] = {}
-        for build in state["builds"].values():
+        for build in self._variants_state()["builds"].values():
             if build["mapper_version"] != mapper.MAPPER_VERSION or not build["completed_at"]:
                 continue
             held = newest.get(build["tozar"])
             if held is None or (str(build["activated_at"]), build["snapshot_id"]) > \
                     (str(held["activated_at"]), held["snapshot_id"]):
                 newest[build["tozar"]] = build
-        current = {b["snapshot_id"] for b in newest.values()}
+        return {b["snapshot_id"] for b in newest.values()}
+
+    def _current_variants(self, filters: dict[str, Any]) -> list[dict[str, Any]]:
+        state = self._variants_state()
+        current = self._current_variant_snapshots()
         return [v for (sid, _u, mv), v in state["rows"].items()
                 if sid in current and mv == mapper.MAPPER_VERSION
                 and (filters.get("segment") is None or v["vehicle_segment"] == filters["segment"])
