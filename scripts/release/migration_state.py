@@ -100,6 +100,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260929000100": ("table", "catalog_register_capture_units"),
     # PR-L1 deterministic catalog variants and the discovery tree.
     "20260930000100": ("table", "catalog_variants"),
+    # PR-HYG P27: placeholder records left out at the queue build.
+    "20260930000200": ("column", "catalog_work_scope_unit_coverage.excluded_placeholder"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

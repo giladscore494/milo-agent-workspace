@@ -215,6 +215,54 @@ def test_the_repaired_t_batch_completes_with_no_unmet_evidence():
     assert report.unconsumed_completions == {} and report.unconsumed_tool_results == []
 
 
+def _t01_without_ramat_gimur() -> dict:
+    """P32: the repaired T batch with register row 38683 stating NO
+    `ramat_gimur` (as 284 of 6,374 production Toyota rows do). Every artifact
+    that states it changes consistently: the row, t01's queue item, the
+    Commander's t01 call (no trim argument) and the recorded answer."""
+    manifest = copy.deepcopy(load_manifest(FIXTURES["29eb076c-ev"]))
+    (row,) = [r for r in manifest["snapshot_rows"] if r["_id"] == 38683]
+    row["ramat_gimur"] = None
+    for item in manifest["preparation"]["queue"]:
+        if item["candidate_id"] == "cand-38683":
+            item["trim"] = None
+    call = ('"model_year": 2022, "trim": "ADVENTURE", "official_model_code": "AXAA54L-CNZVBA"')
+    assert manifest["commander"][1]["content"].count(call) == 1
+    manifest["commander"][1]["content"] = manifest["commander"][1]["content"].replace(
+        call, '"model_year": 2022, "official_model_code": "AXAA54L-CNZVBA"')
+    (entry,) = [e for e in manifest["tool_results"] if e["task_id"] == "t01"]
+    del entry["arguments"]["trim"]
+    del entry["result"]["variants"][0]["trim"]
+    del entry["result"]["source_record"]["ramat_gimur"]
+    return manifest
+
+
+def test_a_resolved_row_without_ramat_gimur_is_a_soft_register_gap(monkeypatch):
+    """P32: the row's register states no trim, so its evidence cannot carry
+    the required `trim`: a typed soft REGISTER_FIELD_ABSENT for that task,
+    never EVIDENCE_REQUIREMENTS_UNMET; every vehicle is kept, and the outcome
+    is otherwise exactly what the hard code gave."""
+    report = replay(_t01_without_ramat_gimur())
+    result = report.result
+    assert report.terminal == "result", report.outcome()
+    assert result["needs_review"] == [{"task_id": "t01", "code": "REGISTER_FIELD_ABSENT"}]
+    assert result["status"] == "partial_success" and result["result_kind"] == "partial_result"
+    assert len(result["vehicles"]) == 11 and result["unresolved_groups"] == []
+    (vehicle,) = [v for v in result["vehicles"] if v["vehicle_key"] == "38683"]
+    assert "trim" not in vehicle["fields"]
+    assert report.unconsumed_tool_results == [] and report.unconsumed_completions == {}
+    # Without the P32 rule the same recording reports the hard code; nothing
+    # else in the outcome moves.
+    import backend.engines.swarm_v2.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "register_fields_absent", lambda _outcomes: set())
+    before = replay(_t01_without_ramat_gimur()).outcome()
+    after = report.outcome()
+    assert before["needs_review"] == [{"task_id": "t01", "code": "EVIDENCE_REQUIREMENTS_UNMET"}]
+    assert {k: v for k, v in before.items() if k != "needs_review"} == \
+        {k: v for k, v in after.items() if k != "needs_review"}
+
+
 # --- the replay is strict ------------------------------------------------------
 
 def _aa() -> dict:

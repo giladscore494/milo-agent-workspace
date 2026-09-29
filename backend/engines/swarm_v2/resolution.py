@@ -59,7 +59,23 @@ CANDIDATE_GAP_CODES: Mapping[str, str] = {
     UNRESOLVED_AMBIGUOUS: "CANDIDATE_UNRESOLVED_AMBIGUOUS",
     UNRESOLVED_NOT_FOUND: "CANDIDATE_UNRESOLVED_NOT_FOUND",
 }
-SOFT_GAP_CODES = frozenset(CANDIDATE_GAP_CODES.values())
+#: P32: a RESOLVED row that states no value for a field the task's
+#: `evidence.required_fields` names. The register itself has nothing to say
+#: (production: `ramat_gimur` null in 284 of 6,374 Toyota rows, `delek_cd` in
+#: 66), so the evidence mapper can emit no fact for it -- a true answer, not a
+#: failed task. Also SOFT, and still listed for review.
+REGISTER_FIELD_ABSENT = "REGISTER_FIELD_ABSENT"
+SOFT_GAP_CODES = frozenset(CANDIDATE_GAP_CODES.values()) | {REGISTER_FIELD_ABSENT}
+
+#: P32: evidence field key -> the register field it is read from, restated
+#: from `backend.catalog.government.evidence.GOVERNMENT_FIELD_SOURCES` as
+#: literals (importing the catalog package here would make the two packages
+#: initialize each other); a test holds the two equal.
+REGISTER_EVIDENCE_FIELDS: Mapping[str, str] = {
+    "model_year_start": "shnat_yitzur", "model_year_end": "shnat_yitzur",
+    "official_model_code": "degem_nm", "trim": "ramat_gimur",
+    "identity_dimensions.fuel_type": "delek_cd",
+}
 
 #: The candidate identity is exactly the operation's input vocabulary.
 CANDIDATE_KEYS = ("manufacturer", "commercial_model", "model_year", "trim",
@@ -127,7 +143,21 @@ def candidate_outcome(*, task_id: str, call_id: str, tool: str, operation: str,
                         if isinstance(record.get(name), str) and record[name]}
         if registration:
             typed["registration"] = registration
+        # P32: the evidence fields this row CANNOT state, read from the
+        # server-built identity projection (an unstated register value is
+        # absent there). Stated only when there is one.
+        absent = sorted(field for field, name in REGISTER_EVIDENCE_FIELDS.items()
+                        if record.get(name) is None or record.get(name) == "")
+        if absent:
+            typed["register_fields_absent"] = absent
     return typed
+
+
+def register_fields_absent(outcomes: Iterable[Mapping[str, Any]]) -> set[str]:
+    """Every evidence field a RESOLVED outcome of one task says its row lacks."""
+    return {str(field) for item in outcomes
+            if isinstance(item, Mapping) and item.get("outcome") == RESOLVED
+            for field in (item.get("register_fields_absent") or [])}
 
 
 def unresolved_kinds(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
@@ -137,7 +167,8 @@ def unresolved_kinds(outcomes: Iterable[Mapping[str, Any]]) -> list[str]:
 
 
 __all__ = ["CANDIDATE_GAP_CODES", "CANDIDATE_KEYS", "CANDIDATE_OUTCOMES",
-           "MAX_OUTCOME_RECORD_IDS", "REGISTRATION_FIELDS", "RESOLVED",
+           "MAX_OUTCOME_RECORD_IDS", "REGISTER_EVIDENCE_FIELDS", "REGISTER_FIELD_ABSENT",
+           "REGISTRATION_FIELDS", "RESOLVED",
            "RESOLVE_VARIANT_OPERATION",
            "SOFT_GAP_CODES", "UNRESOLVED_AMBIGUOUS", "UNRESOLVED_NOT_FOUND",
-           "UNRESOLVED_OUTCOMES", "candidate_outcome", "unresolved_kinds"]
+           "UNRESOLVED_OUTCOMES", "candidate_outcome", "register_fields_absent", "unresolved_kinds"]

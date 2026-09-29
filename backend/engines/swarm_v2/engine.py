@@ -20,7 +20,8 @@ from .feasibility import envelope_supports_a_run, plan_worst_case
 from .grounding import VERIFIER_GROUNDING_VERSION
 from .outcome import (DEGRADED_STEP_CODES, degraded_review_item, finalize_product_outcome,
                       validate_product_outcome)
-from .resolution import CANDIDATE_GAP_CODES, SOFT_GAP_CODES, unresolved_kinds
+from .resolution import (CANDIDATE_GAP_CODES, REGISTER_FIELD_ABSENT, SOFT_GAP_CODES,
+                         register_fields_absent, unresolved_kinds)
 from .state import SwarmState
 from .support import VERIFIER_CONTRACT_VERSION
 from .verifier import Verifier, VerifierContractError, VerifierProgress
@@ -245,6 +246,11 @@ class SwarmV2Engine:
         it can never produce the evidence a resolved one would. An evidence
         shortfall with no typed explanation stays the hard
         `EVIDENCE_REQUIREMENTS_UNMET` it always was.
+
+        P32: a shortfall that is EXACTLY fields the task's resolved register
+        row does not state (its outcome's `register_fields_absent`), with the
+        source minimum met, is the soft `REGISTER_FIELD_ABSENT` instead: the
+        register has no value to quote, which is not a failed task.
         """
         refs = list(evidence)
         outcomes = resolutions or {}
@@ -266,12 +272,15 @@ class SwarmV2Engine:
                         item.supported and item.confidence >= task.evidence.min_confidence]
             source_ids = {item.source_id for item in eligible}
             fields = {item.field for item in eligible}
-            if (len(source_ids) < task.evidence.minimum_sources or
-                    not set(task.evidence.required_fields) <= fields):
+            missing = set(task.evidence.required_fields) - fields
+            if len(source_ids) < task.evidence.minimum_sources or missing:
                 if unresolved:
                     continue
-                gaps.append({"task_id": task.task_id,
-                             "code": "EVIDENCE_REQUIREMENTS_UNMET"})
+                absent = register_fields_absent(outcomes.get(task.task_id, ()))
+                code = (REGISTER_FIELD_ABSENT
+                        if len(source_ids) >= task.evidence.minimum_sources and missing <= absent
+                        else "EVIDENCE_REQUIREMENTS_UNMET")
+                gaps.append({"task_id": task.task_id, "code": code})
         return gaps
 
     @staticmethod

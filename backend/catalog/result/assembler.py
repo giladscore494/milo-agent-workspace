@@ -51,9 +51,14 @@ from backend.engines.swarm_v2.contracts import EvidenceReference, VerificationVe
 from backend.engines.swarm_v2.current_verdict import current_verdict_by_claim
 from backend.engines.swarm_v2.evidence_contracts import (EvidenceContractError,
                                                          parse_locator_key)
-from backend.engines.swarm_v2.resolution import (CANDIDATE_KEYS, REGISTRATION_FIELDS, RESOLVED,
-                                                 SOFT_GAP_CODES, UNRESOLVED_AMBIGUOUS,
-                                                 UNRESOLVED_NOT_FOUND)
+from backend.engines.swarm_v2.resolution import (CANDIDATE_GAP_CODES, CANDIDATE_KEYS,
+                                                 REGISTRATION_FIELDS, RESOLVED,
+                                                 UNRESOLVED_AMBIGUOUS, UNRESOLVED_NOT_FOUND)
+
+#: The candidate gaps, which have their own unresolved group. P32's soft
+#: `REGISTER_FIELD_ABSENT` is NOT one: it is about the resolved row, so it is
+#: attributed to that vehicle like any other code.
+CANDIDATE_CODES = frozenset(CANDIDATE_GAP_CODES.values())
 
 #: The identity every vehicle and every unresolved group states, in this order.
 #: `resolution.CANDIDATE_KEYS` is the operation's input vocabulary; a key the
@@ -187,7 +192,7 @@ class VehicleCatalogResultAssembler:
             if not isinstance(item, Mapping):
                 continue
             task_id, code = _text(item.get("task_id")), _text(item.get("code"))
-            if task_id and code and code not in SOFT_GAP_CODES:
+            if task_id and code and code not in CANDIDATE_CODES:
                 codes.setdefault(task_id, set()).add(code)
         return codes
 

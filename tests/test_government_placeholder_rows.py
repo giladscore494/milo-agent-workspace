@@ -36,6 +36,18 @@ from backend.testing.work_scope_seed import (committed_records, seed_prepared_pl
 PLACEHOLDER_ID = "37363"
 
 
+@pytest.fixture(autouse=True)
+def queues_built_before_p27(monkeypatch):
+    """These tests hold RUN preparation's own placeholder check. Since P27 the
+    queue build already leaves a placeholder out, so a placeholder reaches a
+    batch only in a queue built before P27: that is the queue these tests
+    build (the queue build's check is off; run preparation's is the one
+    under test and is untouched)."""
+    import backend.testing.memory_repository as memory
+
+    monkeypatch.setattr(memory, "is_placeholder_identity", lambda *_args: False)
+
+
 # =============================================================================
 # the rule
 # =============================================================================

@@ -2,6 +2,9 @@
 # grouped into ONE PR per ecosystem; major updates come as their own PRs. At
 # most 3 open PRs per ecosystem. Nothing is auto-merged: every update PR goes
 # through the same mandatory CI and review as any other change.
+# GitHub Actions: semver-major updates are ignored -- a major action upgrade
+# (e.g. actions/checkout@v5 -> v6) is a deliberate change made by hand, since
+# several static tests and operator workflows pin the exact major.
 version: 2
 updates:
   - package-ecosystem: pip
@@ -45,3 +48,7 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-major

@@ -642,7 +642,11 @@ def test_a_run_whose_batch_the_ledger_settles_whole_is_refused_before_any_paid_c
     assert refused.value.code == "GOVERNMENT_BATCH_ALREADY_COVERED"
 
 
-def test_placeholders_alone_still_refuse_as_placeholders():
+def test_placeholders_alone_still_refuse_as_placeholders(monkeypatch):
+    # A queue built before P27 (whose queue build now leaves them out).
+    import backend.testing.memory_repository as memory
+
+    monkeypatch.setattr(memory, "is_placeholder_identity", lambda *_args: False)
     world = World()
     placeholder = copy.deepcopy(AA["snapshot_rows"][0])
     placeholder.update({"_id": 37363, "kinuy_mishari": "11111", "degem_nm": "11111111"})
@@ -651,6 +655,36 @@ def test_placeholders_alone_still_refuse_as_placeholders():
     with pytest.raises(GovernmentPreparationError) as refused:
         prepare_government_work(world.repository, run_id=run)
     assert refused.value.code == "GOVERNMENT_BATCH_ONLY_PLACEHOLDERS"
+
+
+def test_the_queue_build_leaves_a_placeholder_out_and_records_it():
+    """P27: a placeholder source record is left out when the queue is BUILT --
+    not eligible, never queued, recorded with its register id under the
+    placeholder reason and counted -- so it spends no slot of the limit."""
+    world = World()
+    placeholder = copy.deepcopy(AA["snapshot_rows"][0])
+    placeholder.update({"_id": 37363, "kinuy_mishari": "11111", "degem_nm": "11111111"})
+    others = extra_rows(3)
+    plan = world.plan([placeholder, *others], max_items=3, batch_size=3)
+    assert world.queued_records(plan) == sorted(str(row["_id"]) for row in others)
+    unit = world.unit_coverage(plan)
+    assert unit["excluded_placeholder"] == 1
+    assert {"upstream_record_id": "37363",
+            "reason": coverage.EXCLUDED_PLACEHOLDER_SOURCE_RECORD} in unit["excluded_records"]
+    (unit_row,) = [u for u in world.repository.work_scope_units
+                   if u["preparation_id"] == plan["preparation"]["id"] and u["unit_key"] == "toyota"]
+    assert unit_row["eligible_count"] == 3 and unit_row["queued_count"] == 3
+    summary = world.repository._work_scope_preparation_summary(plan["preparation"], False)
+    assert summary["units"][0]["coverage"]["excluded_placeholder"] == 1
+    view = work_scope_batches.progress(world.repository, UUID(world.user), UUID(plan["work_scope_id"]))
+    assert view["preparation"]["units"][0]["coverage"]["pending"] == 0
+
+
+def test_the_queue_build_reason_is_the_batch_reason():
+    from backend.catalog.government import preparation as government_preparation
+
+    assert coverage.EXCLUDED_PLACEHOLDER_SOURCE_RECORD == \
+        government_preparation.EXCLUDED_PLACEHOLDER_SOURCE_RECORD.lower()
 
 
 def test_a_record_written_before_the_ledger_resumes_with_no_ledger_exclusions():
