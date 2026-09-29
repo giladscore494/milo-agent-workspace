@@ -1687,5 +1687,26 @@ __all__ = ["CAPTURE_ENTRYPOINT", "prepare_capture_run", "CAPTURE_MAX_PAGES", "CA
            "safe_message"]
 
 
+def _process_main(argv: Sequence[str]) -> int:
+    """The job's process entry: :func:`main` plus error reporting.
+
+    Reporting is a no-op unless SENTRY_DSN is configured, carries no capture
+    material (backend/observability.py), and never changes the exit status.
+    """
+    from backend import observability
+
+    observability.init_sentry("milo-catalog-capture")
+    try:
+        status = main(argv)
+    except Exception as exc:
+        observability.report_exception(exc)
+        observability.flush()
+        raise
+    if status == EXIT_FAILED:
+        observability.report_run_failed(None, "CATALOG_CAPTURE_FAILED", "operator_capture")
+    observability.flush()
+    return status
+
+
 if __name__ == "__main__":  # pragma: no cover - the process entry point
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(_process_main(sys.argv[1:]))

@@ -13,6 +13,10 @@ disabled (Stage A).
 | `NEXT_PUBLIC_SUPABASE_URL` | browser | yes | no | yes | yes | Supabase project settings | `check-production-config.sh`; bundle check | none | update Vercel env, redeploy |
 | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | browser | yes | no (public anon) | yes | yes | Supabase project settings | bundle secret check (`npm run test:secrets`) | none | rotate anon key in Supabase, update Vercel env |
 | `NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI` | browser | yes | no | no | no | operator (Stage C+) | `check_unsafe_defaults.py` | off | unset to hide execution UI |
+| `NEXT_PUBLIC_SENTRY_DSN` | browser + vercel | yes | no (a Sentry DSN only sends events) | no | no | operator: Sentry project `milo-frontend` (PR-OBS) | `frontend/lib/observability.ts` (`configuredDsn`); bundle check allowlist | empty = error reporting off, SDK never loaded | unset in Vercel, redeploy |
+| `NEXT_PUBLIC_MILO_SENTRY_TRACES_SAMPLE_RATE` | browser + vercel | yes | no | no | no | operator (optional) | capped at 0.05 | empty = traces off | unset |
+| `SENTRY_DSN` | api + worker + capture | no | yes (Secret Manager `SENTRY_DSN`, optional) | no | no | `scripts/ops/setup-sentry.sh`; bound only when the secret has an enabled version (`MILO_OPTIONAL_RUNTIME_SECRETS`) | `backend/observability.py` (`configured_dsn`) | unbound = error reporting off | disable the secret version, redeploy |
+| `MILO_SENTRY_TRACES_SAMPLE_RATE` | api + worker + capture | no | no | no | no | operator (optional) | capped at 0.05 | unset = traces off | unset |
 | `CLOUD_RUN_API_URL` | vercel | no | no | yes | yes | Cloud Run service URL | placeholder check; gateway smoke | none | restore previous URL, redeploy Vercel |
 | `GCP_PROJECT_NUMBER` | vercel | no | no | yes | yes | GCP project | gateway auth flow | none | n/a (project constant) |
 | `GCP_WORKLOAD_IDENTITY_POOL_ID` | vercel | no | no | yes | yes | manual WIF setup | gateway auth flow | none | recreate pool; update env |

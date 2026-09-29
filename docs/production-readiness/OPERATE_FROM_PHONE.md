@@ -134,9 +134,15 @@ if the project has none yet, and the workload identity pool `milo-github`, the O
 `github-actions` whose attribute condition admits **only**
 `assertion.repository == 'giladscore494/milo-agent-workspace' && assertion.ref ==
 'refs/heads/main' && assertion.environment in ['production',
-'production-kill-switch']`, and the deploy service account
-`milo-github-deployer@<project>.iam.gserviceaccount.com` with these roles and
-nothing else:
+'production-kill-switch', 'production-backup']` (`production-backup`: the
+scheduled Supabase backup, PR-OBS; its identities are bound to that
+environment's principalSet only), and the deploy service account
+`milo-github-deployer@<project>.iam.gserviceaccount.com`, impersonable ONLY
+from the `production` and `production-kill-switch` environments (its
+`workloadIdentityUser` members are exactly those two environment
+principalSets; `--apply` binds and reads them back, then removes the former
+repository-wide binding, then reads back that exactly those two remain -- and
+only then writes the provider condition), with these roles and nothing else:
 
 | Role | Where | Needed by |
 |---|---|---|
@@ -150,7 +156,7 @@ nothing else:
 | `roles/storage.bucketViewer` | project | `gcloud builds submit` proves the default source bucket belongs to the project (`storage.buckets.list`) |
 | `roles/storage.admin` | the `gs://<project>_cloudbuild` bucket only | Cloud Build source upload |
 | `roles/iam.serviceAccountUser` | the API, worker, capture **and build** service accounts only | deploying AS those identities; starting builds AS the build identity |
-| `roles/iam.workloadIdentityUser` | the deploy SA, for this repository's principals only | the keyless login |
+| `roles/iam.workloadIdentityUser` | the deploy SA, for the `production` and `production-kill-switch` environment principalSets only (never repository-wide, never `production-backup`) | the keyless login |
 
 and the build identity `CLOUD_BUILD_SERVICE_ACCOUNT`
 (`milo-cloudbuild@<project>.iam.gserviceaccount.com`) with exactly:
@@ -175,6 +181,10 @@ project-wide, is planned as `UNBIND` (the deployer's binding only).
   = `main` only. Secret `MILO_READONLY_DB_URL` (the read-only connection string).
 - **Environments → `production-kill-switch`**: **no** required reviewer;
   deployment branches = `main` only. Secret `VERCEL_TOKEN` (see Vercel below).
+- **Environments → `production-backup`** (PR-OBS, created by
+  `scripts/ops/setup-backup.sh`): **no** required reviewer (it runs on a
+  schedule); deployment branches = `main` only; admitted by the same WIF
+  provider (`setup-wif.sh --apply` first). See [SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).
 - **Repository variables**: `GCP_WORKLOAD_IDENTITY_PROVIDER`,
   `GCP_DEPLOY_SERVICE_ACCOUNT`, `GCP_PROJECT_ID` (printed by `setup-wif.sh`);
   `MILO_OPERATOR_CONFIG` (the contents of your `production-operator.env` --

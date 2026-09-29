@@ -1,0 +1,47 @@
+# PR-OBS (OBS-4): weekly dependency update PRs. Minor and patch updates are
+# grouped into ONE PR per ecosystem; major updates come as their own PRs. At
+# most 3 open PRs per ecosystem. Nothing is auto-merged: every update PR goes
+# through the same mandatory CI and review as any other change.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /backend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    groups:
+      backend-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    groups:
+      frontend-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:23"
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - minor
+          - patch

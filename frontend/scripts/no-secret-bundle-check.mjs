@@ -31,7 +31,7 @@ const SOURCE_FILE = /\.(ts|tsx|js|jsx|mjs)$/;
 /**
  * Every `NEXT_PUBLIC_*` variable the browser is allowed to hold.
  * Source of truth: `docs/production-readiness/ENVIRONMENT_MATRIX.md`
- * (Browser-visible = yes). All three are public by design: the Supabase URL
+ * (Browser-visible = yes). All of them are public by design: the Supabase URL
  * and anon key are what the browser authenticates with, and the execution-UI
  * flag only decides what is rendered — it is never a security boundary.
  */
@@ -39,6 +39,15 @@ const APPROVED_PUBLIC_VARS = new Set([
   'NEXT_PUBLIC_SUPABASE_URL',
   'NEXT_PUBLIC_SUPABASE_ANON_KEY',
   'NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI',
+  // PR-OBS: error reporting. A Sentry DSN is a public ingest address by
+  // design (it can only SEND events); the sample rate and Vercel's own
+  // system variables are not secrets either.
+  'NEXT_PUBLIC_SENTRY_DSN',
+  'NEXT_PUBLIC_MILO_SENTRY_TRACES_SAMPLE_RATE',
+  'NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA',
+  'NEXT_PUBLIC_VERCEL_ENV',
+  // Read by the Sentry SDK itself (lazy chunk, loaded only with a DSN).
+  'NEXT_PUBLIC_VERCEL_TARGET_ENV',
 ]);
 
 /** Server-only markers that must never appear in browser-bound source. */

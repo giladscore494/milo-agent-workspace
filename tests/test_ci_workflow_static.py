@@ -122,16 +122,21 @@ def test_every_mandatory_ci_job_exists():
         assert name in jobs, name
 
 
-def test_ci_runs_on_every_pull_request_without_path_filters_and_not_after_merge():
+def test_ci_runs_on_every_pull_request_without_path_filters():
     on = triggers(load(CI))
     assert "pull_request" in on
     pr = on["pull_request"] or {}
     for key in ("paths", "paths-ignore", "branches", "branches-ignore", "types"):
         assert key not in pr, f"pull_request trigger is narrowed by {key}"
-    # The release gate is CI on the merged PR's latest commit plus tree
-    # equality with the merge commit (SCOPED_BATCH_PRODUCTION_RUNBOOK.md), so
-    # there is deliberately no post-merge push run.
-    assert "push" not in on
+
+
+def test_ci_runs_on_every_push_to_main_and_only_main():
+    # PR-OBS (OBS-3): the merged commit on main gets its own run of the SAME
+    # mandatory jobs (none is conditional on the event, see below). Exactly
+    # `branches: [main]`: no path filter, no tags, no other branch.
+    on = triggers(load(CI))
+    assert on["push"] == {"branches": ["main"]}
+    assert set(on) == {"pull_request", "push", "workflow_dispatch"}
 
 
 def test_ci_can_be_dispatched_manually_on_the_release_sha():
