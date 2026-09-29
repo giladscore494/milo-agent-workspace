@@ -42,6 +42,10 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_candidate_variant_page": {"p_snapshot_id"},
     "catalog_canonical_manufacturer_coverage": {"p_manufacturers"},
     "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
+    "catalog_register_database_bytes": set(),
+    "catalog_register_latest_directory": set(),
+    "catalog_register_prunable_list": set(),
+    "catalog_register_unit_states": set(),
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
     "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
@@ -101,6 +105,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "prepare_work_scope_queue": {
         "p_attempt", "p_lease_token", "p_preparation", "p_run_id", "p_worker_id"
     },
+    "prune_register_snapshots": {"p_digest", "p_snapshot_keys"},
     "rebuild_catalog_variant_coverage": {"p_entries", "p_level", "p_run_id"},
     "record_catalog_candidates_batch_guarded": {
         "p_attempt", "p_candidates", "p_lease_token", "p_run_id", "p_worker_id"
@@ -129,11 +134,24 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_evidence_fragment_guarded": {
         "p_attempt", "p_fragment", "p_lease_token", "p_run_id", "p_worker_id"
     },
+    "record_register_capture_trigger": {
+        "p_execution_name", "p_group_id", "p_run_id", "p_trigger_state"
+    },
+    "record_register_directory": {"p_fetched_at", "p_resource_id", "p_units"},
+    "record_register_snapshot_archive": {
+        "p_attempt", "p_byte_size", "p_gcs_uri", "p_lease_token", "p_line_count", "p_run_id", "p_sha256", "p_snapshot_id", "p_worker_id"
+    },
+    "record_register_unit_status": {
+        "p_api_total", "p_attempt", "p_captured_rows", "p_count_verified", "p_failure_code", "p_lease_token", "p_run_id", "p_snapshot_id", "p_status", "p_unit_id", "p_worker_id"
+    },
     "record_run_usage_guarded": {
         "p_attempt", "p_lease_token", "p_ledger", "p_run_id", "p_worker_id"
     },
     "record_work_scope_preparation_trigger": {
         "p_attempt", "p_execution_name", "p_request_id", "p_run_id", "p_trigger_state"
+    },
+    "request_register_capture": {
+        "p_bytes_per_row", "p_capacity_limit_bytes", "p_grace_seconds", "p_group_max_rows", "p_register_version", "p_requested_by", "p_tozars"
     },
     "request_work_scope_preparation": {
         "p_digest", "p_grace_seconds", "p_requested_by", "p_revision", "p_work_scope_id"

@@ -100,6 +100,10 @@ jobs:
             printf '%s\n' "${dirty}"
             exit 1
           fi
+          if ! grep -qxF 'gha-creds-*.json' .gcloudignore; then
+            echo "::error::.gcloudignore does not exclude gha-creds-*.json: gcloud builds submit would upload the credentials file."
+            exit 1
+          fi
           echo "Clean: the credentials file is ignored and nothing else changed."
 
       - name: Set up gcloud

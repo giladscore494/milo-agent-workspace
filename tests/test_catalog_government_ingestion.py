@@ -1272,6 +1272,12 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # holds it to that. It is NOT a worker, a route, a tool or a schedule:
         # the assertions below and in that module are what keep it one.
         "backend/catalog/operator_capture.py",
+        # PR-D1: register capture -- run ONLY inside that entrypoint's register
+        # modes (directory refresh, one capture group), with the entrypoint's
+        # own client, lease and gates; the in-memory mirror reads the
+        # directory's version function.
+        "backend/catalog/register/capture.py",
+        "backend/testing/register_memory.py",
         # CODE-3: the bounded READ-ONLY review layer. It names the WLTP resource
         # constant and reads through `GovernmentCatalogQuery`, which is the
         # existing bounded database-side reader -- it constructs no transport,

@@ -514,8 +514,6 @@ if [[ "$MODE" == "plan" ]]; then
   print_plan_authoring_commands
   printf '\n== E'"'"' — preparing from the website (Cloud Run API + capture job IAM) ==\n'
   print_web_preparation_commands
-  printf '\n== PR-D1 — register capture from the website (Cloud Run API + capture job IAM) ==\n'
-  print_register_capture_commands
   printf '\n== Stage 2 — backend (Cloud Run) ==\n'
   print_backend_commands
   printf '\n== Frontend (Vercel) — printed only, never applied from here ==\n'
@@ -524,6 +522,8 @@ if [[ "$MODE" == "plan" ]]; then
   print_frontend_commands
   printf '\n== The last step: open run starts (Vercel), only after --gate armed passes ==\n'
   print_run_start_commands
+  printf '\n== PR-D1 — register capture from the website (Cloud Run API + capture job IAM) ==\n'
+  print_register_capture_commands
   printf '\nPLAN ONLY — nothing was changed.\n'
   exit 0
 fi
