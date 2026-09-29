@@ -46,6 +46,8 @@ from tests.test_migrations_postgres import (
 )
 
 VARIANTS_PG_PORT = "54998"
+#: By name, not by position: later migrations apply after it.
+VARIANTS_MIGRATION = next(m for m in MIGRATIONS if m.name == "20260930000100_catalog_variants.sql")
 RESOURCE = "142afde2-6228-49f9-8a29-9b6c3a0cbe40"
 TOYOTA = "טויוטה"
 RELEASE_RO = "milo_release_readonly_4b1d9e7c2a60"
@@ -75,7 +77,7 @@ def vdb():
         server.psql(sql=SUPABASE_AUTH_SHIM)
         server.psql(f"create role {RO_ROLE} login bypassrls; grant pg_read_all_data to {RO_ROLE}; "
                     f"create role {NOT_A_READER} login bypassrls")
-        assert MIGRATIONS[-1].name == "20260930000100_catalog_variants.sql"
+        assert VARIANTS_MIGRATION in MIGRATIONS
         for migration in MIGRATIONS:
             server.psql(file=migration)
         yield server
@@ -160,7 +162,7 @@ def built(vdb):
 # -- 1. applies, rerun-safe, privileges ------------------------------------------------
 
 def test_the_migration_is_rerun_safe_and_pins_the_mapper(vdb):
-    vdb.psql(file=MIGRATIONS[-1])
+    vdb.psql(file=VARIANTS_MIGRATION)
     assert vdb.psql("select public.catalog_variant_mapper_version()") == mapper.MAPPER_VERSION
     assert vdb.psql("select count(*) from pg_policies where tablename like 'catalog\\_variant%'") == "0"
     assert vdb.psql("select pg_get_constraintdef(oid) from pg_constraint "
