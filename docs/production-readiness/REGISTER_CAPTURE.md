@@ -40,7 +40,9 @@ that name the snapshot (`measurement_method =
 pg_column_size(raw_records+candidates+variants+ledger)`,
 `catalog_register_measured_bytes`): taken again whenever the snapshot's
 variant build completes, and at once for a unit that reuses an already built
-snapshot. Heap sizes only (a floor): the estimate below includes indexes.
+snapshot. A re-measurement sets `measured_at`, never `updated_at`: it never
+makes an older unit the tozar's newest. Heap sizes only (a floor): the
+estimate below includes indexes.
 
 The estimate (PR-L1b, 6,000 B/row) is the measured total per register row,
 tables + TOAST + indexes, rounded up to the next 500: raw record + candidate

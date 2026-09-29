@@ -213,6 +213,12 @@ as $$
                                                          and v.variant_identity_key is not null)), 0)
 $$;
 
+-- When a unit's storage was last measured. A re-measurement sets THIS, never
+-- updated_at: "the newest unit per tozar" (the Register page, REGISTER_COVERAGE,
+-- retention's latest captured unit) is chosen by updated_at, and measuring an
+-- older unit must never make it the newest.
+alter table public.catalog_register_capture_units add column if not exists measured_at timestamptz;
+
 -- record_register_unit_status (20260929000100) measures raw records +
 -- candidates under that label. For a snapshot that is already built (a
 -- capture that reuses a content-addressed snapshot) that is not the whole
@@ -225,6 +231,7 @@ begin
   if new.snapshot_id is not null and new.measurement_method = 'pg_column_size(raw_records+candidates)' then
     new.measured_bytes := public.catalog_register_measured_bytes(new.snapshot_id);
     new.measurement_method := 'pg_column_size(raw_records+candidates+variants+ledger)';
+    new.measured_at := now();
   end if;
   return new;
 end;
@@ -439,12 +446,13 @@ begin
   select count(*) into v_keys from written;
 
   -- A complete build re-measures the register units that captured the
-  -- snapshot: raw records, candidates, variants and their ledger rows.
+  -- snapshot: raw records, candidates, variants and their ledger rows. It
+  -- sets measured_at and leaves updated_at alone (which unit is newest).
   if v_build.completed_at is not null then
     update public.catalog_register_capture_units
        set measured_bytes = public.catalog_register_measured_bytes(p_snapshot_id),
            measurement_method = 'pg_column_size(raw_records+candidates+variants+ledger)',
-           updated_at = now()
+           measured_at = now()
      where snapshot_id = p_snapshot_id and status = 'captured';
   end if;
 
@@ -886,6 +894,14 @@ declare
     'public.catalog_variant_current_snapshot(text)',
     'public.catalog_register_prunable_variant_builds()'];
 begin
+  -- The measurement trigger's function is called by its trigger only.
+  execute 'revoke execute on function public.catalog_register_unit_measure() from public';
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    execute 'revoke execute on function public.catalog_register_unit_measure() from anon';
+  end if;
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    execute 'revoke execute on function public.catalog_register_unit_measure() from authenticated';
+  end if;
   foreach fn in array v_reads loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname = 'anon') then

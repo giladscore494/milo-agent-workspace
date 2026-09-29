@@ -452,6 +452,53 @@ def test_a_superseded_snapshot_is_pruned_with_its_variants_and_referenced_ones_n
     assert page["total"] == 1 and page["items"][0]["variants"] == 1
 
 
+def test_a_backfill_that_completes_a_build_never_makes_an_older_unit_the_newest(vdb):
+    """U1 captured S1 (its build partial); U2, for a newer register version,
+    FAILED and made no snapshot, so S1 is still rank 1. The operator's backfill
+    completes S1's build and re-measures U1 -- measured_at, never updated_at --
+    so U2 stays the tozar's newest unit: on the Register page's states, in
+    REGISTER_COVERAGE and in retention's latest-captured keep."""
+    marque = "מדידה-מאוחרת"
+    rows = [dict(record(37425), _id=960001, tozar=marque), dict(record(37439), _id=960002, tozar=marque)]
+    s1 = _snapshot(vdb, rows, "unit-order", marque=marque)
+    _build(vdb, s1, rows[:1])
+    units = {}
+    for name, version, status, ago in (("u1", "d" * 64, "captured", "2 hours"), ("u2", "f" * 64, "failed", "1 hour")):
+        group = vdb.psql("insert into public.catalog_register_capture_groups (register_version, requested_by, "
+                         f"expected_rows) values ('{version}', '{uuid.uuid4()}', 2) returning id")
+        captured = status == "captured"
+        units[name] = vdb.psql(
+            "insert into public.catalog_register_capture_units (group_id, register_version, tozar, expected_rows, "
+            "status, failure_code, snapshot_id, snapshot_key, api_total, captured_rows, count_verified, created_at, "
+            f"updated_at) values ('{group}', '{version}', '{marque}', 2, '{status}', "
+            f"{'null' if captured else chr(39) + 'CATALOG_REGISTER_CAPTURE_FAILED' + chr(39)}, "
+            f"{chr(39) + s1['id'] + chr(39) if captured else 'null'}, "
+            f"{chr(39) + s1['key'] + chr(39) if captured else 'null'}, {2 if captured else 'null'}, "
+            f"{2 if captured else 'null'}, {'true' if captured else 'null'}, now() - interval '{ago}', "
+            f"now() - interval '{ago}') returning id")
+    newest = (f"select u->>'id' from jsonb_array_elements(public.catalog_register_unit_states()) u "
+              f"where u->>'tozar' = '{marque}'")
+    stamps = f"select string_agg(id || '@' || updated_at, ',' order by id) from public.catalog_register_capture_units " \
+             f"where tozar = '{marque}'"
+    before = {"newest": vdb.psql(newest), "stamps": vdb.psql(stamps),
+              "coverage": json.loads(vdb.psql("select public.catalog_register_coverage()")),
+              "prunable": _prunable(vdb)}
+    assert before["newest"] == units["u2"]
+    assert _build(vdb, s1, rows[1:])["complete"] is True      # the backfill completes the build
+    measured, method, measured_at = vdb.psql(
+        "select measured_bytes, measurement_method, measured_at is not null from public.catalog_register_capture_units "
+        f"where id = '{units['u1']}'").split("|")
+    assert method == "pg_column_size(raw_records+candidates+variants+ledger)" and measured_at == "t"
+    assert int(measured) == int(vdb.psql(f"select public.catalog_register_measured_bytes('{s1['id']}')"))
+    coverage = json.loads(vdb.psql("select public.catalog_register_coverage()"))
+    assert vdb.psql(newest) == units["u2"] and vdb.psql(stamps) == before["stamps"]
+    assert {k: v for k, v in coverage.items() if k != "database_bytes"} == \
+        {k: v for k, v in before["coverage"].items() if k != "database_bytes"}
+    assert _prunable(vdb)["digest"] == before["prunable"]["digest"]
+    assert vdb.psql("select distinct on (u.tozar) u.id from public.catalog_register_capture_units u "
+                    f"where u.tozar = '{marque}' order by u.tozar, u.updated_at desc") == units["u2"]
+
+
 def test_a_pruned_partial_build_s_ledger_rows_are_repointed_to_the_current_build(vdb):
     """A newer snapshot's PARTIAL build wrote ledger rows for a key the older,
     complete (current) build also states; it is superseded and pruned. Those
@@ -667,13 +714,14 @@ def test_bytes_per_variant_row_and_the_full_register_projection(vdb, capsys):
               f"projection for 100,000 rows {variants * 100_000 / 1e6:.1f} MB variants + "
               f"{ledger * 100_000 / 1e6:.1f} MB ledger = {projection_mb:.1f} MB")
     # PR-L1b: the equipment document became two masks and a five-text array;
-    # the bound is the measurement (975 B/row, table + TOAST + indexes; the
-    # ledger 996) + 15%, so a regression fails here.
+    # the bound is the measurement (975-1,039 B/row across runs, table + TOAST
+    # + indexes, pinned at 1,027; the ledger 996) + 15%, so a regression fails
+    # here.
     assert variants <= VARIANT_ROW_BYTES * 1.15 and ledger <= LEDGER_ROW_BYTES * 1.15
 
 
 #: Measured by the test above (PostgreSQL 16) after PR-L1b's compaction.
-VARIANT_ROW_BYTES, LEDGER_ROW_BYTES = 975, 996
+VARIANT_ROW_BYTES, LEDGER_ROW_BYTES = 1027, 996
 
 
 def _sizes(db) -> dict[str, int]:
