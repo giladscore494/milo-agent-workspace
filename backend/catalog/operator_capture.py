@@ -1623,6 +1623,17 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     supervisor.stop()
 
     if register_document is not None:
+        group = register_document.get("group") or {}
+        if int(group.get("failed") or 0) > 0:
+            # A unit that failed may have left its snapshot PENDING under this
+            # run. Ending the run `failed` is what lets the next capture of that
+            # tozar -- or Prepare's scoped capture of it -- adopt the pending
+            # snapshot (adoption only takes over from a failed writer) instead
+            # of being refused by it for good.
+            _finalize(repository, lease, document=register_document,
+                      reason_code="CATALOG_REGISTER_CAPTURE_FAILED", cancelled=False)
+            return EXIT_FAILED, _envelope("failed", "CATALOG_REGISTER_CAPTURE_FAILED",
+                                          register=register_document)
         _finalize(repository, lease, document=register_document, reason_code="", cancelled=False)
         return EXIT_OK, _envelope("succeeded", "", register=register_document)
     if preparation is not None:

@@ -140,6 +140,7 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['CATALOG_REGISTER_JOB_NOT_RELEASE', 'The capture job does not run the deployed release, so nothing was started. An operator must update the capture job first.'],
   ['CATALOG_REGISTER_JOB_UNREADABLE', 'The server could not read the capture job or the worker job, so nothing was started.'],
   ['CATALOG_REGISTER_TRIGGER_FAILED', 'The capture job could not be started. Capture can be tried again.'],
+  ['CATALOG_REGISTER_WORKFLOW_UNSUPPORTED', "This project's engine does not read the Government catalog, so it cannot capture the register."],
   ['CATALOG_REGISTER_CONVERSATION_UNAVAILABLE', 'Open a conversation of this project first; register capture is recorded under it.'],
 
   // An ordinary task in a project whose runs read the Government catalog:

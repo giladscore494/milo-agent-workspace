@@ -232,7 +232,7 @@ REQUIRED_PER_FILE["20260929000100_catalog_register_capture.sql"] = [
     "raise exception 'catalog_capacity_threshold_exceeded: current=% projected=% limit=%'",
     "raise exception 'catalog_prune_digest_mismatch",
     "lock table public.catalog_source_snapshots, public.catalog_raw_records,",
-    "revoke delete on table %s from service_role",
+    "revoke delete, truncate on table %s from service_role",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
     "execute format('grant execute on function %s to %i', fn, ro.rolname);",
 ]

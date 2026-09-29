@@ -209,15 +209,17 @@ class DirectoryClient:
 
 
 def test_the_directory_is_metadata_only_bounded_and_exact():
-    fake = DirectoryClient({TOYOTA: 28, LEXUS: 5000, "טויוטה ": 3, None: 7})
+    # A padded value and one carrying a right-to-left mark are values no scoped
+    # capture can filter on (CaptureScope refuses them): counted, never units.
+    fake = DirectoryClient({TOYOTA: 28, LEXUS: 5000, "טויוטה ": 3, "מאזדה\u200f": 2, None: 7})
     found = discover_directory(fake, clock=lambda: 0.0)
-    assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28), ("טויוטה ", 3), (LEXUS, 5000)]
-    assert found.unfilterable_values == 1 and found.total_rows == 5031
+    assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28), (LEXUS, 5000)]
+    assert found.unfilterable_values == 3 and found.total_rows == 5028
     # One distinct read, then one count per tozar -- limit=0, never a row.
     distinct, *counts = fake.calls
     assert distinct["fields"] == "tozar" and distinct["distinct"] == "true"
     assert all(call["limit"] == "0" and "fields" not in call for call in counts)
-    assert found.requests == 4
+    assert found.requests == 3
 
 
 def test_the_directory_refuses_past_its_request_or_time_cap():
@@ -617,7 +619,9 @@ def test_the_api_captures_answers_202_then_200_and_a_capacity_body():
     assert refused.status_code == 409
     error = refused.json()["error"]
     assert error["code"] == "CATALOG_CAPACITY_THRESHOLD_EXCEEDED"
-    assert error["capacity"] == {"current_bytes": 399_999_000, "projected_bytes": 399_999_000 + 5000 * 3500,
+    # The first request's 28 rows are still in flight: they count too.
+    assert error["capacity"] == {"current_bytes": 399_999_000,
+                                 "projected_bytes": 399_999_000 + (5000 + 28) * 3500,
                                  "limit_bytes": 400_000_000}
 
 
@@ -796,3 +800,161 @@ def test_register_coverage_reads_the_api_capacity_from_its_plain_env_only(tmp_pa
     assert "SUPABASE_SECRET_KEY" not in out
     assert coverage_module.main([], stdin=io.StringIO("null")) == 0
     assert "REGISTER_COVERAGE=INFO not available" in capsys.readouterr().out
+
+
+# =============================================================================
+# 6. the review's findings, each held by a test
+# =============================================================================
+
+def test_a_failed_unit_fails_its_run_so_a_retry_and_prepare_can_adopt_its_snapshot(capsys, monkeypatch):
+    """Blocker 1: an archive failure leaves a PENDING snapshot; the run must end
+    `failed` so the next writer of the same content adopts it."""
+    repo, w = world()
+    version = directory(repo)
+    trigger = FakeTrigger()
+    answer, _ = request(repo, w, version, [TOYOTA], trigger)
+    args = list(trigger.calls[0].entrypoint_args)
+    run_id = args[args.index("--run-id") + 1]
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
+    monkeypatch.setattr(entrypoint, "_open_transport",
+                        lambda: FixtureTransport(bodies={0: scoped_page(planned_records())}))
+    monkeypatch.setattr(entrypoint, "_open_archive_writer", lambda env: FakeWriter(fail=True))
+    env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
+    status = entrypoint.main(authorized_argv(run_id, **{"--register-group-id": answer["group_id"]}), env=env)
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_FAILED and document["reason_code"] == "CATALOG_REGISTER_CAPTURE_FAILED"
+    assert repo.runs[run_id]["status"] == "failed"
+    pending_key = document["register"]["group"]["units"][0]["snapshot_key"]
+    assert snapshot_by_key(repo, pending_key)["activated_at"] is None
+    assert the_unit(repo)["count_verified"] is True  # the count passed; only the archive failed
+
+    # "Capture again", once the failed run's lease has lapsed (adoption's own
+    # rule, unchanged): a new group and run adopt the pending snapshot.
+    repo.runs[run_id]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"
+    retry, started = request(repo, w, version, [TOYOTA], trigger)
+    assert started
+    args = list(trigger.calls[-1].entrypoint_args)
+    run_id = args[args.index("--run-id") + 1]
+    writer = FakeWriter()
+    monkeypatch.setattr(entrypoint, "_open_archive_writer", lambda env: writer)
+    status = entrypoint.main(authorized_argv(run_id, **{"--register-group-id": retry["group_id"]}), env=env)
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+    assert document["register"]["group"]["units"][0]["snapshot_key"] == pending_key
+    assert snapshot_by_key(repo, pending_key)["activated_at"] is not None
+    assert the_unit(repo)["status"] == "captured"
+
+
+def test_prepare_can_adopt_a_snapshot_a_failed_register_run_left_pending():
+    repo, w = world()
+    version = directory(repo)
+    answer, _ = request(repo, w, version, [TOYOTA])
+    run_id = repo.register_capture_group(answer["group_id"])["group"]["run_id"]
+    lease = claimed_lease(repo, run_id)
+    report = capture_group(repo, lease, client=scoped_client(planned_records()), group_id=answer["group_id"],
+                           archive_writer=FakeWriter(fail=True))
+    entrypoint._finalize(repo, lease, document={}, reason_code="CATALOG_REGISTER_CAPTURE_FAILED", cancelled=False)
+    assert repo.runs[run_id]["status"] == "failed"
+    repo.runs[run_id]["lease_expires_at"] = "2000-01-01T00:00:00+00:00"  # the lease has lapsed
+    # Prepare's scoped capture of the same tozar (no archive hook) now adopts it.
+    code, doc = entrypoint.prepare_capture_run(repo, conversation_id=UUID(w["conversation"]), requested_by=USER,
+                                               idempotency_key="prepare", env=capture_env(MILO_RELEASE_SHA=RELEASE_SHA))
+    prepare_lease = claimed_lease(repo, doc["preparation"]["run_id"])
+    prepared = GovernmentCatalogIngestor(repo, prepare_lease, client=scoped_client(planned_records())).ingest_resource(
+        src.WLTP_RESOURCE_ID, capture_scope=CaptureScope.for_register_marque(TOYOTA))
+    assert prepared.snapshot_key == report.units[0].snapshot_key
+    assert snapshot_by_key(repo, prepared.snapshot_key)["activated_at"] is not None
+
+
+def test_a_recorded_archive_is_trusted_for_the_same_snapshot():
+    """Nit 8: a re-capture of an archived snapshot never rebuilds and compares gzip bytes."""
+    repo, w, version, report, writer = captured_world()
+    snapshot = snapshot_by_key(repo, report.units[0].snapshot_key)
+    recorded = repo.register_snapshot_archive(snapshot["id"])
+    from backend.catalog.register.capture import _Archiver
+
+    # The record short-circuits before any build, write or lease is needed.
+    archiver = _Archiver(repo, None, FakeWriter(fail=True), src.WLTP_RESOURCE_ID)
+    assert archiver.ensure(TOYOTA, object(), snapshot) == recorded
+
+
+def test_a_register_that_reverts_records_its_old_version_again():
+    repo = MemoryRepository()
+    a = [{"tozar": TOYOTA, "expected_rows": 28}]
+    b = [{"tozar": TOYOTA, "expected_rows": 29}]
+    first = repo.record_register_directory(src.WLTP_RESOURCE_ID, "t1", a)
+    repo.record_register_directory(src.WLTP_RESOURCE_ID, "t2", b)
+    back = repo.record_register_directory(src.WLTP_RESOURCE_ID, "t3", a)
+    assert back["decision"] == "created"
+    assert repo.latest_register_directory()["version"]["register_version"] == first["version"]["register_version"]
+
+
+def test_the_capacity_guard_counts_rows_still_in_flight():
+    repo, w = world()
+    repo.register_database_bytes = 394_700_000
+    version = directory(repo, {TOYOTA: 28, LEXUS: 1500})
+    assert request(repo, w, version, [LEXUS])[1]  # 394,700,000 + 1500 x 3500 = 399,950,000: fits
+    with pytest.raises(register_service.CapacityRefusal) as refused:
+        # Alone it would fit (394,798,000); with LEXUS still in flight it does not.
+        request(repo, w, version, [TOYOTA])
+    assert refused.value.capacity["projected_bytes"] == 394_700_000 + (28 + 1500) * 3500
+
+
+def test_a_stalled_capture_reads_failed_and_can_be_captured_again():
+    from datetime import UTC, datetime, timedelta
+
+    repo, w = world()
+    version = directory(repo)
+    trigger = FakeTrigger()
+    answer, _ = request(repo, w, version, [TOYOTA], trigger)
+    group = repo._register_state()["groups"][answer["group_id"]]
+    run = repo.runs[group["run_id"]]
+    old = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    group["triggered_at"] = group["claimed_at"] = old
+    # A run no worker ever claimed, long past the grace.
+    assert run["status"] == "queued" and not run.get("worker_id")
+    api = client(repo, trigger)
+    page = api.get(f"/projects/{w['project']}/register", headers=as_user()).json()
+    toyota = next(u for u in page["units"] if u["tozar"] == TOYOTA)
+    assert (toyota["state"], toyota["failure_code"]) == ("failed", "CATALOG_REGISTER_CAPTURE_STALLED")
+    assert request(repo, w, version, [TOYOTA], trigger)[1] is True
+
+
+def test_an_expired_lease_long_past_the_grace_is_retryable():
+    from datetime import UTC, datetime, timedelta
+
+    repo, w = world()
+    version = directory(repo)
+    trigger = FakeTrigger()
+    answer, _ = request(repo, w, version, [TOYOTA], trigger)
+    run_id = repo.register_capture_group(answer["group_id"])["group"]["run_id"]
+    claimed_lease(repo, run_id)
+    repo.runs[run_id]["lease_expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    assert repo.runs[run_id]["status"] in ("starting", "running")
+    assert request(repo, w, version, [TOYOTA], trigger)[1] is True
+
+
+def test_a_project_whose_engine_does_not_read_the_catalog_has_no_register():
+    repo = MemoryRepository()
+    repo.seed_user(str(USER))
+    project = str(uuid4())
+    repo.seed_project(project, "p-v1", "P", [str(USER)], workflow_key="vehicle_catalog_v1")
+    conversation = repo.create_conversation(UUID(project), "c", USER)["id"]
+    version = directory(repo)
+    api = client(repo, FakeTrigger())
+    assert api.get(f"/projects/{project}/register", headers=as_user()).status_code == 404
+    refused = api.post(f"/projects/{project}/register/captures", headers=as_user(), json={
+        "register_version": version, "tozars": [TOYOTA], "conversation_id": conversation})
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "CATALOG_REGISTER_WORKFLOW_UNSUPPORTED"
+
+
+def test_retention_keeps_the_latest_captured_register_snapshot():
+    repo, _w, _version, report, _writer = captured_world()
+    key = report.units[0].snapshot_key
+    # Two newer activations of the same tozar would otherwise make it prunable.
+    snapshot = snapshot_by_key(repo, key)
+    for label in ("n1", "n2"):
+        newer = dict(snapshot, id=str(uuid4()), snapshot_key=f"cs1.{label}",
+                     activated_at="2099-01-0%s" % ("1" if label == "n1" else "2"))
+        repo.catalog_snapshots[("government", src.WLTP_RESOURCE_ID, newer["snapshot_key"])] = newer
+    assert key not in {row["snapshot_key"] for row in repo.prunable_register_snapshots()}

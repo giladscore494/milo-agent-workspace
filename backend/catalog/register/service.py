@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
@@ -57,6 +58,8 @@ REQUEST_REASONS: Mapping[str, tuple[int, str]] = {
     "CATALOG_REGISTER_TRIGGER_FAILED": (502, "the capture job could not be started"),
     "CATALOG_REGISTER_CONVERSATION_UNAVAILABLE":
         (404, "that conversation does not belong to this project"),
+    "CATALOG_REGISTER_WORKFLOW_UNSUPPORTED":
+        (409, "this project's engine does not read the Government catalog"),
 }
 
 _TRIGGER_CODES = {trig.JOB_NOT_RELEASE: "CATALOG_REGISTER_JOB_NOT_RELEASE",
@@ -104,8 +107,32 @@ def server_can_capture(trigger: Any, env: Mapping[str, str] | None = None) -> bo
 
 # -- the page ------------------------------------------------------------------
 
+def _time(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
+def _stalled(group: Mapping[str, Any], run: Mapping[str, Any], now: datetime) -> bool:
+    """The database's retry rule (request_register_capture), read for the page:
+    a claim that never got a run, a run no worker ever claimed, or a running
+    capture whose lease expired -- each longer ago than the grace."""
+    limit = now - timedelta(seconds=START_GRACE_SECONDS)
+    claimed = _time(group.get("claimed_at"))
+    started = _time(group.get("triggered_at")) or claimed
+    lease = _time(run.get("lease_expires_at")) if run.get("lease_expires_at") else None
+    return bool(
+        (group.get("trigger_state") == "claimed" and claimed is not None and claimed < limit)
+        or (run.get("status") == "queued" and not run.get("worker_id") and started is not None and started < limit)
+        or (run.get("status") in ("starting", "running") and lease is not None and lease < limit))
+
+
 def _state(unit: Mapping[str, Any] | None, runs: Mapping[str, Mapping[str, Any]],
-           groups: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+           groups: Mapping[str, Mapping[str, Any]], now: datetime | None = None) -> dict[str, Any]:
     if unit is None:
         return {"state": "not_captured"}
     status = str(unit.get("status"))
@@ -127,6 +154,10 @@ def _state(unit: Mapping[str, Any] | None, runs: Mapping[str, Mapping[str, Any]]
                                    "budget_exhausted"):
             # The job ended without recording this unit's outcome.
             view.update(state="failed", failure_code="CATALOG_REGISTER_CAPTURE_INTERRUPTED")
+        elif _stalled(group, run, now or datetime.now(UTC)):
+            # The database would take a new request for it: say so, so the
+            # page offers "Capture again".
+            view.update(state="failed", failure_code="CATALOG_REGISTER_CAPTURE_STALLED")
         else:
             view["state"] = "capturing"
     if view["state"] == "requested":
@@ -134,10 +165,18 @@ def _state(unit: Mapping[str, Any] | None, runs: Mapping[str, Mapping[str, Any]]
     return view
 
 
+def _supported(project: Mapping[str, Any]) -> bool:
+    from backend.catalog.scope.service import WORK_SCOPE_WORKFLOWS
+
+    return project.get("workflow_key") in WORK_SCOPE_WORKFLOWS
+
+
 def register_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: Any,
                   env: Mapping[str, str] | None = None) -> dict[str, Any]:
     require_enabled(env)
-    repo.get_project(project_id, user_id)
+    # A project whose engine does not read the catalog has no Register page.
+    if not _supported(repo.get_project(project_id, user_id)):
+        raise _refusal("CATALOG_REGISTER_DISABLED")
     config = register_config.load(env)
     directory = repo.latest_register_directory()
     units = list(repo.register_capture_units())
@@ -186,7 +225,8 @@ def register_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: Any,
 # -- Capture ---------------------------------------------------------------------
 
 def _authorized_conversation(repo: Any, user_id: UUID, project_id: UUID, conversation_id: UUID) -> None:
-    repo.get_project(project_id, user_id)
+    if not _supported(repo.get_project(project_id, user_id)):
+        raise _refusal("CATALOG_REGISTER_WORKFLOW_UNSUPPORTED")
     try:
         conversation = repo.get_conversation(conversation_id, user_id)
     except Exception:

@@ -23,6 +23,10 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _as_time(value: Any) -> datetime:
+    return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+
+
 class RegisterMemoryMixin:
     #: What `pg_database_size` answers in these tests (production measured 107 MB).
     register_database_bytes: int = 107 * 1000 * 1000
@@ -43,9 +47,9 @@ class RegisterMemoryMixin:
                 or any(not 1 <= len(t) <= 200 for t in tozars)):
             raise AppError("CATALOG_REGISTER_DIRECTORY_INVALID", "invalid register directory", 409)
         version = directory_version(resource_id, units)
-        for existing in state["directories"]:
-            if existing["version"]["register_version"] == version:
-                return {"decision": "unchanged", "version": dict(existing["version"])}
+        # Only the CURRENT (newest) version counts: A -> B -> A records A again.
+        if state["directories"] and state["directories"][-1]["version"]["register_version"] == version:
+            return {"decision": "unchanged", "version": dict(state["directories"][-1]["version"])}
         row = {"id": str(uuid4()), "resource_id": resource_id, "register_version": version,
                "unit_count": len(units), "total_rows": sum(int(u["expected_rows"]) for u in units),
                "fetched_at": fetched_at, "created_at": _now()}
@@ -92,7 +96,10 @@ class RegisterMemoryMixin:
                          or (group["trigger_state"] == "claimed" and claimed < datetime.now(UTC) - grace)
                          or (run is not None and run.get("status") in _TERMINAL)
                          or (run is not None and run.get("status") == "queued" and not run.get("worker_id")
-                             and started < datetime.now(UTC) - grace))
+                             and started < datetime.now(UTC) - grace)
+                         or (run is not None and run.get("status") in ("starting", "running")
+                             and run.get("lease_expires_at")
+                             and _as_time(run["lease_expires_at"]) < datetime.now(UTC) - grace))
                 if retry:
                     new.append(tozar)
             if not new:
@@ -102,8 +109,11 @@ class RegisterMemoryMixin:
             rows = sum(expected[t] for t in new)
             if len(new) > 1 and rows > group_max_rows:
                 raise AppError("CATALOG_REGISTER_GROUP_TOO_LARGE", "too large", 409)
+            inflight = sum(int(u["expected_rows"]) for u in state["units"].values()
+                           if u["status"] in ("requested", "capturing")
+                           and not (u["register_version"] == register_version and u["tozar"] in new))
             current = int(self.register_database_bytes)
-            projected = current + rows * int(bytes_per_row)
+            projected = current + (rows + inflight) * int(bytes_per_row)
             if projected > capacity_limit_bytes:
                 raise AppError("CATALOG_CAPACITY_THRESHOLD_EXCEEDED",
                                f"current={current} projected={projected} limit={capacity_limit_bytes}", 409)
@@ -221,6 +231,9 @@ class RegisterMemoryMixin:
             snapshot = self._snapshot_by_id(snapshot_id)
             if snapshot is None:
                 raise AppError("CATALOG_REGISTER_REQUEST_INVALID", "unknown snapshot", 409)
+            if not str(gcs_uri).endswith(f"/{snapshot['snapshot_key']}.jsonl.gz") \
+                    or f"/register/{snapshot.get('resource_id')}/" not in str(gcs_uri):
+                raise AppError("CATALOG_REGISTER_REQUEST_INVALID", "the archive object does not name this snapshot", 409)
             lines = sum(1 for (sid, _k), row in self.catalog_raw_records.items()
                         if str(sid) == str(snapshot_id) and "capture_index" in (row.get("source_locator") or {}))
             if lines != line_count or int(snapshot.get("declared_record_count") or -1) != line_count:
@@ -260,6 +273,11 @@ class RegisterMemoryMixin:
             if isinstance(government, dict) and government.get("snapshot_key"):
                 referenced_keys.add(str(government["snapshot_key"]))
         live = {rid for rid, run in self.runs.items() if run.get("status") not in _TERMINAL}
+        latest_unit: dict[str, dict[str, Any]] = {}
+        for unit in sorted(self._register_state()["units"].values(), key=lambda u: str(u["updated_at"])):
+            if unit["status"] == "captured" and unit.get("snapshot_id"):
+                latest_unit[unit["tozar"]] = unit
+        referenced_ids |= {str(u["snapshot_id"]) for u in latest_unit.values()}
         rows = retention.prunable(self.catalog_snapshots.values(), referenced_ids=referenced_ids,
                                   referenced_keys=referenced_keys, live_run_ids=live)
         return [{"snapshot_id": str(r["id"]), "snapshot_key": r["snapshot_key"],

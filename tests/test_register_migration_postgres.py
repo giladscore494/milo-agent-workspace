@@ -49,7 +49,9 @@ TABLES = ("catalog_register_directory_versions", "catalog_register_directory_uni
           "catalog_register_snapshot_archives", "catalog_register_archive_lines")
 READ_FUNCTIONS = ("catalog_register_version(text,jsonb)", "catalog_register_database_bytes()",
                   "catalog_register_snapshot_bytes(uuid)", "catalog_register_prunable_snapshots()",
-                  "catalog_register_prune_digest(text[])", "catalog_register_coverage()")
+                  "catalog_register_prune_digest(text[])", "catalog_register_coverage()",
+                  "catalog_register_latest_directory()", "catalog_register_unit_states()",
+                  "catalog_register_prunable_list()")
 WRITE_FUNCTIONS = ("record_register_directory(text,timestamptz,jsonb)",
                    "request_register_capture(text,text[],uuid,integer,bigint,integer,integer)",
                    "record_register_capture_trigger(uuid,uuid,text,text)",
@@ -157,7 +159,8 @@ def test_browsers_and_other_roles_get_nothing(regdb):
     for function in READ_FUNCTIONS + WRITE_FUNCTIONS:
         assert regdb.psql(f"select has_function_privilege('service_role', 'public.{function}', 'EXECUTE')") == "t"
     for table in TABLES[:-1]:
-        assert regdb.psql(f"select has_table_privilege('service_role', 'public.{table}', 'DELETE')") == "f"
+        for privilege in ("DELETE", "TRUNCATE"):
+            assert regdb.psql(f"select has_table_privilege('service_role', 'public.{table}', '{privilege}')") == "f"
 
 
 # -- 2. the directory -------------------------------------------------------------
@@ -285,3 +288,47 @@ def test_prune_never_selects_the_kept_or_referenced_and_refuses_a_stale_digest(r
     assert regdb.psql("select count(*) from pg_trigger where not tgenabled = 'O' and tgname in ("
                       "'catalog_source_snapshots_append_only', 'catalog_raw_records_append_only', "
                       "'catalog_candidate_variants_identity_immutable')") == "0"
+
+
+# -- 6. review fixes ----------------------------------------------------------------
+
+def test_a_register_that_reverts_is_the_current_version_again(regdb):
+    a = {f"rev-{uuid.uuid4().hex[:6]}": 3}
+    b = {**a, f"rev-{uuid.uuid4().hex[:6]}": 1}
+    version_a = _directory(regdb, a)
+    version_b = _directory(regdb, b)
+    assert _directory(regdb, a) == version_a != version_b
+    latest = json.loads(_rpc_as_service(regdb, "select public.catalog_register_latest_directory()"))
+    assert latest["version"]["register_version"] == version_a
+    assert [u["tozar"] for u in latest["units"]] == list(a)
+
+
+def test_the_capacity_guard_counts_rows_still_in_flight(regdb):
+    first, second = f"fl-{uuid.uuid4().hex[:6]}", f"fl-{uuid.uuid4().hex[:6]}"
+    version = _directory(regdb, {first: 1000, second: 10})
+    current = int(regdb.psql("select pg_database_size(current_database())"))
+    # A limit that fits either request alone, but not both.
+    limit = current + 1005 * 3500
+    inflight = int(regdb.psql("select coalesce(sum(expected_rows), 0) from public.catalog_register_capture_units "
+                              "where status in ('requested', 'capturing')"))
+    limit += inflight * 3500
+    assert json.loads(_rpc_as_service(regdb, _request(regdb, version, [first], limit=limit)))["decision"] == "claimed"
+    text = _refusal(regdb, _request(regdb, version, [second], limit=limit))
+    assert "CATALOG_CAPACITY_THRESHOLD_EXCEEDED" in text
+
+
+def test_the_page_reads_are_single_documents(regdb):
+    states = json.loads(_rpc_as_service(regdb, "select public.catalog_register_unit_states()"))
+    assert isinstance(states, list) and len({s["tozar"] for s in states}) == len(states)
+    listing = json.loads(_rpc_as_service(regdb, "select public.catalog_register_prunable_list()"))
+    assert set(listing) == {"snapshots", "digest"}
+    assert listing["digest"] == prune_digest(s["snapshot_key"] for s in listing["snapshots"])
+
+
+def test_an_archive_uri_must_name_its_snapshot(regdb):
+    _user, _project, conversation = _ws_world(regdb)
+    _run_id, args = _wsp_capture_run(regdb, conversation)
+    snapshot, key = _scoped_snapshot(regdb, args, f"uri-{uuid.uuid4().hex[:6]}", 1)
+    wrong = f"gs://milo-test-archive/register/{RESOURCE}/{'a' * 16}/cs1.other.jsonl.gz"
+    assert "does not name this snapshot" in _refusal(
+        regdb, f"select public.record_register_snapshot_archive({args}, '{snapshot}', '{wrong}', 100, '{'b' * 64}', 1)")

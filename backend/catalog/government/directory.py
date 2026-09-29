@@ -15,6 +15,10 @@ whole discovery runs under two HARD caps: a request count
 (`MILO_REGISTER_DIRECTORY_MAX_SECONDS`). Exceeding either refuses the whole
 directory; nothing partial is ever recorded.
 
+A unit is always capturable: a value `CaptureScope` would refuse (padded,
+over-long, a control or format character) is counted with the unfilterable
+values instead.
+
 The directory is keyed by the EXACT tozar string. Nothing is normalized
 (that is D3): different spellings are different units. A value no filter can
 select (null or empty) is counted in `unfilterable_values` and never a unit.
@@ -36,6 +40,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable, Mapping
 
 from backend.catalog.government import source as src
+from backend.catalog.government.capture_scope import CaptureScopeError, _filter_value
 from backend.catalog.government.client import DataGovClient
 from backend.catalog.government.source import GovernmentSourceError
 
@@ -45,8 +50,10 @@ TOZAR_FIELD = "tozar"
 DISTINCT_PAGE_LIMIT = src.MAX_PAGE_LIMIT
 MAX_REQUESTS_ENV = "MILO_REGISTER_DIRECTORY_MAX_REQUESTS"
 MAX_SECONDS_ENV = "MILO_REGISTER_DIRECTORY_MAX_SECONDS"
-DEFAULT_MAX_REQUESTS = 1000
-DEFAULT_MAX_SECONDS = 900.0
+#: A full directory is one distinct page per 1000 values plus one count per
+#: tozar, so the request cap sits above the database's 5000-unit bound.
+DEFAULT_MAX_REQUESTS = 6000
+DEFAULT_MAX_SECONDS = 3000.0
 #: The database bounds a directory at 5000 units and a tozar at 200 chars.
 MAX_UNITS = 5000
 MAX_TOZAR_CHARS = 200
@@ -173,11 +180,15 @@ def _distinct_values(client: DataGovClient, resource_id: str,
                     or TOZAR_FIELD not in record:
                 raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
             value = record[TOZAR_FIELD]
-            if value is None or value == "":
+            if value is not None and not isinstance(value, str):
+                raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+            if not _capturable(value):
+                # A value no scoped capture can filter on -- null, empty,
+                # padded, over-long, or carrying a control/format character
+                # (CaptureScope refuses exactly these) -- is counted, never a
+                # unit: a unit is always capturable.
                 unfilterable += 1
                 continue
-            if not isinstance(value, str) or len(value) > MAX_TOZAR_CHARS:
-                raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
             if value in seen:
                 raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
             seen.add(value)
@@ -187,6 +198,16 @@ def _distinct_values(client: DataGovClient, resource_id: str,
         if len(records) < DISTINCT_PAGE_LIMIT:
             return values, unfilterable
         offset += DISTINCT_PAGE_LIMIT
+
+
+def _capturable(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        _filter_value(value)
+    except CaptureScopeError:
+        return False
+    return True
 
 
 def _count(client: DataGovClient, resource_id: str, tozar: str, budget: _Budget) -> int:

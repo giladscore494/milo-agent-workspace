@@ -130,14 +130,15 @@ class _Archiver:
     def ensure(self, tozar: str, capture: ResourceCapture, snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
         snapshot_id = str(snapshot["id"])
         recorded = self._repository.register_snapshot_archive(snapshot_id)
+        if recorded is not None:
+            # The snapshot is content-addressed and its archive was verified
+            # when it was recorded: the record stands. (Rebuilding and
+            # comparing the gzip bytes would tie it to one zlib build.)
+            return recorded
         obj = self._built.get(id(capture))
         if obj is None:
             obj = archive_module.build(record for _locator, record in capture.located_records())
             self._built[id(capture)] = obj
-        if recorded is not None:
-            if recorded.get("sha256") != obj.sha256:
-                raise RegisterCaptureError("CATALOG_ARCHIVE_WRITE_FAILED")
-            return recorded
         if self._writer is None:
             raise RegisterCaptureError("CATALOG_ARCHIVE_NOT_CONFIGURED")
         name = archive_module.object_name(self._resource_id, tozar, str(snapshot["snapshot_key"]))
@@ -220,10 +221,14 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         outcome.failure_code = _unit_code(failure)
         snapshot = seen.get("snapshot") or {}
         outcome.snapshot_key = str(snapshot.get("snapshot_key") or "")
+        if outcome.failure_code == "CATALOG_CAPTURE_COUNT_MISMATCH":
+            verified: bool | None = False
+        else:
+            # The count passed (captured_rows is set only then), or was never checked.
+            verified = True if outcome.captured_rows is not None else None
         record("failed", code=outcome.failure_code,
                snapshot_id=str(snapshot["id"]) if snapshot.get("id") else None,
-               api_total=outcome.api_total, captured=outcome.captured_rows,
-               verified=False if snapshot.get("id") else None)
+               api_total=outcome.api_total, captured=outcome.captured_rows, verified=verified)
         return outcome
 
 

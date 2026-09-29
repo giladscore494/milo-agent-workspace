@@ -58,7 +58,9 @@ create table if not exists public.catalog_register_directory_versions (
   fetched_at timestamptz not null,
   created_at timestamptz not null default now()
 );
-create unique index if not exists catalog_register_directory_versions_version_uidx
+-- NOT unique: a register that reverts (A -> B -> A) records A again as the
+-- newest row, so "the current version" is always the newest row.
+create index if not exists catalog_register_directory_versions_version_idx
   on public.catalog_register_directory_versions (register_version);
 create index if not exists catalog_register_directory_versions_created_idx
   on public.catalog_register_directory_versions (created_at desc);
@@ -146,16 +148,18 @@ begin
   select count(*), coalesce(sum((e->>'expected_rows')::bigint), 0)
     into v_count, v_total from jsonb_array_elements(p_units) e;
 
+  -- One writer at a time; a new row only when the content differs from the
+  -- CURRENT (newest) version.
+  perform pg_advisory_xact_lock(hashtext('public.catalog_register_directory'));
+  select * into v_row from public.catalog_register_directory_versions
+   order by created_at desc, id desc limit 1;
+  if found and v_row.register_version = v_version then
+    return jsonb_build_object('decision', 'unchanged', 'version', to_jsonb(v_row));
+  end if;
   insert into public.catalog_register_directory_versions
     (resource_id, register_version, unit_count, total_rows, fetched_at)
   values (p_resource_id, v_version, v_count, v_total, p_fetched_at)
-  on conflict (register_version) do nothing
   returning * into v_row;
-  if not found then
-    select * into v_row from public.catalog_register_directory_versions
-     where register_version = v_version;
-    return jsonb_build_object('decision', 'unchanged', 'version', to_jsonb(v_row));
-  end if;
   insert into public.catalog_register_directory_units (version_id, tozar, expected_rows)
   select v_row.id, e->>'tozar', (e->>'expected_rows')::integer
     from jsonb_array_elements(p_units) e;
@@ -318,6 +322,7 @@ declare
   v_new_rows bigint := 0;
   v_current bigint;
   v_projected bigint;
+  v_inflight bigint;
   v_retry boolean;
 begin
   if p_register_version is null or p_register_version !~ '^[0-9a-f]{64}$'
@@ -332,9 +337,11 @@ begin
   end if;
   v_grace := make_interval(secs => p_grace_seconds);
 
-  -- Serialize every claim behind the newest directory version.
+  -- Serialize every claim (and the directory writer) on one advisory lock --
+  -- never a row lock on the append-only directory.
+  perform pg_advisory_xact_lock(hashtext('public.catalog_register_directory'));
   select * into v_latest from public.catalog_register_directory_versions
-   order by created_at desc, id desc limit 1 for update;
+   order by created_at desc, id desc limit 1;
   if not found or v_latest.register_version <> p_register_version then
     raise exception 'CATALOG_REGISTER_VERSION_STALE: that is not the current register directory version'
       using errcode = '40001';
@@ -368,7 +375,9 @@ begin
       or (v_run.id is not null and v_run.status in ('completed', 'partial_success', 'failed',
                                                     'cancelled', 'timed_out', 'budget_exhausted'))
       or (v_run.id is not null and v_run.status = 'queued' and v_run.worker_id is null
-          and coalesce(v_group.triggered_at, v_group.claimed_at) < now() - v_grace);
+          and coalesce(v_group.triggered_at, v_group.claimed_at) < now() - v_grace)
+      or (v_run.id is not null and v_run.status in ('starting', 'running') and v_run.lease_expires_at is not null
+          and v_run.lease_expires_at < now() - v_grace);
     if v_retry then
       v_new := v_new || v_tozar;
       v_new_rows := v_new_rows + v_expected;
@@ -388,8 +397,14 @@ begin
       using errcode = '22023';
   end if;
   -- Capacity guard, before anything is written: no partial start.
+  -- Rows claimed by requests still in flight are not in the database yet:
+  -- they count against the threshold too.
+  select coalesce(sum(u.expected_rows), 0) into v_inflight
+    from public.catalog_register_capture_units u
+   where u.status in ('requested', 'capturing')
+     and not (u.register_version = p_register_version and u.tozar = any(v_new));
   v_current := pg_database_size(current_database());
-  v_projected := v_current + v_new_rows * p_bytes_per_row;
+  v_projected := v_current + (v_new_rows + v_inflight) * p_bytes_per_row;
   if v_projected > p_capacity_limit_bytes then
     raise exception 'CATALOG_CAPACITY_THRESHOLD_EXCEEDED: current=% projected=% limit=%',
       v_current, v_projected, p_capacity_limit_bytes using errcode = 'P0001';
@@ -556,6 +571,12 @@ begin
     raise exception 'CATALOG_CAPTURE_COUNT_MISMATCH: the archive does not hold exactly the stored rows'
       using errcode = '22023';
   end if;
+  if p_gcs_uri is null or right(p_gcs_uri, char_length(v_snapshot.snapshot_key) + 10)
+       <> '/' || v_snapshot.snapshot_key || '.jsonl.gz'
+     or strpos(p_gcs_uri, '/register/' || v_snapshot.resource_id || '/') = 0 then
+    raise exception 'CATALOG_REGISTER_REQUEST_INVALID: the archive object does not name this snapshot'
+      using errcode = '22023';
+  end if;
   select * into v_row from public.catalog_register_snapshot_archives where snapshot_id = p_snapshot_id;
   if found then
     if v_row.sha256 = p_sha256 and v_row.gcs_uri = p_gcs_uri and v_row.byte_size = p_byte_size then
@@ -613,6 +634,10 @@ as $$
      and not exists (select 1 from public.catalog_work_scope_batches x where x.snapshot_id = sc.id)
      and not exists (select 1 from public.catalog_work_scope_queue_items x where x.snapshot_id = sc.id)
      and not exists (select 1 from public.catalog_variant_coverage x where x.snapshot_key = sc.snapshot_key)
+     and sc.id not in (select distinct on (u.tozar) u.snapshot_id
+                         from public.catalog_register_capture_units u
+                        where u.status = 'captured' and u.snapshot_id is not null
+                        order by u.tozar, u.updated_at desc)
      and not exists (select 1 from public.run_checkpoints x
                       where x.artifacts->'government'->>'snapshot_key' = sc.snapshot_key)
      and not exists (select 1 from public.catalog_candidate_variants c
@@ -737,6 +762,59 @@ as $$
 $$;
 
 -- ---------------------------------------------------------------------------
+-- 7b. The page's reads, each ONE jsonb document: a set-returning read through
+-- PostgREST is truncated at its row cap (1000 on hosted Supabase), and the
+-- register has thousands of tozars.
+-- ---------------------------------------------------------------------------
+create or replace function public.catalog_register_latest_directory()
+returns jsonb
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  with latest as (
+    select * from public.catalog_register_directory_versions
+     order by created_at desc, id desc limit 1
+  )
+  select case when not exists (select 1 from latest) then null else jsonb_build_object(
+    'version', (select to_jsonb(l) from latest l),
+    'units', coalesce((select jsonb_agg(jsonb_build_object('tozar', d.tozar, 'expected_rows', d.expected_rows)
+                                        order by d.tozar collate "C")
+                         from public.catalog_register_directory_units d
+                         join latest l on l.id = d.version_id), '[]'::jsonb)) end
+$$;
+
+-- The newest request row per tozar (any directory version).
+create or replace function public.catalog_register_unit_states()
+returns jsonb
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select coalesce(jsonb_agg(to_jsonb(u) order by u.tozar collate "C"), '[]'::jsonb)
+    from (select distinct on (x.tozar) x.*
+            from public.catalog_register_capture_units x
+           order by x.tozar, x.updated_at desc, x.id desc) u
+$$;
+
+-- The prunable list and its digest, as one document computed in one statement.
+create or replace function public.catalog_register_prunable_list()
+returns jsonb
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  with p as (select * from public.catalog_register_prunable_snapshots())
+  select jsonb_build_object(
+    'snapshots', coalesce((select jsonb_agg(jsonb_build_object(
+                             'snapshot_id', p.snapshot_id, 'snapshot_key', p.snapshot_key, 'tozar', p.tozar,
+                             'raw_rows', p.raw_rows, 'estimated_bytes', p.estimated_bytes)
+                           order by p.snapshot_key collate "C") from p), '[]'::jsonb),
+    'digest', public.catalog_register_prune_digest(
+                coalesce((select array_agg(p.snapshot_key) from p), '{}'::text[])))
+$$;
+
+-- ---------------------------------------------------------------------------
 -- 8. RLS and privileges.
 -- ---------------------------------------------------------------------------
 alter table public.catalog_register_directory_versions enable row level security;
@@ -778,7 +856,10 @@ begin
     'public.catalog_register_snapshot_bytes(uuid)',
     'public.catalog_register_prunable_snapshots()',
     'public.catalog_register_prune_digest(text[])',
-    'public.catalog_register_coverage()'
+    'public.catalog_register_coverage()',
+    'public.catalog_register_latest_directory()',
+    'public.catalog_register_unit_states()',
+    'public.catalog_register_prunable_list()'
   ] loop
     execute format('revoke execute on function %s from public', fn);
     if exists (select 1 from pg_roles where rolname = 'anon') then
@@ -818,7 +899,7 @@ begin
       'public.catalog_register_capture_groups', 'public.catalog_register_capture_units',
       'public.catalog_register_snapshot_archives'
     ] loop
-      execute format('revoke delete on table %s from service_role', tbl);
+      execute format('revoke delete, truncate on table %s from service_role', tbl);
     end loop;
   end if;
 
@@ -849,7 +930,10 @@ begin
       'public.catalog_register_snapshot_bytes(uuid)',
       'public.catalog_register_prunable_snapshots()',
       'public.catalog_register_prune_digest(text[])',
-      'public.catalog_register_coverage()'
+      'public.catalog_register_coverage()',
+      'public.catalog_register_latest_directory()',
+      'public.catalog_register_unit_states()',
+      'public.catalog_register_prunable_list()'
     ] loop
       execute format('grant execute on function %s to %I', fn, ro.rolname);
     end loop;

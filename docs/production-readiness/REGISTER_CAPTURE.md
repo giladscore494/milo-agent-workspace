@@ -15,14 +15,15 @@ proxied, and its two writes are execution routes, so they use the existing
 
 | Step | Where | What |
 |---|---|---|
-| Directory | capture job (`--register-directory`) | One distinct read (`fields=tozar`, `distinct=true`) and one count per tozar (`limit=0`, `filters={"tozar": <exact>}`). Metadata only, no row payload, under hard caps (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`, default 1000; `MILO_REGISTER_DIRECTORY_MAX_SECONDS`, default 900). A new directory version only when the content changed: `register_version` = SHA-256 of `gov.register.directory.1`, the resource id, and the sorted `(tozar, count)` list. |
+| Directory | capture job (`--register-directory`) | One distinct read (`fields=tozar`, `distinct=true`) and one count per tozar (`limit=0`, `filters={"tozar": <exact>}`). Metadata only, no row payload, under hard caps (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`, default 6000; `MILO_REGISTER_DIRECTORY_MAX_SECONDS`, default 3000). A new directory version only when the content differs from the CURRENT (newest) one (a register that reverts A → B → A records A again), and only capturable values become units (a value `CaptureScope` refuses -- null, empty, padded, over-long, control/format characters -- is counted as unfilterable): `register_version` = SHA-256 of `gov.register.directory.1`, the resource id, and the sorted `(tozar, count)` list. |
 | Capture request | API (`POST /projects/{id}/register/captures`) | Release refusal first (both jobs on the current release, `prepare_trigger.release_refusal_for`); then ONE database call (`request_register_capture`) that is idempotent per `(tozar, register_version)`, refuses a group over `MILO_REGISTER_GROUP_MAX_ROWS` expected rows (a single larger tozar is captured alone and never split), and refuses a capture that would take the database above the threshold -- before anything is written. Then an operator capture run and the capture job with the register invocation. |
 | Capture | capture job (`--register-group-id`) | Per tozar: the scoped capture Prepare uses (same client, bounds, snapshot key and content hash), rows written in bounded batches, then **before activation**: the stored count must equal the source's total for that tozar, and the archive object must be written and recorded. Otherwise the snapshot stays inactive (never used by Prepare). |
 | Page | API (`GET /projects/{id}/register`) | Every tozar with expected rows and state (not captured / capturing / captured with snapshot key, rows and verified / failed with its code), totals vs the directory, measured bytes per row, and the capacity bar. 404 while the flag is off. |
 
 ### Capacity
 
-`projected = pg_database_size + expected_rows x MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE`,
+`projected = pg_database_size + (expected_rows + rows still in flight) x MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE`
+(rows of earlier requests still `requested` / `capturing` count too),
 refused when `projected > MILO_DB_CAPACITY_BYTES x MILO_DB_CAPACITY_THRESHOLD`
 with `CATALOG_CAPACITY_THRESHOLD_EXCEEDED` and the three numbers (current,
 projected, limit, in bytes) in the response body (`error.capacity`) and on the
@@ -42,12 +43,20 @@ records `gcs_uri`, byte size and SHA-256 (`catalog_register_snapshot_archives`);
 a raw record's line is `source_locator.capture_index + 1`
 (`catalog_register_archive_lines`). No recorded archive, no activation
 (`CATALOG_ARCHIVE_WRITE_FAILED` / `CATALOG_ARCHIVE_NOT_CONFIGURED`). The
-capture identity holds `roles/storage.objectCreator` on that bucket only: it
-can create, never read back, overwrite or delete.
+capture identity holds `roles/storage.objectCreator` and `roles/storage.objectViewer`
+on that bucket only: it can create an object and read its metadata back (so an
+upload whose answer was lost, or a crash before the database record, is
+verified by its recorded SHA-256 instead of wedging the snapshot), and can
+never overwrite or delete one. A unit that fails ends its run `failed`, so the
+next capture of that tozar -- or Prepare's -- adopts the pending snapshot once
+that run's lease has lapsed (at most `MILO_WORKER_LEASE_SECONDS`, 300 s;
+earlier, the retry answers `GOV_SNAPSHOT_OWNED_BY_ANOTHER_RUN` and can simply
+be repeated).
 
 ### Retention (O22)
 
-Always kept: per tozar the active snapshot and the one before it; every
+Always kept: per tozar the active snapshot and the one before it; the
+snapshot of the latest captured register unit of each tozar; every
 snapshot referenced by evidence, claims (field provenance), runs (adoptions,
 checkpoints), work-scope units / batches / queue items, the coverage ledger,
 or whose candidates are referenced; every snapshot whose writer run is live.
@@ -65,7 +74,7 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
 | `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `3500` | |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
-| `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `1000` / `900` | capture job |
+| `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |
 | `MILO_ENABLE_REGISTER_CAPTURE_JOB` | off | capture job; set only by the API's invocation, per execution |
 
 ## Operator steps, in order
@@ -112,11 +121,15 @@ API: `CATALOG_REGISTER_DISABLED` (404), `CATALOG_REGISTER_UNAVAILABLE`,
 `CATALOG_REGISTER_UNIT_UNKNOWN`, `CATALOG_REGISTER_REQUEST_INVALID`,
 `CATALOG_REGISTER_GROUP_TOO_LARGE`, `CATALOG_CAPACITY_THRESHOLD_EXCEEDED`,
 `CATALOG_REGISTER_JOB_NOT_RELEASE`, `CATALOG_REGISTER_JOB_UNREADABLE`,
-`CATALOG_REGISTER_TRIGGER_FAILED`, `CATALOG_REGISTER_CONVERSATION_UNAVAILABLE`.
+`CATALOG_REGISTER_TRIGGER_FAILED`, `CATALOG_REGISTER_CONVERSATION_UNAVAILABLE`,
+`CATALOG_REGISTER_WORKFLOW_UNSUPPORTED` (the page exists only in projects
+whose engine reads the catalog, `swarm_v2`).
 Capture job, per unit: `CATALOG_CAPTURE_COUNT_MISMATCH`,
 `CATALOG_ARCHIVE_WRITE_FAILED`, `CATALOG_ARCHIVE_NOT_CONFIGURED`,
 `CATALOG_REGISTER_UNIT_NOT_THIS_RUN`, `CATALOG_REGISTER_CAPTURE_FAILED`,
-`CATALOG_REGISTER_CAPTURE_INTERRUPTED` (page); entrypoint:
+`CATALOG_REGISTER_CAPTURE_INTERRUPTED`, `CATALOG_REGISTER_CAPTURE_STALLED` (page: the
+database would take a new request -- a claim with no run, a run no worker
+claimed, or an expired lease, each past the 15-minute grace); entrypoint:
 `CAPTURE_REGISTER_ARGUMENTS_INVALID`, `CAPTURE_REGISTER_CAPTURE_DISABLED`;
 directory: `GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED`,
 `GOV_DIRECTORY_TIME_BUDGET_EXCEEDED`, `GOV_DIRECTORY_RESULT_INVALID`;

@@ -310,15 +310,17 @@ print_register_capture_commands() {
   cat << EOC
 # --- PR-D1, capture job + both jobs: the same bindings as E' (run THIS job
 # with overrides; read the capture and worker jobs), each only when absent.
+# <API_SERVICE_ACCOUNT> is the operator configuration's key: no address is
+# printed.
 gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
   --region ${REGION} --project ${PROJECT_ID} \\
-  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role roles/run.jobsExecutorWithOverrides
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role roles/run.jobsExecutorWithOverrides
 gcloud run jobs add-iam-policy-binding ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} \\
   --region ${REGION} --project ${PROJECT_ID} \\
-  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role ${MILO_API_JOB_READ_ROLE}
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role ${MILO_API_JOB_READ_ROLE}
 gcloud run jobs add-iam-policy-binding ${WORKER_JOB} \\
   --region ${REGION} --project ${PROJECT_ID} \\
-  --member serviceAccount:${API_SA:-<API_SERVICE_ACCOUNT>} --role ${MILO_API_JOB_READ_ROLE}
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role ${MILO_API_JOB_READ_ROLE}
 # --- PR-D1, API only: the Register page and the job it executes. Run
 # creation, batches, paid execution and promotion stay exactly as they are.
 gcloud run services update ${API_SERVICE} \\
@@ -667,14 +669,16 @@ if [[ "$MODE" == "apply-register-capture" ]]; then
   fi
   printf '\n== Applying register capture (capture job IAM, then the API) ==\n'
   print_register_capture_commands
-  if ! ensure_job_binding "$CAPTURE_JOB" roles/run.jobsExecutorWithOverrides "serviceAccount:${API_SA}" \
-     || ! ensure_job_binding "$CAPTURE_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" \
-     || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}"; then
+  # ensure_job_binding's own lines name the member: not shown here.
+  if ! ensure_job_binding "$CAPTURE_JOB" roles/run.jobsExecutorWithOverrides "serviceAccount:${API_SA}" > /dev/null \
+     || ! ensure_job_binding "$CAPTURE_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" > /dev/null \
+     || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" > /dev/null; then
     printf 'FAIL: the API identity cannot run and read the jobs (above); the API was NOT changed.\n' >&2
     exit 1
   fi
   gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${REGISTER_API_VARS}"
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${REGISTER_API_VARS}" > /dev/null
+  printf 'The API identity runs and reads the capture job (read back); the API carries the register flag.\n'
   split_pairs "$REGISTER_API_VARS"
   # Paid execution stays OFF on the API, and the job's register switch is
   # never the API's: the API only EXECUTES the capture job.

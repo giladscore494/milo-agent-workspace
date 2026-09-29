@@ -15,16 +15,23 @@
 # What it sets up:
 #   1. the bucket REGISTER_ARCHIVE_BUCKET in us-central1, with uniform
 #      bucket-level access and public access prevention ENFORCED;
-#   2. roles/storage.objectCreator on THAT bucket only for the capture job's
-#      identity (CAPTURE_SERVICE_ACCOUNT, or WORKER_SERVICE_ACCOUNT when the
+#   2. on THAT bucket only, for the capture job's identity
+#      (CAPTURE_SERVICE_ACCOUNT, or WORKER_SERVICE_ACCOUNT when the
 #      configuration names no separate capture identity -- exactly what
-#      government-production-capture.sh runs the job as). objectCreator can
-#      create an object and nothing else: it cannot overwrite (the job writes
-#      with ifGenerationMatch=0), read, list or delete one.
+#      government-production-capture.sh runs the job as):
+#        roles/storage.objectCreator  create an object (never overwrite: the
+#                                     job writes with ifGenerationMatch=0)
+#        roles/storage.objectViewer   read an object's metadata back, so an
+#                                     upload whose answer was lost (or a crash
+#                                     before the database record) can be
+#                                     verified by its recorded sha256 rather
+#                                     than wedge the snapshot
+#      Neither can delete or overwrite anything.
 # No identity of the application (API, worker, capture) is given, or may hold,
-# any delete-capable role on the bucket: --check reports one as FAIL. Prune
-# (scripts/ops/register-retention.sh) deletes database rows only, never an
-# object. It creates no key, reads no object and prints no secret.
+# any delete-capable role on the bucket or the project: --check reports one as
+# FAIL. Prune (scripts/ops/register-retention.sh) deletes database rows only,
+# never an object. It creates no key, reads no object content, and prints no
+# secret and no account address (identities are named by their config key).
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,12 +40,13 @@ source "${SCRIPT_DIR}/common.sh"
 
 MODE="plan"
 REGISTER_ARCHIVE_LOCATION="us-central1"
-REGISTER_ARCHIVE_ROLE="roles/storage.objectCreator"
+REGISTER_ARCHIVE_ROLES=("roles/storage.objectCreator" "roles/storage.objectViewer")
 # Roles on the bucket that can delete or overwrite an object. None may be held
 # by an application identity.
 DELETE_CAPABLE_ROLES=(roles/storage.admin roles/storage.objectAdmin roles/storage.objectUser
                       roles/storage.legacyBucketOwner roles/storage.legacyBucketWriter
                       roles/owner roles/editor)
+# The same, held on the PROJECT, reaches every bucket.
 
 usage() {
   cat << 'EOF'
@@ -61,8 +69,9 @@ done
 
 ops_load_config
 BUCKET="$(milo_op REGISTER_ARCHIVE_BUCKET)"
-CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
-[[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"
+CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)" CAPTURE_KEY="CAPTURE_SERVICE_ACCOUNT"
+[[ -n "$CAPTURE_SA" ]] || { CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"; CAPTURE_KEY="WORKER_SERVICE_ACCOUNT"; }
+CAPTURE_LABEL="the capture identity (${CAPTURE_KEY})"
 APP_IDENTITIES=()
 for key in API_SERVICE_ACCOUNT WORKER_SERVICE_ACCOUNT CAPTURE_SERVICE_ACCOUNT; do
   value="$(milo_op "$key")"
@@ -101,34 +110,42 @@ if isinstance(uniform, dict):
 print(str(doc.get("location") or "").lower(), str(bool(uniform)).lower(),
       str(doc.get("public_access_prevention") or "inherited").lower())
 '
-# Policy facts: "HAS" when MEMBER holds ROLE; then one "DELETE <role>" line per
-# app identity holding a delete-capable role, and "PUBLIC" for allUsers /
-# allAuthenticatedUsers. Members are compared, never printed.
+# Policy facts: "HAS <role>" per archive role MEMBER holds; "DELETE <role>"
+# per app identity holding a delete-capable role; "PUBLIC <role>" for
+# allUsers / allAuthenticatedUsers. Members are compared, never printed.
 POLICY_PY='
 import json, sys
 doc = json.load(sys.stdin)
-member, role = sys.argv[1], sys.argv[2]
+member = sys.argv[1]
+roles = set(sys.argv[2].split(","))
 app = set(sys.argv[3].split(",")) if sys.argv[3] else set()
 delete_roles = set(sys.argv[4].split(","))
 out = []
 for binding in doc.get("bindings") or []:
     members = set(binding.get("members") or [])
-    if binding.get("role") == role and member in members:
-        out.append("HAS")
+    if binding.get("role") in roles and member in members and not binding.get("condition"):
+        out.append("HAS " + binding["role"])
     if binding.get("role") in delete_roles and members & app:
         out.append("DELETE " + binding["role"])
     if members & {"allUsers", "allAuthenticatedUsers"}:
         out.append("PUBLIC " + str(binding.get("role")))
 print("\n".join(out))
 '
+roles_csv="$(IFS=,; printf '%s' "${REGISTER_ARCHIVE_ROLES[*]}")"
 app_csv="$(IFS=,; printf '%s' "${APP_IDENTITIES[*]}")"
 delete_csv="$(IFS=,; printf '%s' "${DELETE_CAPABLE_ROLES[*]}")"
 
 bucket_json() { gcloud storage buckets describe "$URL" --project "$PROJECT_ID" --format=json 2> /dev/null; }
 policy_facts() {
-  local policy
+  local policy project
   policy="$(gcloud storage buckets get-iam-policy "$URL" --project "$PROJECT_ID" --format=json 2> /dev/null)" || return 1
-  python3 -c "$POLICY_PY" "$CAPTURE_MEMBER" "$REGISTER_ARCHIVE_ROLE" "$app_csv" "$delete_csv" <<< "$policy"
+  python3 -c "$POLICY_PY" "$CAPTURE_MEMBER" "$roles_csv" "$app_csv" "$delete_csv" <<< "$policy"
+  project="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> /dev/null)" || return 1
+  python3 -c "$POLICY_PY" "" "" "$app_csv" "$delete_csv" <<< "$project" | sed -n 's/^DELETE /PROJECT_DELETE /p'
+}
+holds_all() {  # holds_all FACTS -- the member holds every archive role
+  local role
+  for role in "${REGISTER_ARCHIVE_ROLES[@]}"; do grep -qxF "HAS ${role}" <<< "$1" || return 1; done
 }
 
 # ---------------------------------------------------------------------------
@@ -145,22 +162,22 @@ if [[ "$MODE" == "check" ]]; then
   fi
   read -r location uniform pap <<< "$(python3 -c "$POSTURE_PY" <<< "$json")"
   if ! facts="$(policy_facts)"; then
-    printf 'UNREADABLE the IAM policy of %s could not be read by this identity\n' "$BUCKET"
+    printf 'UNREADABLE the IAM policy of %s or of the project could not be read by this identity\n' "$BUCKET"
     exit 0
   fi
   if grep -q '^PUBLIC ' <<< "$facts" || [[ "$pap" != "enforced" ]]; then
     printf 'FAIL bucket %s is not closed to the public (public access prevention %s)\n' "$BUCKET" "$pap"
-  elif grep -q '^DELETE ' <<< "$facts"; then
-    printf 'FAIL an application identity holds a delete-capable role on %s (%s)\n' "$BUCKET" \
-      "$(grep '^DELETE ' <<< "$facts" | cut -d' ' -f2 | sort -u | paste -sd, -)"
+  elif grep -qE '^(PROJECT_)?DELETE ' <<< "$facts"; then
+    printf 'FAIL an application identity holds a delete-capable role on %s or the project (%s)\n' "$BUCKET" \
+      "$(grep -E '^(PROJECT_)?DELETE ' <<< "$facts" | cut -d' ' -f2 | sort -u | paste -sd, -)"
   elif [[ "$uniform" != "true" || "$location" != "$REGISTER_ARCHIVE_LOCATION" ]]; then
     printf 'GAP bucket %s is not in %s with uniform access (location %s, uniform %s)\n' \
       "$BUCKET" "$REGISTER_ARCHIVE_LOCATION" "${location:-unknown}" "$uniform"
-  elif ! grep -qx 'HAS' <<< "$facts"; then
-    printf 'GAP the capture identity does not hold %s on %s\n' "$REGISTER_ARCHIVE_ROLE" "$BUCKET"
+  elif ! holds_all "$facts"; then
+    printf 'GAP %s does not hold %s on %s\n' "$CAPTURE_LABEL" "${REGISTER_ARCHIVE_ROLES[*]}" "$BUCKET"
   else
-    printf 'PASS bucket %s: %s, uniform access, public access prevention enforced; capture identity holds %s\n' \
-      "$BUCKET" "$REGISTER_ARCHIVE_LOCATION" "$REGISTER_ARCHIVE_ROLE"
+    printf 'PASS bucket %s: %s, uniform access, public access prevention enforced; %s holds %s\n' \
+      "$BUCKET" "$REGISTER_ARCHIVE_LOCATION" "$CAPTURE_LABEL" "${REGISTER_ARCHIVE_ROLES[*]}"
   fi
   exit 0
 fi
@@ -168,7 +185,8 @@ fi
 # ---------------------------------------------------------------------------
 # --plan / --apply
 # ---------------------------------------------------------------------------
-milo_require_gcloud_context "$PROJECT_ID" || exit 2
+# Its own lines name the operator's account: not shown (no address is printed).
+milo_require_gcloud_context "$PROJECT_ID" > /dev/null || exit 2
 printf '== Register archive: %s (project %s) ==\n' "$URL" "$PROJECT_ID"
 
 step() {  # step VERB DETAIL CMD... -- print, and run only in --apply
@@ -176,7 +194,8 @@ step() {  # step VERB DETAIL CMD... -- print, and run only in --apply
   shift 2
   printf '%-7s %s\n' "$verb" "$detail"
   if [[ "$MODE" == "apply" ]]; then
-    "$@" > /dev/null || { printf 'FAIL: %s did not apply\n' "$detail" >&2; exit 1; }
+    # gcloud's own output can quote an account address: never shown.
+    "$@" > /dev/null 2>&1 || { printf 'FAIL: %s did not apply\n' "$detail" >&2; exit 1; }
   fi
 }
 
@@ -206,19 +225,21 @@ facts=""
 if [[ "$MODE" == "apply" ]] || bucket_json > /dev/null; then
   facts="$(policy_facts)" || { printf 'FAIL: the IAM policy of %s could not be read\n' "$URL" >&2; exit 1; }
 fi
-if grep -qx 'HAS' <<< "$facts"; then
-  printf 'OK      %s holds %s on %s\n' "$CAPTURE_SA" "$REGISTER_ARCHIVE_ROLE" "$URL"
-else
-  step BIND "${REGISTER_ARCHIVE_ROLE} for ${CAPTURE_SA} on ${URL} only" \
-    gcloud storage buckets add-iam-policy-binding "$URL" --project "$PROJECT_ID" \
-    --member "$CAPTURE_MEMBER" --role "$REGISTER_ARCHIVE_ROLE"
-fi
-if grep -q '^DELETE ' <<< "$facts"; then
+for role in "${REGISTER_ARCHIVE_ROLES[@]}"; do
+  if grep -qxF "HAS ${role}" <<< "$facts"; then
+    printf 'OK      %s holds %s on %s\n' "$CAPTURE_LABEL" "$role" "$URL"
+  else
+    step BIND "${role} for ${CAPTURE_LABEL} on ${URL} only" \
+      gcloud storage buckets add-iam-policy-binding "$URL" --project "$PROJECT_ID" \
+      --member "$CAPTURE_MEMBER" --role "$role"
+  fi
+done
+if grep -qE '^(PROJECT_)?DELETE ' <<< "$facts"; then
   # Never removed automatically: a binding someone else made is theirs to
   # explain. It is reported, and --check (the preflight) reports it as FAIL.
-  printf 'FAIL: an application identity holds a delete-capable role on %s (%s). Remove it:\n' "$URL" \
-    "$(grep '^DELETE ' <<< "$facts" | cut -d' ' -f2 | sort -u | paste -sd, -)" >&2
-  printf '      gcloud storage buckets remove-iam-policy-binding %s --member <identity> --role <role>\n' "$URL" >&2
+  printf 'FAIL: an application identity holds a delete-capable role on %s or the project (%s). Remove it\n' "$URL" \
+    "$(grep -E '^(PROJECT_)?DELETE ' <<< "$facts" | cut -d' ' -f2 | sort -u | paste -sd, -)" >&2
+  printf '      (gcloud storage buckets / projects remove-iam-policy-binding ... --member <identity> --role <role>).\n' >&2
   exit 1
 fi
 

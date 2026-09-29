@@ -6,6 +6,7 @@ agree by construction. Kept, always:
 
 * per tozar, the ACTIVE snapshot and the one before it (the two latest
   activations);
+* the snapshot of the latest CAPTURED register unit of each tozar;
 * any snapshot referenced by evidence, claims (canonical field provenance),
   runs (adoptions, run checkpoints), work-scope units / batches / queue items,
   the coverage ledger, or whose candidates are referenced anywhere;
@@ -55,7 +56,9 @@ def prunable(snapshots: Iterable[Mapping[str, Any]], *, referenced_ids: set[str]
         if row.get("activated_at") is not None:
             by_tozar.setdefault(str(scoped_tozar(row)), []).append(row)
     for activated in by_tozar.values():
-        activated.sort(key=lambda row: (str(row["activated_at"]), str(row["id"])), reverse=True)
+        # The database's order: activated_at DESC, then id ASC.
+        activated.sort(key=lambda row: str(row["id"]))
+        activated.sort(key=lambda row: str(row["activated_at"]), reverse=True)
         kept.update(str(row["id"]) for row in activated[:2])
     out = [row for row in rows
            if str(row["id"]) not in kept and str(row["id"]) not in referenced_ids

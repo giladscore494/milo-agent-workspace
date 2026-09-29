@@ -2391,15 +2391,14 @@ class SupabaseRepository:
             "register directory", refusals=self._REGISTER_REFUSALS)
 
     def latest_register_directory(self) -> dict[str, Any] | None:
-        versions = self._many(self.client.table("catalog_register_directory_versions").select("*")
-                              .order("created_at", desc=True).order("id", desc=True).limit(1))
-        if not versions:
+        # ONE jsonb document: a row-set read would be cut at PostgREST's row cap.
+        data = self.client.rpc("catalog_register_latest_directory", {}).execute().data
+        if data is None:
             return None
-        version = versions[0]
-        units = self._many(self.client.table("catalog_register_directory_units")
-                           .select("tozar,expected_rows").eq("version_id", str(version["id"]))
-                           .order("tozar").limit(5000))
-        return {"version": version, "units": units}
+        if not isinstance(data, dict) or not isinstance(data.get("version"), dict) \
+                or not isinstance(data.get("units"), list):
+            raise AppError("REPOSITORY_ERROR", "register directory returned an unreadable document", 502)
+        return data
 
     def request_register_capture(self, register_version: str, tozars: list[str], requested_by: UUID, *, group_max_rows: int, capacity_limit_bytes: int, bytes_per_row: int, grace_seconds: int) -> dict[str, Any]:
         try:
@@ -2445,8 +2444,11 @@ class SupabaseRepository:
                           .in_("id", [str(g) for g in group_ids][:1000]).limit(1000))
 
     def register_capture_units(self) -> list[dict[str, Any]]:
-        return self._many(self.client.table("catalog_register_capture_units").select("*")
-                          .order("updated_at", desc=True).limit(10000))
+        """The newest request row per tozar, as ONE jsonb document."""
+        data = self.client.rpc("catalog_register_unit_states", {}).execute().data
+        if not isinstance(data, list):
+            raise AppError("REPOSITORY_ERROR", "register units returned an unreadable document", 502)
+        return data
 
     def record_register_unit_status(self, run_id: UUID, unit_id: str, status: str, failure_code: str | None, snapshot_id: str | None, api_total: int | None, captured_rows: int | None, count_verified: bool | None, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
         return self._guarded_rpc("record_register_unit_status", {
@@ -2484,8 +2486,11 @@ class SupabaseRepository:
         return data
 
     def prunable_register_snapshots(self) -> list[dict[str, Any]]:
-        data = self.client.rpc("catalog_register_prunable_snapshots", {}).execute().data
-        return list(data or [])
+        """The whole prunable list, as ONE jsonb document (never row-capped)."""
+        data = self.client.rpc("catalog_register_prunable_list", {}).execute().data
+        if not isinstance(data, dict) or not isinstance(data.get("snapshots"), list):
+            raise AppError("REPOSITORY_ERROR", "the prunable list returned an unreadable document", 502)
+        return data["snapshots"]
 
     def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]:
         return self._guarded_rpc("prune_register_snapshots", {

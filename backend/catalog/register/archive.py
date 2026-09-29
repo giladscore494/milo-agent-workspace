@@ -13,12 +13,13 @@ A record's line is its ``source_locator.capture_index + 1`` -- the database
 view ``catalog_register_archive_lines`` exposes it per raw record, so PR-L can
 cite a single record from the archive by (uri, line).
 
-The write is CREATE-ONLY (``ifGenerationMatch=0``). If the object already
-exists it is a success only when its sha256 matches: first the object's own
-recorded sha256 (custom metadata) when this identity can read it, else the
-sha256 the database already recorded for this snapshot. Anything else is a
-failure, and the snapshot stays inactive (``CATALOG_ARCHIVE_WRITE_FAILED``).
-Nothing here ever deletes an object.
+A snapshot whose archive the database already recorded is not written again
+(the capture job checks the record first). Otherwise the write is CREATE-ONLY
+(``ifGenerationMatch=0``); if the object already exists (a retry whose first
+answer was lost, a crash before the record) it is a success only when the
+object's own recorded sha256 (custom metadata, read with objectViewer) and
+size match. Anything else is a failure, and the snapshot stays inactive
+(``CATALOG_ARCHIVE_WRITE_FAILED``). Nothing here ever deletes an object.
 """
 
 from __future__ import annotations
@@ -103,7 +104,8 @@ class GcsArchiveWriter:
     """Create-only upload through the Cloud Storage JSON API.
 
     Authenticated with the runtime identity (Application Default Credentials),
-    which holds ``roles/storage.objectCreator`` on the archive bucket only
+    which holds ``roles/storage.objectCreator`` and ``roles/storage.objectViewer``
+    on the archive bucket only
     (scripts/ops/setup-register-archive.sh): it can create, never overwrite
     and never delete. `session_factory` is the test seam.
     """
@@ -174,7 +176,7 @@ class GcsArchiveWriter:
         except Exception:
             return EXISTS_UNVERIFIED
         if status != 200:
-            # objectCreator cannot read objects: the database record decides.
+            # Without objectViewer the object cannot be verified: never success.
             return EXISTS_UNVERIFIED
         try:
             stored = response.json()

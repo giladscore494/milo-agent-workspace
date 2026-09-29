@@ -68,6 +68,9 @@ if args[:3] == ["storage", "buckets", "get-iam-policy"]:
         sys.exit(1)
     bindings = state["bindings"].get(name, [])
     print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]})); sys.exit(0)
+if args[:2] == ["projects", "get-iam-policy"]:
+    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in state.get("project_bindings", [])]}))
+    sys.exit(0)
 if args[:3] == ["storage", "buckets", "add-iam-policy-binding"]:
     state["bindings"].setdefault(name, []).append([flag("--role"), flag("--member")]); save(); sys.exit(0)
 sys.stderr.write("unmocked gcloud " + " ".join(args) + "\n"); sys.exit(2)
@@ -100,7 +103,7 @@ def test_the_archive_setup_plans_applies_once_and_is_idempotent(tmp_path):
     plan = tree.run("setup-register-archive.sh", extra_env=env)
     assert plan.returncode == 0, plan.stdout + plan.stderr
     assert mutations(tree) == [], "--plan changed something"
-    assert re.findall(r"^(CREATE|UPDATE|BIND) ", plan.stdout, re.M) == ["CREATE", "BIND"]
+    assert re.findall(r"^(CREATE|UPDATE|BIND) ", plan.stdout, re.M) == ["CREATE", "BIND", "BIND"]
     assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith("UNREADABLE ")
 
     applied = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
@@ -108,9 +111,13 @@ def test_the_archive_setup_plans_applies_once_and_is_idempotent(tmp_path):
     state = json.loads((tmp_path / "storage.json").read_text())
     assert state["buckets"][BUCKET] == {"location": "US-CENTRAL1", "uniform_bucket_level_access": True,
                                         "public_access_prevention": "enforced"}
-    # Exactly one grant: objectCreator for the capture identity, on this bucket.
-    assert state["bindings"] == {BUCKET: [["roles/storage.objectCreator", CAPTURE]]}
+    # Exactly two grants, on this bucket only: create, and read back. No delete.
+    assert state["bindings"] == {BUCKET: [["roles/storage.objectCreator", CAPTURE],
+                                          ["roles/storage.objectViewer", CAPTURE]]}
     assert "PASS bucket test-project-milo-register-archive: us-central1" in applied.stdout
+    # Identities are named by their configuration key, never by address.
+    for out in (plan.stdout, plan.stderr, applied.stdout, applied.stderr):
+        assert "@" not in out
     again = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
     assert again.returncode == 0
     assert re.findall(r"^(CREATE|UPDATE|BIND) ", again.stdout, re.M) == []
@@ -124,8 +131,9 @@ def test_without_a_capture_account_the_worker_identity_is_the_one_granted(tmp_pa
         "CAPTURE_SERVICE_ACCOUNT=capture@test-project.iam.gserviceaccount.com\n", ""))
     assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
     state = json.loads((tmp_path / "storage.json").read_text())
-    assert state["bindings"][BUCKET] == [["roles/storage.objectCreator",
-                                         "serviceAccount:worker@test-project.iam.gserviceaccount.com"]]
+    worker = "serviceAccount:worker@test-project.iam.gserviceaccount.com"
+    assert state["bindings"][BUCKET] == [["roles/storage.objectCreator", worker],
+                                         ["roles/storage.objectViewer", worker]]
 
 
 def test_the_check_reports_a_gap_without_a_bucket_name(tmp_path):
@@ -144,11 +152,12 @@ def test_a_delete_capable_role_or_a_public_bucket_is_a_failure(tmp_path):
                                       "serviceAccount:api@test-project.iam.gserviceaccount.com"])
     path.write_text(json.dumps(state))
     check = tree.run("setup-register-archive.sh", "--check", extra_env=env)
-    assert check.stdout.startswith("FAIL an application identity holds a delete-capable role")
+    assert check.stdout.startswith("FAIL an application identity holds a delete-capable role on")
     assert "roles/storage.objectAdmin" in check.stdout
     applied = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
     assert applied.returncode == 1 and "delete-capable" in applied.stderr
-    state["bindings"][BUCKET] = [["roles/storage.objectCreator", CAPTURE], ["roles/storage.objectViewer", "allUsers"]]
+    state["bindings"][BUCKET] = [["roles/storage.objectCreator", CAPTURE], ["roles/storage.objectViewer", CAPTURE],
+                                 ["roles/storage.objectViewer", "allUsers"]]
     path.write_text(json.dumps(state))
     assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith(
         "FAIL bucket test-project-milo-register-archive is not closed to the public")
@@ -339,3 +348,15 @@ def test_register_coverage_fails_the_gate_above_the_threshold(tmp_path):
     assert "SUMMARY|REGISTER_COVERAGE|FAIL|" in result.stdout
     assert "above the register capacity threshold" in result.stdout
     no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_a_project_level_delete_capable_role_is_a_failure(tmp_path):
+    tree, env = archive_tree(tmp_path)
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    path = tmp_path / "storage.json"
+    state = json.loads(path.read_text())
+    state["project_bindings"] = [["roles/editor", "serviceAccount:worker@test-project.iam.gserviceaccount.com"]]
+    path.write_text(json.dumps(state))
+    check = tree.run("setup-register-archive.sh", "--check", extra_env=env)
+    assert check.stdout.startswith("FAIL an application identity holds a delete-capable role on") \
+        and "roles/editor" in check.stdout
