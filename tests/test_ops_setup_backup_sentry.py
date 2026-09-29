@@ -317,6 +317,8 @@ def test_setup_backup_refuses_until_setup_wif_admits_production_backup(env):
 
 
 @pytest.mark.parametrize("condition", [
+    PROVIDER_CONDITION + " || true",
+    OLD_PROVIDER_CONDITION + " || assertion.environment in ['production-backup']",
     # repository or ref clause loosened: refused even though the env is listed
     "assertion.ref == 'refs/heads/main' && assertion.environment in ['production-backup']",
     f"assertion.repository == '{REPOSITORY}' && assertion.environment in ['production-backup']",
@@ -330,3 +332,18 @@ def test_setup_backup_refuses_a_provider_that_does_not_pin_repository_and_main(e
     result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
     assert result.returncode == 1
     assert "FAIL provider github-actions does not admit production-backup" in result.stdout
+
+
+
+def test_setup_backup_fails_when_someone_else_can_impersonate_a_backup_identity(env):
+    assert env.run(SETUP_BACKUP, "--pg-major", "17").returncode == 0
+    data = env.data()
+    key = f"sa:milo-backup-writer@{PROJECT}.iam.gserviceaccount.com"
+    data["policies"][key]["bindings"].append({
+        "role": "roles/iam.workloadIdentityUser",
+        "members": ["principalSet://iam.googleapis.com/projects/123456789/locations/global/"
+                    f"workloadIdentityPools/milo-github/attribute.repository/{REPOSITORY}"]})
+    env.state.write_text(json.dumps(data))
+    result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
+    assert result.returncode == 1
+    assert "FAIL milo-backup-writer: its own IAM policy grants more than workloadIdentityUser" in result.stdout

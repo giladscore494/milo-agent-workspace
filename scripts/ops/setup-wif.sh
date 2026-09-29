@@ -210,29 +210,25 @@ if [[ "$current_condition" == "<missing>" ]]; then
   step CREATE "OIDC provider ${PROVIDER_ID} (condition: ${CONDITION})" \
     gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" "${provider_args[@]}"
 elif [[ "$current_condition" != "$CONDITION" ]]; then
+  # In place, the CONDITION only: the issuer and the attribute mapping of the
+  # existing provider are left exactly as they are.
   step UPDATE "OIDC provider ${PROVIDER_ID} condition -> ${CONDITION}" \
-    gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" "${provider_args[@]}"
+    gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" \
+    --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+    --attribute-condition "$CONDITION"
 else
   ok "provider ${PROVIDER_ID} admits only ${GITHUB_REPOSITORY_NAME}, main, ${ALLOWED_ENVIRONMENTS[*]}"
 fi
-# 2b. Read-back (--apply): the LIVE condition must still pin this repository
-#     and refs/heads/main, and admit every allowed environment. PASS only then.
+# 2b. Read-back (--apply): the LIVE condition must be exactly CONDITION (this
+#     repository, refs/heads/main, exactly the allowed environments).
 if [[ "$MODE" == "apply" ]]; then
   readback="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
     --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
     --format='value(attributeCondition)' 2> /dev/null || true)"
-  if python3 -c '
-import re, sys
-condition, repository, allowed = sys.argv[1], sys.argv[2], sys.argv[3:]
-q = chr(39)
-clauses = [c.strip() for c in condition.split("&&")]
-envs = re.fullmatch(r"assertion\.environment in \[(.*)\]", clauses[-1] if clauses else "")
-listed = re.findall(q + "([^" + q + "]*)" + q, envs.group(1)) if envs else []
-sys.exit(0 if len(clauses) == 3
-         and clauses[0] == "assertion.repository == " + q + repository + q
-         and clauses[1] == "assertion.ref == " + q + "refs/heads/main" + q
-         and set(listed) == set(allowed) else 1)' \
-      "$readback" "$GITHUB_REPOSITORY_NAME" "${ALLOWED_ENVIRONMENTS[@]}"; then
+  # EXACTLY the condition this script writes -- which pins the repository and
+  # refs/heads/main and lists exactly ALLOWED_ENVIRONMENTS. Anything else (an
+  # appended `||`, a loosened clause) is a FAIL, never a PASS.
+  if [[ -n "$readback" && "$readback" == "$CONDITION" ]]; then
     printf 'PASS   provider %s condition read back: repository %s, ref refs/heads/main, environments %s\n' \
       "$PROVIDER_ID" "$GITHUB_REPOSITORY_NAME" "$(IFS=,; printf '%s' "${ALLOWED_ENVIRONMENTS[*]}" | sed 's/,/, /g')"
   else

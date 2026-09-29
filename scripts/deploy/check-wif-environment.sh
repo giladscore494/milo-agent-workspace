@@ -38,12 +38,15 @@ verdict="$(python3 -c '
 import re, sys
 condition, repository, environment = sys.argv[1:4]
 q = chr(39)
-clauses = [c.strip() for c in condition.split("&&")]
-envs = re.fullmatch(r"assertion\.environment in \[(.*)\]", clauses[-1] if clauses else "")
-listed = re.findall(q + "([^" + q + "]*)" + q, envs.group(1)) if envs else []
-pinned = (len(clauses) == 3 and clauses[0] == "assertion.repository == " + q + repository + q
-          and clauses[1] == "assertion.ref == " + q + "refs/heads/main" + q)
-print("PASS" if pinned and environment in listed else ("UNPINNED" if not pinned else "GAP"))' \
+# The canonical form setup-wif.sh writes, and nothing else: a fullmatch, so
+# an appended `||`, a negation or a loosened clause can never pass.
+name = "[A-Za-z0-9_-]+"
+pattern = ("assertion\\.repository == " + q + re.escape(repository) + q
+           + " && assertion\\.ref == " + q + "refs/heads/main" + q
+           + " && assertion\\.environment in \\[((?:" + q + name + q + ", )*" + q + name + q + ")\\]")
+match = re.fullmatch(pattern, condition)
+listed = re.findall(q + "(" + name + ")" + q, match.group(1)) if match else []
+print("PASS" if match and environment in listed else ("UNPINNED" if not match else "GAP"))' \
   "$condition" "$REPOSITORY" "$ENVIRONMENT_NAME")"
 
 case "$verdict" in

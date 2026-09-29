@@ -812,11 +812,42 @@ print_targets
 # Optional runtime secrets (deployment-contract.sh): each is added to BOTH
 # surfaces only when it has an enabled version; otherwise it is said and left
 # out. Never a precondition of the deploy.
+OPTIONAL_UNREADABLE=()
 while IFS= read -r optional_binding; do
-  [[ -n "$optional_binding" ]] || continue
-  API_SECRETS+=("$optional_binding")
-  WORKER_SECRETS+=("$optional_binding")
+  case "$optional_binding" in
+    UNREADABLE\ *) OPTIONAL_UNREADABLE+=("${optional_binding#UNREADABLE }") ;;
+    *=*)
+      API_SECRETS+=("$optional_binding")
+      WORKER_SECRETS+=("$optional_binding") ;;
+  esac
 done < <(milo_optional_secret_bindings "$PROJECT_ID")
+# An OPTIONAL secret this deploy does not bind, but that a live surface still
+# binds from an earlier deploy: --update-secrets never removes a binding, and a
+# binding to `latest` without an enabled newest version stops new revisions and
+# executions from starting. Refused in check AND apply mode, before anything
+# is built or deployed (read-only describes).
+refuse_stale_optional_bindings() {
+  local label="$1" bindings="$2" entry env_name secret_name binding bound unreadable
+  for entry in "${MILO_OPTIONAL_RUNTIME_SECRETS[@]}"; do
+    env_name="${entry%%=*}"
+    secret_name="${entry#*=}"
+    bound=0
+    for binding in "${API_SECRETS[@]}"; do
+      [[ "$binding" == "$env_name="* ]] && bound=1
+    done
+    [[ "$bound" == "0" && -n "$(secret_reference_for "$bindings" "$env_name")" ]] || continue
+    unreadable=0
+    for binding in "${OPTIONAL_UNREADABLE[@]}"; do
+      [[ "$binding" == "$env_name" ]] && unreadable=1
+    done
+    if [[ "$unreadable" == "1" ]]; then
+      fail "$label still binds $env_name, and secret ${secret_name}'s versions could not be read (see the NOTE above), so it cannot be confirmed that a new revision could start. Fix the read (roles/secretmanager.viewer) and re-run. Nothing was built or deployed."
+    fi
+    fail "$label still binds $env_name, but secret ${secret_name} has no enabled newest version, so a new revision or execution could not start. Turn it off by storing the value 'disabled' as a new version (scripts/ops/setup-sentry.sh --disable), never by disabling or destroying its last version. Nothing was built or deployed."
+  done
+}
+refuse_stale_optional_bindings "API service '$API_SERVICE'" "$(binding_identities "$(binding_report service "$API_SERVICE")")"
+refuse_stale_optional_bindings "Worker job '$WORKER_JOB'" "$(binding_identities "$(binding_report job "$WORKER_JOB")")"
 
 if [[ "$DEPLOY_MODE" == "apply" && "$JOB_LAUNCHER_MODE" == "cloud_run" ]]; then
   echo "WARNING: JOB_LAUNCHER_MODE=cloud_run — the API will be deployed with the Cloud Run job launcher ENABLED. This is an explicit operator override of the safe default (disabled)." >&2
@@ -835,26 +866,6 @@ API_REPORT_BEFORE=$(binding_report service "$API_SERVICE")
 WORKER_REPORT_BEFORE=$(binding_report job "$WORKER_JOB")
 API_BINDINGS_BEFORE=$(binding_identities "$API_REPORT_BEFORE")
 WORKER_BINDINGS_BEFORE=$(binding_identities "$WORKER_REPORT_BEFORE")
-# An OPTIONAL secret (deployment-contract.sh) this deploy does not bind because
-# it has no enabled version, but that a live surface still binds from an
-# earlier deploy: --update-secrets never removes a binding, and a binding to
-# `latest` with no enabled version stops new revisions and executions from
-# starting. Refused before anything is built or deployed.
-refuse_stale_optional_bindings() {
-  local label="$1" bindings="$2" entry env_name binding bound
-  for entry in "${MILO_OPTIONAL_RUNTIME_SECRETS[@]}"; do
-    env_name="${entry%%=*}"
-    bound=0
-    for binding in "${API_SECRETS[@]}"; do
-      [[ "$binding" == "$env_name="* ]] && bound=1
-    done
-    if [[ "$bound" == "0" && -n "$(secret_reference_for "$bindings" "$env_name")" ]]; then
-      fail "$label still binds $env_name, but secret ${entry#*=} has no enabled version, so a new revision or execution could not start. Turn it off by storing the value 'disabled' as a new version (scripts/ops/setup-sentry.sh --disable), never by disabling or destroying its last version. Nothing was built or deployed."
-    fi
-  done
-}
-refuse_stale_optional_bindings "API service '$API_SERVICE'" "$API_BINDINGS_BEFORE"
-refuse_stale_optional_bindings "Worker job '$WORKER_JOB'" "$WORKER_BINDINGS_BEFORE"
 if [[ "$DEPLOY_PRESERVE_STAGE" == "1" ]]; then
   # A stage can only be preserved on resources that exist and state one.
   [[ -n "$(report_field "$API_REPORT_BEFORE" image)" && -n "$(report_field "$WORKER_REPORT_BEFORE" image)" ]] || \

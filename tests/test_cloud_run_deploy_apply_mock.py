@@ -143,8 +143,10 @@ case "$args" in
   "secrets describe"*)
     echo "$3" ;;
   "secrets versions list"*)
-    # PR-OBS optional runtime secrets: enabled versions, one per line (none
-    # unless the test writes optional-secret-versions).
+    # PR-OBS optional runtime secrets: the NEWEST version's state (nothing
+    # unless the test writes optional-secret-versions); optional-secret-error
+    # makes the call itself fail.
+    if [[ -f "$MOCK_DIR/optional-secret-error" ]]; then echo "PERMISSION_DENIED" >&2; exit 1; fi
     cat "$MOCK_DIR/optional-secret-versions" 2>/dev/null || true ;;
   "builds submit"*)
     # Async submit: the build id on stdout (a build log would stream to
@@ -1181,13 +1183,13 @@ def test_sentry_dsn_is_not_bound_without_an_enabled_version(deployment):
     assert result.returncode == 0, result.stderr
     for line in (deployment.command("run jobs deploy"), deployment.command("run deploy ")):
         assert "SENTRY_DSN" not in line
-    assert "optional secret SENTRY_DSN has no enabled version" in result.stderr
+    assert "optional secret SENTRY_DSN has no enabled newest version" in result.stderr
     # The lookup is metadata only: never a secret value.
     assert "secrets versions access" not in "\n".join(deployment.invocations())
 
 
 def test_an_enabled_sentry_dsn_is_bound_on_both_surfaces_and_verified(deployment):
-    (deployment.dir / "optional-secret-versions").write_text("projects/p/secrets/SENTRY_DSN/versions/1\n")
+    (deployment.dir / "optional-secret-versions").write_text("ENABLED\n")
     for doc in (deployment.service_after, deployment.job_after):
         _container_env(doc).append(secret_entry("SENTRY_DSN", "SENTRY_DSN"))
     result = deployment.run()
@@ -1195,11 +1197,11 @@ def test_an_enabled_sentry_dsn_is_bound_on_both_surfaces_and_verified(deployment
     for line in (deployment.command("run jobs deploy"), deployment.command("run deploy ")):
         assert "SENTRY_DSN=SENTRY_DSN:latest" in line
         assert "--set-secrets" not in line
-    assert "optional secret SENTRY_DSN has an enabled version" in result.stderr
+    assert "optional secret SENTRY_DSN has an enabled newest version" in result.stderr
 
 
 def test_a_bound_sentry_dsn_that_did_not_land_fails_verification(deployment):
-    (deployment.dir / "optional-secret-versions").write_text("projects/p/secrets/SENTRY_DSN/versions/1\n")
+    (deployment.dir / "optional-secret-versions").write_text("ENABLED\n")
     result = deployment.run()
     assert result.returncode != 0
 
@@ -1215,3 +1217,35 @@ def test_a_live_sentry_binding_without_an_enabled_version_is_refused_before_any_
     assert "setup-sentry.sh --disable" in result.stderr
     log = "\n".join(deployment.invocations())
     assert "builds submit" not in log and "run deploy" not in log and "run jobs deploy" not in log
+
+
+
+def test_a_disabled_newest_version_is_not_bound(deployment):
+    (deployment.dir / "optional-secret-versions").write_text("DISABLED\n")
+    result = deployment.run()
+    assert result.returncode == 0, result.stderr
+    assert "SENTRY_DSN" not in deployment.command("run deploy ")
+
+
+def test_an_unreadable_optional_secret_with_a_live_binding_names_the_real_cause(deployment):
+    (deployment.dir / "optional-secret-error").write_text("1")
+    _container_env(deployment.service_before).append(secret_entry("SENTRY_DSN", "SENTRY_DSN"))
+    result = deployment.run()
+    assert result.returncode != 0
+    assert "versions could not be read" in result.stderr
+    assert "has no enabled newest version" not in result.stderr
+
+
+def test_an_unreadable_optional_secret_without_a_live_binding_deploys_without_it(deployment):
+    (deployment.dir / "optional-secret-error").write_text("1")
+    result = deployment.run()
+    assert result.returncode == 0, result.stderr
+    assert "SENTRY_DSN" not in deployment.command("run deploy ")
+    assert "optional secret SENTRY_DSN could not be read" in result.stderr
+
+
+def test_check_mode_also_refuses_a_stale_live_binding(deployment):
+    _container_env(deployment.service_before).append(secret_entry("SENTRY_DSN", "SENTRY_DSN"))
+    result = deployment.run(DEPLOY_MODE="check")
+    assert result.returncode != 0
+    assert "still binds SENTRY_DSN" in result.stderr

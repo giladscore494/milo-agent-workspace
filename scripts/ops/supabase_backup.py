@@ -63,7 +63,6 @@ import shutil
 import subprocess
 import sys
 import http.client
-import socket
 import tarfile
 import tempfile
 import time
@@ -244,9 +243,14 @@ def pg_env(url: str) -> dict[str, str]:
     dbname = urllib.parse.unquote(parts.path.lstrip("/"))
     if dbname:
         values["dbname"] = dbname
-    for name, value in urllib.parse.parse_qsl(parts.query, keep_blank_values=True):
+    # libpq decodes %XX only: "+" stays "+" (parse_qsl would turn it into a space).
+    pairs = [item.partition("=") for item in parts.query.split("&") if item]
+    for raw_name, _, raw_value in pairs:
+        name, value = urllib.parse.unquote(raw_name), urllib.parse.unquote(raw_value)
         if name not in _LIBPQ_PARAMS:
             raise BackupError("CONFIG_INVALID", f"unsupported database URL parameter {name!r}")
+        if name in ("host", "hostaddr") and "," in value:
+            raise BackupError("CONFIG_INVALID", "multi-host database URLs are not supported")
         values[name] = value
     for name, value in values.items():
         if value:
@@ -447,8 +451,9 @@ def _bucket(name: str) -> str:
     return name
 
 
-_TRANSIENT = (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError,
-              http.client.HTTPException)
+# OSError covers URLError, ssl.SSLError, ConnectionError, TimeoutError and
+# socket.timeout -- including those raised while READING a response.
+_TRANSIENT = (OSError, http.client.HTTPException)
 
 
 def _call(method: str, url: str, *, body_path: Path | None = None, headers: dict | None = None,
@@ -518,12 +523,37 @@ def upload_object(bucket: str, name: str, path: Path) -> dict:
     return meta
 
 
+_MANIFEST_TYPES = {"format": str, "encrypted_file": str, "encrypted_sha256": str,
+                   "encrypted_size_bytes": int, "created_at": str, "server_major": int}
+
+
+def _valid_manifest(raw: object, where: str) -> dict:
+    """The manifest, with every key the tool reads present and well-typed."""
+    if not isinstance(raw, dict) or raw.get("format") != FORMAT:
+        raise BackupError("MANIFEST_INVALID", f"{where} is not a {FORMAT} manifest")
+    for key, kind in _MANIFEST_TYPES.items():
+        if not isinstance(raw.get(key), kind) or isinstance(raw.get(key), bool):
+            raise BackupError("MANIFEST_INVALID", f"{where} has no valid {key}")
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", raw["encrypted_file"]) \
+            or not re.fullmatch(r"[0-9a-f]{64}", raw["encrypted_sha256"]):
+        raise BackupError("MANIFEST_INVALID", f"{where} names an invalid bundle")
+    return raw
+
+
+def _read_manifest(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raw = None
+    return _valid_manifest(raw, path.name)
+
+
 def upload(directory: Path, bucket: str) -> str:
     bucket = _bucket(bucket)
     manifests = sorted(directory.glob(f"*{MANIFEST_SUFFIX}"))
     if len(manifests) != 1:
         raise BackupError("MANIFEST_MISSING", "exactly one manifest is expected in the backup directory")
-    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    manifest = _read_manifest(manifests[0])
     bundle = directory / manifest["encrypted_file"]
     if not bundle.is_file() or sha256_file(bundle) != manifest["encrypted_sha256"]:
         raise BackupError("BUNDLE_MISMATCH", "the bundle does not match its manifest")
@@ -579,17 +609,18 @@ def fetch_latest(bucket: str, out: Path, max_age_hours: float = DEFAULT_MAX_BACK
     manifest_path = out / Path(latest).name
     download_object(bucket, latest, manifest_path)
     try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     except ValueError:
-        manifest = {}
-    if not isinstance(manifest, dict) or manifest.get("format") != FORMAT \
-            or not re.fullmatch(r"[A-Za-z0-9._-]+", str(manifest.get("encrypted_file", ""))):
-        raise BackupError("MANIFEST_INVALID", f"{latest} is not a {FORMAT} manifest")
+        raw = None
+    manifest = _valid_manifest(raw, latest)
     try:
         created = datetime.strptime(manifest["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
-    except (KeyError, TypeError, ValueError):
+    except ValueError:
         raise BackupError("MANIFEST_INVALID", f"{latest} has no valid created_at")
     age_hours = (datetime.now(UTC) - created).total_seconds() / 3600
+    if age_hours < -1:
+        # A manifest dated in the future would be picked as "newest" forever.
+        raise BackupError("MANIFEST_INVALID", f"{latest} is dated in the future ({manifest['created_at']})")
     if age_hours > max_age_hours:
         raise BackupError("BACKUP_STALE", f"the newest backup ({manifest['created_at']}) is {age_hours:.0f}h old; "
                           f"more than {max_age_hours:.0f}h means the daily backup has stopped")
@@ -657,10 +688,15 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 def _require_local_target(url: str) -> None:
     """The restore DROPS schema public: only a local throwaway database."""
-    host = pg_env(url).get("PGHOST", "")
-    if not (host in _LOCAL_HOSTS or host.startswith("/")):
+    env = pg_env(url)
+    host, hostaddr = env.get("PGHOST", ""), env.get("PGHOSTADDR", "")
+    # hostaddr, when given, is where libpq actually connects: it must be local too.
+    if not (host in _LOCAL_HOSTS or host.startswith("/")) or hostaddr not in ("", "127.0.0.1", "::1"):
         raise BackupError("RESTORE_TARGET_NOT_LOCAL",
                           "the restore target must be a local throwaway database (localhost or a unix socket)")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,63}", env.get("PGDATABASE", "postgres")):
+        # pg_restore -d with "=" or a URI prefix is a whole conninfo string to libpq.
+        raise BackupError("CONFIG_INVALID", "the restore database name must be a plain identifier")
 
 
 def restore(directory: Path, migrations: Path) -> dict[str, int]:
@@ -669,9 +705,9 @@ def restore(directory: Path, migrations: Path) -> dict[str, int]:
     manifests = sorted(directory.glob(f"*{MANIFEST_SUFFIX}"))
     if len(manifests) != 1:
         raise BackupError("MANIFEST_MISSING", "exactly one manifest is expected in the restore directory")
-    manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+    manifest = _read_manifest(manifests[0])
     bundle = directory / manifest["encrypted_file"]
-    if sha256_file(bundle) != manifest["encrypted_sha256"]:
+    if not bundle.is_file() or sha256_file(bundle) != manifest["encrypted_sha256"]:
         raise BackupError("BUNDLE_MISMATCH", "the bundle does not match its manifest")
     expected_major = int(manifest["server_major"])
     target_major = server_major(target)

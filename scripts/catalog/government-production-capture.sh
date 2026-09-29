@@ -221,7 +221,7 @@ build_secret_args() {
   # Optional runtime secrets (SENTRY_DSN): only when enabled; never a provider key.
   local optional_binding
   while IFS= read -r optional_binding; do
-    if [[ -n "$optional_binding" ]]; then
+    if [[ "$optional_binding" == *=* ]]; then
       printf ',%s' "$optional_binding"
     fi
   done < <(milo_optional_secret_bindings "$PROJECT_ID")

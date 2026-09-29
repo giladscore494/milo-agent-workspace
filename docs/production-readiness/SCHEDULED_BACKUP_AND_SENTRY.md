@@ -82,9 +82,27 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
    ```
 
    Until this has run, the deploy preflight reports
-   `WARN wif:admits-production-backup` (a gap, never a blocked deploy) and
+   `WARN wif:admits-production-backup` (a gap, never a blocked deploy). Note:
+   the deploy identity cannot read the WIF provider (by design), so a
+   preflight run BY THE DEPLOY WORKFLOW always reports it as "not verifiable
+   with this identity"; only an operator run
+   (`bash scripts/deploy/check-wif-environment.sh <project>`) can show PASS. And
    `setup-backup.sh` refuses with `FAIL provider github-actions does not admit
    production-backup: run scripts/ops/setup-wif.sh --apply first`.
+
+   **Known exposure (owner decision pending):** the deployer's
+   `workloadIdentityUser` binding is to the REPOSITORY-wide principalSet
+   (`attribute.repository/<repo>`), unchanged by this PR. Once the provider
+   admits `production-backup`, a job on `main` in that reviewer-less
+   environment could therefore also impersonate `milo-github-deployer` --
+   the same exposure `production-kill-switch` already has. It needs a change
+   merged to `main` (reviewed) to use it. Narrowing it (the deployer bound to
+   the `production` and `production-kill-switch` principalSets only, or an
+   attribute mapping that issues `attribute.repository` only for those two)
+   is a separate owner decision. Also: the backup identities' principalSet
+   (`attribute.environment/production-backup`) is scoped to this repository
+   ONLY through the provider condition; the condition must never admit
+   another repository.
 
 2. **Backup setup** (idempotent; prints only `PASS` / `FAIL`):
 
@@ -146,8 +164,12 @@ repository admin and `~/.milo_ro_url` (mode 600) in place.
 7. **First backup, by hand:**
 
    ```bash
+   before="$(gh run list --workflow backup-supabase-scheduled.yml --limit 1 --json databaseId --jq '.[0].databaseId // 0')"
    gh workflow run backup-supabase-scheduled.yml --ref main -f job=backup
-   gh run watch "$(gh run list --workflow backup-supabase-scheduled.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+   # wait for the NEW run to appear, then watch it
+   until run="$(gh run list --workflow backup-supabase-scheduled.yml --limit 1 --json databaseId --jq '.[0].databaseId')" \
+         && [ "$run" != "$before" ]; do sleep 3; done
+   gh run watch "$run"
    ```
 
    Expect `PASS backup created: ...` and `PASS uploaded gs://.../supabase/<date>/...`.

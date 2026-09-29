@@ -668,3 +668,31 @@ def test_a_read_back_that_does_not_match_is_a_failure(tmp_path):
     assert result.returncode == 1
     assert "FAIL   provider github-actions condition read back does not pin" in result.stderr
     assert "PASS   provider" not in result.stdout
+
+
+
+def test_a_forged_read_back_is_a_failure_not_a_pass(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'state["providers"][args[4]] = flag("--attribute-condition"); save(); sys.exit(0)',
+        'state["providers"][args[4]] = flag("--attribute-condition") + " || true"; save(); sys.exit(0)'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env={"OPS_TEST_WIF_STATE": str(tmp_path / "wif.json")})
+    assert result.returncode == 1
+    assert "PASS   provider" not in result.stdout
+
+
+def test_the_in_place_update_changes_the_condition_only(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD)
+    state_path = tmp_path / "wif.json"
+    env = {"OPS_TEST_WIF_STATE": str(state_path)}
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    state = json.loads(state_path.read_text())
+    state["providers"]["github-actions"] = OLD_CONDITION
+    state_path.write_text(json.dumps(state))
+    tree.calls.write_text("", encoding="utf-8")
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    update = [c for c in tree.tool_calls() if "providers update-oidc" in c]
+    assert len(update) == 1
+    assert "--attribute-mapping" not in update[0] and "--issuer-uri" not in update[0]
+    assert "--attribute-condition" in update[0]

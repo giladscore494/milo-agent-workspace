@@ -297,6 +297,11 @@ WIF_BACKUP_CHECK="$(bash "${SCRIPT_DIR}/check-wif-environment.sh" "$PROJECT_ID" 
   || printf 'UNREADABLE the check did not run')"
 case "$WIF_BACKUP_CHECK" in
   PASS\ *) record_check PASS "wif:admits-production-backup" "${WIF_BACKUP_CHECK#PASS }" ;;
+  UNREADABLE\ *)
+    # The deploy identity holds no WIF-provider read permission (by design),
+    # so a preflight run BY THE DEPLOY WORKFLOW always lands here.
+    record_check WARN "wif:admits-production-backup" \
+      "not verifiable with this identity (${WIF_BACKUP_CHECK#UNREADABLE }). Verify from Cloud Shell as the operator: bash scripts/deploy/check-wif-environment.sh ${PROJECT_ID}" ;;
   *) record_check WARN "wif:admits-production-backup" \
        "${WIF_BACKUP_CHECK#* } Remediation: bash scripts/ops/setup-wif.sh --apply (then scripts/ops/setup-backup.sh)" ;;
 esac

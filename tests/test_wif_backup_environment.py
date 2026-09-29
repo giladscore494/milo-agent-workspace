@@ -110,3 +110,33 @@ def test_setup_backup_binds_the_environment_principal_set_not_the_repository_one
     for verb in ("providers create-oidc", "providers update-oidc", "workload-identity-pools create"):
         assert verb not in text
     assert re.search(r'^ENVIRONMENT_NAME="production-backup"$', text, re.M)
+
+
+FORGED = [
+    # An appended `||` makes the whole condition true in CEL.
+    NEW + " || true",
+    OLD + " || assertion.environment in ['production-backup']",
+    NEW.replace(" && assertion.ref", " || assertion.ref"),
+    "!(" + NEW + ")",
+]
+
+
+@pytest.mark.parametrize("condition", FORGED)
+def test_a_forged_condition_is_never_a_pass(tmp_path, condition):
+    result = _run_check(tmp_path, condition)
+    assert result.returncode == 0
+    assert not result.stdout.startswith("PASS"), result.stdout
+
+
+def test_the_preflight_names_unreadable_as_unverifiable_not_as_a_missing_setup(tmp_path):
+    unreadable = _run_check(tmp_path, None).stdout.strip()
+    text = PREFLIGHT.read_text()
+    block = text[text.index("case \"$WIF_BACKUP_CHECK\" in"):text.index("# No worker execution may be in flight")]
+    script = (f'source "{REPO}/scripts/release/lib/common.sh"\nPROJECT_ID=test-project\n'
+              f"WIF_BACKUP_CHECK={unreadable!r}\n" + block + '\nfinish_checks "preflight-under-test" ""\n')
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "not verifiable with this identity" in result.stdout
+    assert "check-wif-environment.sh test-project" in result.stdout
+    assert "setup-wif.sh --apply" not in result.stdout
+    assert "RESULT: OK" in result.stdout

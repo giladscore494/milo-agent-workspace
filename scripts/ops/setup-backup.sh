@@ -251,13 +251,15 @@ if python3 -c '
 import re, sys
 condition, repository, environment = sys.argv[1:4]
 q = chr(39)
-clauses = [c.strip() for c in condition.split("&&")]
-envs = re.fullmatch(r"assertion\.environment in \[(.*)\]", clauses[-1] if clauses else "")
-listed = re.findall(q + "([^" + q + "]*)" + q, envs.group(1)) if envs else []
-sys.exit(0 if len(clauses) == 3
-         and clauses[0] == "assertion.repository == " + q + repository + q
-         and clauses[1] == "assertion.ref == " + q + "refs/heads/main" + q
-         and environment in listed else 1)' "$provider_condition" "$GITHUB_REPOSITORY_NAME" "$ENVIRONMENT_NAME"; then
+# The canonical form setup-wif.sh writes, and nothing else: a fullmatch, so
+# an appended `||`, a negation or a loosened clause can never pass.
+name = "[A-Za-z0-9_-]+"
+pattern = ("assertion\\.repository == " + q + re.escape(repository) + q
+           + " && assertion\\.ref == " + q + "refs/heads/main" + q
+           + " && assertion\\.environment in \\[((?:" + q + name + q + ", )*" + q + name + q + ")\\]")
+match = re.fullmatch(pattern, condition)
+listed = re.findall(q + "(" + name + ")" + q, match.group(1)) if match else []
+sys.exit(0 if match and environment in listed else 1)' "$provider_condition" "$GITHUB_REPOSITORY_NAME" "$ENVIRONMENT_NAME"; then
   pass "provider ${PROVIDER_ID} admits ${ENVIRONMENT_NAME} (still pinned to ${GITHUB_REPOSITORY_NAME} and refs/heads/main)"
 else
   fail_line "provider ${PROVIDER_ID} does not admit ${ENVIRONMENT_NAME}: run scripts/ops/setup-wif.sh --apply first"
@@ -270,9 +272,20 @@ for account_id in "$WRITER_ID" "$READER_ID"; do
       --member "$PRINCIPAL" --role roles/iam.workloadIdentityUser || true
   fi
   if has_member "$(sa_policy)" roles/iam.workloadIdentityUser "$PRINCIPAL"; then
-    pass "${account_id}: workloadIdentityUser for principalSet attribute.environment/${ENVIRONMENT_NAME} of pool ${POOL_ID} only"
+    pass "${account_id}: workloadIdentityUser for principalSet attribute.environment/${ENVIRONMENT_NAME} of pool ${POOL_ID}"
   else
     fail_line "${account_id}: the ${ENVIRONMENT_NAME} principal cannot impersonate it"
+  fi
+  # Least privilege on the account ITSELF: nobody else may impersonate it or
+  # mint its tokens (e.g. the repository-wide principalSet the deployer uses).
+  if python3 -c '
+import json, sys
+policy = json.loads(sys.argv[1] or "{}")
+pairs = {(b.get("role"), m) for b in policy.get("bindings") or [] for m in b.get("members") or []}
+sys.exit(0 if pairs <= {("roles/iam.workloadIdentityUser", sys.argv[2])} else 1)' "$(sa_policy)" "$PRINCIPAL"; then
+    pass "${account_id}: nobody else holds a role on the account itself"
+  else
+    fail_line "${account_id}: its own IAM policy grants more than workloadIdentityUser to the ${ENVIRONMENT_NAME} principalSet; remove the extra member(s)"
   fi
 done
 

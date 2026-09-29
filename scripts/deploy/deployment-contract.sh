@@ -149,22 +149,30 @@ MILO_OPTIONAL_RUNTIME_SECRETS=(
   "SENTRY_DSN=SENTRY_DSN"
 )
 
-# milo_optional_secret_bindings PROJECT -> one ENV=SECRET:VERSION line per
-# optional secret that has an enabled version. Metadata only (versions list,
-# roles/secretmanager.viewer): a secret VALUE is never read. A secret that is
-# absent or unreadable is reported on stderr and left unbound.
+# milo_optional_secret_bindings PROJECT -> one line per optional secret:
+#   ENV=SECRET:VERSION   bind it: its NEWEST version (what `latest` resolves
+#                        to) is ENABLED
+#   UNREADABLE ENV       the metadata could not be read (a gcloud error)
+# and nothing for a secret with no version, or whose newest version is not
+# enabled. Metadata only (versions list, roles/secretmanager.viewer): a secret
+# VALUE is never read. Each outcome is also said on stderr.
 milo_optional_secret_bindings() {
-  local project="$1" entry env_name secret_name enabled
+  local project="$1" entry env_name secret_name newest status
   for entry in "${MILO_OPTIONAL_RUNTIME_SECRETS[@]}"; do
     env_name="${entry%%=*}"
     secret_name="${entry#*=}"
-    enabled="$(gcloud secrets versions list "$secret_name" --project "$project" \
-      --filter='state:ENABLED' --limit=1 --format='value(name)' 2> /dev/null || true)"
-    if [[ -n "$enabled" ]]; then
-      printf 'NOTE: optional secret %s has an enabled version: bound as %s.\n' "$secret_name" "$env_name" >&2
+    status=0
+    newest="$(gcloud secrets versions list "$secret_name" --project "$project" \
+      --sort-by=~createTime --limit=1 --format='value(state)' 2> /dev/null)" || status=$?
+    if [[ "$status" -ne 0 ]]; then
+      printf 'NOTE: optional secret %s could not be read (gcloud exit %s): %s stays unbound.\n' \
+        "$secret_name" "$status" "$env_name" >&2
+      printf 'UNREADABLE %s\n' "$env_name"
+    elif [[ "$newest" == "ENABLED" ]]; then
+      printf 'NOTE: optional secret %s has an enabled newest version: bound as %s.\n' "$secret_name" "$env_name" >&2
       printf '%s=%s:%s\n' "$env_name" "$secret_name" "$MILO_SECRET_VERSION"
     else
-      printf 'NOTE: optional secret %s has no enabled version: %s stays unbound (feature off).\n' \
+      printf 'NOTE: optional secret %s has no enabled newest version: %s stays unbound (feature off).\n' \
         "$secret_name" "$env_name" >&2
     fi
   done

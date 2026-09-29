@@ -716,3 +716,67 @@ def test_pg_restore_errors_name_the_error_line_not_the_toc_header():
               'pg_restore: from TOC entry 215; 1259 16390 TABLE runs postgres\n'
               'pg_restore: error: could not execute query: ERROR:  relation "runs" already exists\n')
     assert backup.redact(stderr).startswith("pg_restore: error: could not execute query")
+
+
+
+def test_hostaddr_cannot_redirect_a_local_looking_restore_target():
+    for url in ("postgresql://u@localhost/db?hostaddr=10.1.2.3",
+                "postgresql://u@/db?host=localhost,db.production.example"):
+        with pytest.raises(backup.BackupError) as exc:
+            backup._require_local_target(url)
+        assert exc.value.code in ("RESTORE_TARGET_NOT_LOCAL", "CONFIG_INVALID")
+    backup._require_local_target("postgresql://u@localhost/db?hostaddr=127.0.0.1")
+
+
+def test_query_values_are_decoded_like_libpq():
+    env = backup.pg_env("postgresql://u@h/db?options=-c+search_path%3Dx&password=a+b")
+    assert env["PGOPTIONS"] == "-c+search_path=x"
+    assert env["PGPASSWORD"] == "a+b"
+
+
+@pytest.mark.parametrize("manifest", [
+    {"format": "milo-supabase-scheduled-backup-v1"},
+    {"format": "milo-supabase-scheduled-backup-v1", "encrypted_file": "x.tar.gz.enc", "encrypted_sha256": "0" * 64,
+     "encrypted_size_bytes": "12", "created_at": "2026-01-01T00:00:00Z", "server_major": 17},
+    {"format": "milo-supabase-scheduled-backup-v1", "encrypted_file": "../x", "encrypted_sha256": "0" * 64,
+     "encrypted_size_bytes": 12, "created_at": "2026-01-01T00:00:00Z", "server_major": 17},
+])
+def test_an_incomplete_manifest_is_refused_not_a_traceback(gcs, pg_bin, tmp_path, manifest):
+    gcs.objects[("milo-test-backups", "supabase/2099-01-01/x.manifest.json")] = json.dumps(manifest).encode()
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and result.stdout.startswith("FAIL MANIFEST_INVALID"), result.stdout + result.stderr
+    assert "Traceback" not in result.stderr
+
+
+def test_a_manifest_dated_in_the_future_is_refused(created, gcs, pg_bin, tmp_path):
+    out = _copy(created[0], tmp_path)
+    manifest_path = next(out.glob("*.manifest.json"))
+    manifest = json.loads(manifest_path.read_text())
+    manifest["created_at"] = "2099-01-01T00:00:00Z"
+    manifest_path.write_text(json.dumps(manifest))
+    assert _tool(_gcs_env(pg_bin, gcs), "upload", "--dir", str(out), "--bucket", "milo-test-backups").returncode == 0
+    result = _tool(_gcs_env(pg_bin, gcs), "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
+    assert result.returncode == 1 and "dated in the future" in result.stdout
+
+
+def test_a_restore_database_name_that_is_a_conninfo_is_refused(created, pg_bin, fresh_target):
+    url = f"postgresql://postgres@/{'dbname%3Dother'}?host={fresh_target.dir}&port={fresh_target.port}"
+    env = _env(pg_bin, MILO_RESTORE_DB_URL=url)
+    result = _tool(env, "restore", "--dir", str(created[0]), "--migrations", str(MIGRATIONS))
+    assert result.returncode == 1
+    assert result.stdout.startswith("FAIL CONFIG_INVALID: the restore database name must be a plain identifier")
+
+
+def test_a_connection_reset_while_reading_is_retried_then_reported(monkeypatch, tmp_path):
+    attempts = []
+
+    def fail_open(request, timeout):
+        attempts.append(1)
+        raise ConnectionResetError("reset")
+
+    monkeypatch.setattr(backup.urllib.request, "urlopen", fail_open)
+    monkeypatch.setenv("MILO_GCS_ACCESS_TOKEN", "t")
+    monkeypatch.setenv("MILO_GCS_BACKOFF_SCALE", "0")
+    with pytest.raises(backup.BackupError) as exc:
+        backup._call("GET", "https://storage.example/x")
+    assert exc.value.code == "GCS_UNREACHABLE" and len(attempts) == backup.HTTP_ATTEMPTS
