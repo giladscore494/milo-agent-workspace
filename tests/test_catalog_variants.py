@@ -126,6 +126,20 @@ def test_empty_is_null_and_a_value_that_does_not_parse_is_null_with_an_issue():
     assert {issue["reason"] for issue in bad["parse_issues"]} <= set(mapper.PARSE_REASONS)
 
 
+@pytest.mark.parametrize("value,reason", [
+    ("1e400", "not_a_number"), ("1E3", "not_a_number"), (float("inf"), "not_a_number"),
+    (float("nan"), "not_a_number"), ("1_000", "not_a_number"), ("١٢٣", "not_a_number"),
+    ("12,5", "not_a_number"), ("1234567890123456", "out_of_range"), (10 ** 16, "out_of_range"),
+])
+def test_a_number_the_register_did_not_state_plainly_is_an_issue_never_a_failure(value, reason):
+    row = mapper.map_record({**record(37425), "madad_yarok": value})
+    assert row["madad_yarok"] is None
+    assert {"field": "madad_yarok", "reason": reason} in row["parse_issues"]
+    json.dumps(row, allow_nan=False)      # the batch is always valid JSON
+    assert mapper.map_record({**record(37425), "madad_yarok": " 331.5 "})["madad_yarok"] == 331.5
+    assert mapper.map_record({**record(37425), "mishkal_kolel": "-3"})["mishkal_kolel"] == -3
+
+
 def test_the_equipment_document_has_a_closed_key_list():
     for payload in fixture_rows():
         row = mapper.map_record({**payload, "some_new_register_field_ind": 1})
@@ -306,6 +320,39 @@ def test_a_failed_build_leaves_the_unit_captured():
         MemoryRepository.record_catalog_variants = broken
 
 
+def test_an_empty_snapshot_still_records_its_build():
+    calls = []
+
+    class Empty:
+        def catalog_variant_build_state(self, *_args):
+            return None
+
+        def list_catalog_raw_records(self, *_args, **_kwargs):
+            return []
+
+        def record_catalog_variants(self, snapshot_id, version, rows):
+            calls.append(rows)
+            return {"snapshot_key": "cs1.x", "built_rows": 0, "expected_rows": 0, "complete": True,
+                    "inserted": 0}
+
+    assert mapper.build_snapshot_variants(Empty(), "s")["status"] == "built"
+    assert calls == [[]]
+
+
+def test_the_newest_capture_of_a_snapshot_decides_its_count_verification():
+    repo, _w, _report, snapshot = built_world()
+    units = repo._register_state()["units"]
+    (unit,) = units.values()
+    units[("old", "x")] = {**unit, "id": "u-old", "count_verified": False, "updated_at": "2000-01-01"}
+    repo._variants = None
+    assert mapper.build_snapshot_variants(repo, snapshot["id"])["status"] == "built"
+    units[("new", "x")] = {**unit, "id": "u-new", "count_verified": False, "updated_at": "2999-01-01"}
+    repo._variants = None
+    with pytest.raises(Exception) as refused:
+        mapper.build_snapshot_variants(repo, snapshot["id"])
+    assert getattr(refused.value, "code", "") == "CATALOG_VARIANT_SNAPSHOT_INELIGIBLE"
+
+
 def test_retention_keeps_a_snapshot_with_variants():
     repo, _w, _report, snapshot = built_world()
     kept = {row["snapshot_id"] for row in repo.prunable_register_snapshots()}
@@ -394,6 +441,8 @@ def test_filters_and_facets(browsing):
     ("manufacturers", {"limit": 0}), ("manufacturers", {"limit": 101}), ("manufacturers", {"segment": "truck"}),
     ("manufacturers", {"year_from": 2026, "year_to": 2020}), ("models", {}),
     ("variants", {"tozar": "טויוטה", "kinuy_mishari": "RAV4"}), ("manufacturers", {"offset": -1}),
+    ("manufacturers", {"year_from": "²"}), ("manufacturers", {"delek_cd": "--5"}),
+    ("manufacturers", {"year_from": "٢٠٢٠"}), ("manufacturers", {"limit": "1e2"}),
 ])
 def test_an_invalid_query_is_422(browsing, path, params):
     client, base, headers, _repo = browsing
@@ -403,9 +452,9 @@ def test_an_invalid_query_is_422(browsing, path, params):
 
 def test_flag_off_is_404_and_unknown_levels_do_not_exist(browsing, monkeypatch):
     client, base, headers, _repo = browsing
-    assert client.get(f"{base}/everything", headers=headers).status_code in (404, 422)
+    assert client.get(f"{base}/everything", headers=headers).status_code == 404
     monkeypatch.delenv(browser.BROWSER_FLAG)
-    for level in browser.LEVELS:
+    for level in (*browser.LEVELS, "everything"):
         answer = client.get(f"{base}/{level}", headers=headers)
         assert answer.status_code == 404 and answer.json()["error"]["code"] == "CATALOG_BROWSER_DISABLED"
     assert client.post(f"{base}/manufacturers", headers=headers).status_code in (403, 405)

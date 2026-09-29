@@ -14,6 +14,7 @@ Government catalog.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Mapping
 from uuid import UUID
 
@@ -24,6 +25,7 @@ from backend.errors import AppError
 from backend.production_config import TRUE_VALUES
 
 BROWSER_FLAG = "MILO_ENABLE_CATALOG_BROWSER"
+LEVELS = ("manufacturers", "models", "years", "variants", "facets")
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 100
 MAX_OFFSET = 100_000
@@ -50,12 +52,15 @@ def _authorize(repo: Any, user_id: UUID, project_id: UUID, env: Mapping[str, str
         raise _refusal("CATALOG_BROWSER_DISABLED")
 
 
+_WHOLE = re.compile(r"^-?[0-9]{1,9}$")
+
+
 def _int(params: Mapping[str, Any], name: str, low: int, high: int, default: int | None = None) -> int | None:
     raw = params.get(name)
     if raw is None or raw == "":
         return default
     text = str(raw).strip()
-    if not text.lstrip("-").isdigit() or len(text) > 9 or not low <= int(text) <= high:
+    if not _WHOLE.fullmatch(text) or not low <= int(text) <= high:
         raise _refusal("CATALOG_BROWSER_QUERY_INVALID")
     return int(text)
 
@@ -91,8 +96,11 @@ def _page(params: Mapping[str, Any]) -> dict[str, int]:
 
 def browse(repo: Any, user_id: UUID, project_id: UUID, level: str, params: Mapping[str, Any], *,
            env: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """One level of the tree, or the facets. `params` are the query string."""
+    """One level of the tree, or the facets. `params` are the query string.
+    Anything else -- and everything while the flag is off -- does not exist."""
     _authorize(repo, user_id, project_id, env)
+    if level not in LEVELS:
+        raise _refusal("CATALOG_BROWSER_DISABLED")
     if level == "facets":
         return repo.catalog_browser_facets(_text(params, "tozar"))
     filters, page = _filters(params), _page(params)
@@ -104,14 +112,10 @@ def browse(repo: Any, user_id: UUID, project_id: UUID, level: str, params: Mappi
     model = _text(params, "kinuy_mishari", required=True)
     if level == "years":
         return repo.catalog_browser_years(tozar, model, filters, **page)
-    if level == "variants":
-        year = _int(params, "shnat_yitzur", vocab.MIN_MODEL_YEAR, vocab.MAX_MODEL_YEAR)
-        if year is None:
-            raise _refusal("CATALOG_BROWSER_QUERY_INVALID")
-        return repo.catalog_browser_variants(tozar, model, year, filters, **page)
-    raise _refusal("CATALOG_BROWSER_DISABLED")
+    year = _int(params, "shnat_yitzur", vocab.MIN_MODEL_YEAR, vocab.MAX_MODEL_YEAR)
+    if year is None:
+        raise _refusal("CATALOG_BROWSER_QUERY_INVALID")
+    return repo.catalog_browser_variants(tozar, model, year, filters, **page)
 
-
-LEVELS = ("manufacturers", "models", "years", "variants", "facets")
 
 __all__ = ["BROWSER_FLAG", "BROWSER_REASONS", "LEVELS", "browse", "browser_enabled"]

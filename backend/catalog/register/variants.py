@@ -50,7 +50,7 @@ import argparse
 import math
 import re
 import sys
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 from backend.catalog.government import source as src
@@ -169,6 +169,13 @@ def _blank(value: Any) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+#: The register's own numeric strings: ASCII digits, an optional sign and
+#: decimal part -- no exponent, no separator, no other script's digits.
+_NUMERIC_TEXT = re.compile(r"^[+-]?[0-9]{1,30}(\.[0-9]{1,30})?$")
+#: A float states at most 15 significant digits exactly.
+_MAX_EXACT_DIGITS = 15
+
+
 def _parse(value: Any, kind: str, *, limit: int = MAX_TEXT_CHARS) -> tuple[Any, str | None]:
     """(value, issue): the parsed value or None, and a parse reason or None."""
     if _blank(value):
@@ -181,12 +188,11 @@ def _parse(value: Any, kind: str, *, limit: int = MAX_TEXT_CHARS) -> tuple[Any, 
     if isinstance(value, bool):
         return None, not_a_number
     if isinstance(value, str):
-        try:
-            number: Any = Decimal(value.strip())
-        except InvalidOperation:
+        if not _NUMERIC_TEXT.fullmatch(value.strip()):
             return None, not_a_number
-        if not number.is_finite():
-            return None, not_a_number
+        number: Any = Decimal(value.strip())
+        if len(number.as_tuple().digits) > _MAX_EXACT_DIGITS:
+            return None, "out_of_range"
     elif isinstance(value, (int, float)):
         if isinstance(value, float) and not math.isfinite(value):
             return None, not_a_number
@@ -194,6 +200,8 @@ def _parse(value: Any, kind: str, *, limit: int = MAX_TEXT_CHARS) -> tuple[Any, 
     else:
         return None, not_a_number
     if kind == NUM:
+        if isinstance(number, int) and abs(number) >= 10 ** _MAX_EXACT_DIGITS:
+            return None, "out_of_range"
         return (float(number) if not isinstance(number, int) else number), None
     if number != int(number):
         return None, "not_a_whole_number" if kind == INT else "not_an_indicator"
@@ -284,8 +292,9 @@ def build_snapshot_variants(repository: Any, snapshot_id: Any, *,
     offset = 0
     while True:
         page = repository.list_catalog_raw_records(snapshot_id, limit=bound, offset=offset)
-        if not page:
+        if not page and offset:
             break
+        # An empty snapshot still records its (complete) build: one empty batch.
         rows = [map_record(record["payload"]) for record in page]
         answer = repository.record_catalog_variants(str(snapshot_id), MAPPER_VERSION, rows)
         report["batches"] += 1

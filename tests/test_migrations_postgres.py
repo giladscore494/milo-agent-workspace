@@ -9016,7 +9016,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (46/46" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (47/47" in state.stdout, state.stdout
 
 
 

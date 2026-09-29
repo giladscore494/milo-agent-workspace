@@ -40,9 +40,11 @@ class VariantsMemoryMixin:
     def _buildable(self, snapshot: dict[str, Any] | None) -> str:
         filters = ((snapshot or {}).get("retrieval_metadata") or {}).get("capture_scope") or {}
         filters = filters.get("filters") if isinstance(filters, dict) else None
-        unverified = any(str(u.get("snapshot_id")) == str((snapshot or {}).get("id"))
-                         and u.get("count_verified") is False
-                         for u in self._register_state()["units"].values())
+        # The NEWEST register unit that captured this snapshot decides.
+        units = sorted((u for u in self._register_state()["units"].values()
+                        if str(u.get("snapshot_id")) == str((snapshot or {}).get("id"))),
+                       key=lambda u: (str(u.get("updated_at")), str(u.get("id"))))
+        unverified = bool(units) and units[-1].get("count_verified") is False
         if (snapshot is None or snapshot.get("source_family") != "government" or not snapshot.get("activated_at")
                 or snapshot.get("validation_state") != "complete"
                 or int(snapshot.get("stored_record_count") or 0) != int(snapshot.get("declared_record_count") or -1)
@@ -108,7 +110,6 @@ class VariantsMemoryMixin:
     def _refresh_variant_ledger(self, snapshot: dict[str, Any], built: list[dict[str, Any]],
                                 keys: set[str | None]) -> int:
         """Mirror of the ledger step of `record_catalog_variants`."""
-        builds = self._variants_state()["builds"].values()
         rank = catalog_coverage.STATUS_RANK
         written = 0
         for key in sorted(k for k in keys if k):
@@ -128,8 +129,9 @@ class VariantsMemoryMixin:
                         "created_at": _now(), "updated_at": _now()}
                     written += 1
                     continue
-                newer = any(b["snapshot_key"] == row["snapshot_key"]
-                            and str(b["activated_at"]) > str(snapshot["activated_at"]) for b in builds)
+                newer = any(s.get("snapshot_key") == row["snapshot_key"] and s.get("activated_at")
+                            and str(s["activated_at"]) > str(snapshot["activated_at"])
+                            for s in self.catalog_snapshots.values())
                 replace = not newer and (
                     row["content_sha256"] != incoming["content_sha256"]
                     or rank[incoming["status"]] > rank[row["status"]]
@@ -185,8 +187,9 @@ class VariantsMemoryMixin:
         rows = [v for v in self._current_variants(filters) if v["tozar"] == tozar]
         groups = self._grouped(rows, "kinuy_mishari")
         return self._browser_page([
-            {"kinuy_mishari": m, "variants": len(rs), "year_min": min(r["shnat_yitzur"] for r in rs),
-             "year_max": max(r["shnat_yitzur"] for r in rs)}
+            {"kinuy_mishari": m, "variants": len(rs),
+             "year_min": min((r["shnat_yitzur"] for r in rs if r["shnat_yitzur"] is not None), default=None),
+             "year_max": max((r["shnat_yitzur"] for r in rs if r["shnat_yitzur"] is not None), default=None)}
             for m, rs in sorted(groups.items(), key=lambda i: (i[0] is None, (i[0] or "").encode()))], limit, offset)
 
     def catalog_browser_years(self, tozar: str, kinuy_mishari: str, filters: dict[str, Any], *,

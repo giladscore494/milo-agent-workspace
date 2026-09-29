@@ -5,7 +5,7 @@ import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from fastapi import Depends, FastAPI, Path, Query, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -826,7 +826,7 @@ def request_register_directory(project_id: UUID, request: RegisterDirectoryReque
 # and the filter facets. GET only. Flag MILO_ENABLE_CATALOG_BROWSER off (the
 # default; every deploy pins it off): 404, the surface does not exist.
 @app.get("/projects/{project_id}/catalog/browser/{level}")
-def get_catalog_browser(project_id: UUID, request: Request, level: str = Path(pattern=r"^(manufacturers|models|years|variants|facets)$"), user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+def get_catalog_browser(project_id: UUID, level: str, request: Request, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
     return catalog_browser.browse(repo, user.user_id, project_id, level, request.query_params)
 
 

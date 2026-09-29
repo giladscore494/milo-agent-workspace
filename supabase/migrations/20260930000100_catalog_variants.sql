@@ -312,8 +312,11 @@ begin
      or jsonb_typeof(v_filters) is distinct from 'object'
      or (case when jsonb_typeof(v_filters) = 'object'
               then (select array_agg(k) from jsonb_object_keys(v_filters) k) end) is distinct from array['tozar']
-     or exists (select 1 from public.catalog_register_capture_units u
-                 where u.snapshot_id = p_snapshot_id and u.count_verified is false) then
+     -- The NEWEST register unit that captured this (content-addressed)
+     -- snapshot decides: a later verified capture clears an older mismatch.
+     or (select u.count_verified from public.catalog_register_capture_units u
+          where u.snapshot_id = p_snapshot_id
+          order by u.updated_at desc, u.id desc limit 1) is false then
     raise exception 'CATALOG_VARIANT_SNAPSHOT_INELIGIBLE: only an active, count-verified, whole-tozar Government snapshot is built'
       using errcode = '22023';
   end if;
@@ -439,9 +442,9 @@ begin
            snapshot_key = excluded.snapshot_key, content_sha256 = excluded.content_sha256,
            vocabulary_version = excluded.vocabulary_version, reason_code = excluded.reason_code,
            updated_at = now()
-     where not exists (select 1 from public.catalog_variant_builds nb
-                        where nb.snapshot_key = cv.snapshot_key
-                          and nb.activated_at > v_snapshot.activated_at)
+     where not exists (select 1 from public.catalog_source_snapshots ns
+                        where ns.snapshot_key = cv.snapshot_key
+                          and ns.activated_at > v_snapshot.activated_at)
        and (cv.content_sha256 is distinct from excluded.content_sha256
             or public.catalog_variant_coverage_rank(excluded.status)
                  > public.catalog_variant_coverage_rank(cv.status)
@@ -477,23 +480,10 @@ $$;
 -- 5. The discovery tree (D2). Every read is ONE jsonb document (PostgREST's
 --    row cap never truncates it), filtered server-side and paged: limit
 --    1..100, offset 0..100000. Filters (all optional): vehicle segment, model
---    year range, fuel code (delek_cd), body (merkav, exact).
+--    year range, fuel code (delek_cd), body (merkav, exact). Each read states
+--    its filters over the view itself (never through a helper function, which
+--    PostgreSQL would not inline), so the tree index serves it.
 -- ---------------------------------------------------------------------------
-create or replace function public.catalog_browser_rows(
-  p_segment text, p_year_from integer, p_year_to integer, p_delek_cd integer, p_merkav text
-) returns setof public.catalog_variants_current
-language sql
-stable
-set search_path = pg_catalog
-as $$
-  select v.* from public.catalog_variants_current v
-   where (p_segment is null or v.vehicle_segment = p_segment)
-     and (p_year_from is null or v.shnat_yitzur >= p_year_from)
-     and (p_year_to is null or v.shnat_yitzur <= p_year_to)
-     and (p_delek_cd is null or v.delek_cd = p_delek_cd)
-     and (p_merkav is null or v.merkav = p_merkav)
-$$;
-
 create or replace function public.catalog_browser_page_valid(p_limit integer, p_offset integer)
 returns boolean
 language sql
@@ -514,8 +504,25 @@ begin
     raise exception 'CATALOG_BROWSER_QUERY_INVALID' using errcode = '22023';
   end if;
   return (
-    with g as (select v.tozar, count(*) as n
-                 from public.catalog_browser_rows(p_segment, p_year_from, p_year_to, p_delek_cd, p_merkav) v
+    -- Unfiltered, the counts are the current builds' own (no row is read).
+    with g as (select b.tozar, b.built_rows as n
+                 from (select distinct on (x.tozar) x.tozar, x.built_rows
+                         from public.catalog_variant_builds x
+                        where x.mapper_version = public.catalog_variant_mapper_version()
+                          and x.completed_at is not null
+                        order by x.tozar, x.activated_at desc, x.snapshot_id) b
+                where p_segment is null and p_year_from is null and p_year_to is null
+                  and p_delek_cd is null and p_merkav is null and b.built_rows > 0
+               union all
+               select v.tozar, count(*) as n
+                 from public.catalog_variants_current v
+                where (p_segment is null or v.vehicle_segment = p_segment)
+                  and (p_year_from is null or v.shnat_yitzur >= p_year_from)
+                  and (p_year_to is null or v.shnat_yitzur <= p_year_to)
+                  and (p_delek_cd is null or v.delek_cd = p_delek_cd)
+                  and (p_merkav is null or v.merkav = p_merkav)
+                  and (p_segment is not null or p_year_from is not null or p_year_to is not null
+                       or p_delek_cd is not null or p_merkav is not null)
                 group by v.tozar)
     select jsonb_build_object(
       'total', (select count(*) from g), 'limit', p_limit, 'offset', p_offset,
@@ -541,8 +548,13 @@ begin
   return (
     with g as (select v.kinuy_mishari, count(*) as n, min(v.shnat_yitzur) as year_min,
                       max(v.shnat_yitzur) as year_max
-                 from public.catalog_browser_rows(p_segment, p_year_from, p_year_to, p_delek_cd, p_merkav) v
-                where v.tozar = p_tozar
+                 from public.catalog_variants_current v
+                where (p_segment is null or v.vehicle_segment = p_segment)
+                  and (p_year_from is null or v.shnat_yitzur >= p_year_from)
+                  and (p_year_to is null or v.shnat_yitzur <= p_year_to)
+                  and (p_delek_cd is null or v.delek_cd = p_delek_cd)
+                  and (p_merkav is null or v.merkav = p_merkav)
+                  and v.tozar = p_tozar
                 group by v.kinuy_mishari)
     select jsonb_build_object(
       'total', (select count(*) from g), 'limit', p_limit, 'offset', p_offset,
@@ -569,8 +581,13 @@ begin
   end if;
   return (
     with g as (select v.shnat_yitzur, count(*) as n
-                 from public.catalog_browser_rows(p_segment, p_year_from, p_year_to, p_delek_cd, p_merkav) v
-                where v.tozar = p_tozar and v.kinuy_mishari = p_kinuy_mishari
+                 from public.catalog_variants_current v
+                where (p_segment is null or v.vehicle_segment = p_segment)
+                  and (p_year_from is null or v.shnat_yitzur >= p_year_from)
+                  and (p_year_to is null or v.shnat_yitzur <= p_year_to)
+                  and (p_delek_cd is null or v.delek_cd = p_delek_cd)
+                  and (p_merkav is null or v.merkav = p_merkav)
+                  and v.tozar = p_tozar and v.kinuy_mishari = p_kinuy_mishari
                 group by v.shnat_yitzur)
     select jsonb_build_object(
       'total', (select count(*) from g), 'limit', p_limit, 'offset', p_offset,
@@ -599,8 +616,13 @@ begin
   end if;
   return (
     with m as (select v.*
-                 from public.catalog_browser_rows(p_segment, p_year_from, p_year_to, p_delek_cd, p_merkav) v
-                where v.tozar = p_tozar and v.kinuy_mishari = p_kinuy_mishari
+                 from public.catalog_variants_current v
+                where (p_segment is null or v.vehicle_segment = p_segment)
+                  and (p_year_from is null or v.shnat_yitzur >= p_year_from)
+                  and (p_year_to is null or v.shnat_yitzur <= p_year_to)
+                  and (p_delek_cd is null or v.delek_cd = p_delek_cd)
+                  and (p_merkav is null or v.merkav = p_merkav)
+                  and v.tozar = p_tozar and v.kinuy_mishari = p_kinuy_mishari
                   and v.shnat_yitzur = p_shnat_yitzur),
     p as (select * from m
            order by m.degem_nm collate "C" nulls last, m.ramat_gimur collate "C" nulls last,
@@ -639,11 +661,11 @@ as $$
     'fuels', coalesce((select jsonb_agg(jsonb_build_object('delek_cd', f.delek_cd, 'delek_nm', f.delek_nm,
                                                            'variants', f.n) order by f.delek_cd, f.delek_nm)
                          from (select delek_cd, min(delek_nm) as delek_nm, count(*) n from m
-                                where delek_cd is not null group by 1 limit 100) f), '[]'::jsonb),
+                                where delek_cd is not null group by 1 order by 1 limit 100) f), '[]'::jsonb),
     'bodies', coalesce((select jsonb_agg(jsonb_build_object('merkav', b.merkav, 'variants', b.n)
                                          order by b.merkav collate "C")
                           from (select merkav, count(*) n from m where merkav is not null
-                                 group by 1 limit 100) b), '[]'::jsonb),
+                                 group by 1 order by merkav collate "C" limit 100) b), '[]'::jsonb),
     'year_min', (select min(shnat_yitzur) from m),
     'year_max', (select max(shnat_yitzur) from m))
 $$;
@@ -725,7 +747,6 @@ declare
     'public.catalog_variant_equipment_valid(jsonb)',
     'public.catalog_variant_parse_issues_valid(jsonb)',
     'public.catalog_variant_build_state(uuid,text)',
-    'public.catalog_browser_rows(text,integer,integer,integer,text)',
     'public.catalog_browser_page_valid(integer,integer)',
     'public.catalog_browser_manufacturers(text,integer,integer,integer,text,integer,integer)',
     'public.catalog_browser_models(text,text,integer,integer,integer,text,integer,integer)',
