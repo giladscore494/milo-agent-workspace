@@ -196,6 +196,11 @@ EXECUTION_FLAGS = (
     # The job definition pins it false; the API's invocation turns it on for
     # ONE execution (backend/capture_invocation.py REGISTER_SWITCH).
     "MILO_ENABLE_REGISTER_CAPTURE_JOB",
+    # API-only (PR-L1): the read-only catalog browser (the discovery tree over
+    # the deterministic variants). GET only, $0; pinned off here like every
+    # other stage flag, turned on only by
+    # `website-execution-activate.sh --apply-catalog-browser`.
+    "MILO_ENABLE_CATALOG_BROWSER",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

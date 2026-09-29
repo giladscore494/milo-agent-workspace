@@ -1138,6 +1138,8 @@ def test_the_registered_review_routes_are_get_only():
     assert registered == {
         ("/projects/{project_id}/catalog/canonical", frozenset({"GET"})),
         ("/projects/{project_id}/catalog/review-candidates", frozenset({"GET"})),
+        # PR-L1: the read-only discovery tree.
+        ("/projects/{project_id}/catalog/browser/{level}", frozenset({"GET"})),
     }
 
 

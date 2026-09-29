@@ -18,8 +18,9 @@ name: Deploy production
 # Only after a SUCCESSFUL deploy (step 11 of deploy.sh, reached only when 1-10
 # passed) the named ones come back on through scripts/ops/website-stage.sh:
 # Stage P (plan authoring) and/or E' (the Prepare button), and/or the
-# Register page (register-capture; all = both + register-capture, which needs
-# REGISTER_ARCHIVE_BUCKET). Never Stage 2 --
+# Register page (register-capture, which needs REGISTER_ARCHIVE_BUCKET), and/or
+# the read-only catalog browser (catalog-browser; all = both + register-capture
+# + catalog-browser). Never Stage 2 --
 # paid execution stays with arm.yml. Skipped in permanent operating mode, which
 # keeps the live stage.
 #
@@ -46,6 +47,7 @@ on:
           - plan-authoring
           - web-preparation
           - register-capture
+          - catalog-browser
           - all
           - none
       dry_run:

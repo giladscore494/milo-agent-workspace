@@ -23,8 +23,12 @@
 #                    (website-execution-activate.sh --apply-register-capture).
 #                    Refused until scripts/ops/setup-register-archive.sh has
 #                    run. Not part of `both`: it is its own decision.
+#   catalog-browser  PR-L1, the read-only catalog browser:
+#                    MILO_ENABLE_CATALOG_BROWSER on the API, read back
+#                    (website-execution-activate.sh --apply-catalog-browser).
+#                    GET only and $0: no job, no run, no model.
 #   all              `both`, then the Register page (the capture job is
-#                    ensured once)
+#                    ensured once), then the catalog browser
 #   none             nothing
 #
 # Every step is the canonical tool, unchanged, behind its own gate
@@ -44,11 +48,12 @@ source "${SCRIPT_DIR}/common.sh"
 STAGE="" STEP_PREFIX="" HEADER=1
 usage() {
   cat << 'EOF'
-Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|all|none [--dry-run]
+Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|catalog-browser|all|none [--dry-run]
                         [--operator-config <path>] [--step-prefix <n>] [--no-header]
 
 Turns the website's plan authoring (Stage P) and/or its Prepare button (E'),
-or its Register page (register-capture; all = both + register-capture), on
+or its Register page (register-capture), or its catalog browser
+(catalog-browser; all = both + register-capture + catalog-browser), on
 through the canonical activation tools. Never Stage 2. --dry-run calls nothing.
 EOF
 }
@@ -64,8 +69,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$STAGE" in
-  plan-authoring | web-preparation | both | register-capture | all | none) ;;
-  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, all or none\n' >&2; usage >&2; exit 2 ;;
+  plan-authoring | web-preparation | both | register-capture | catalog-browser | all | none) ;;
+  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, all or none\n' >&2; usage >&2; exit 2 ;;
 esac
 [[ -z "$STEP_PREFIX" || "$STEP_PREFIX" =~ ^[0-9]{1,2}$ ]] \
   || { printf 'FAIL: --step-prefix must be a step number\n' >&2; exit 2; }
@@ -142,6 +147,14 @@ if [[ "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
     "PR-D1 (the Register page): the register archive gate (PASS; or PARTIAL = WARN: its IAM is verified from Cloud Shell, setup-register-archive.sh --check); the API identity runs and reads the capture job; MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
     "register capture was not applied (above); the Register page stays off" \
     "${activate[@]}" --apply-register-capture
+fi
+if [[ "$STAGE" == "catalog-browser" || "$STAGE" == "all" ]]; then
+  browser_step=(1 a)
+  [[ "$STAGE" == "all" ]] && browser_step=(5 e)
+  run_step "$(step_name "${browser_step[0]}" "${browser_step[1]}" catalog-browser)" \
+    "PR-L1 (the read-only catalog browser): MILO_ENABLE_CATALOG_BROWSER on the API; run creation and paid execution read back OFF" \
+    "the catalog browser was not applied (above); the Catalog page stays off" \
+    "${activate[@]}" --apply-catalog-browser
 fi
 
 # Inside a deploy (--no-header) the deploy writes the closing note.

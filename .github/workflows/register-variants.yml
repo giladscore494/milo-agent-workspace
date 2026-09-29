@@ -1,0 +1,90 @@
+name: Register variants
+
+# Catalog variant backfill (scripts/ops/register-variants.sh, PR-L1 L1-4).
+# Builds the deterministic catalog variants (levels 1 and 1.5, category,
+# coverage ledger levels identity / government_fields) of ONE active,
+# count-verified, whole-tozar Government snapshot, on the capture job's image
+# and identity. Idempotent: an already built snapshot is answered unchanged.
+# $0: no Government request, no model, no run. Runs in the `production`
+# environment, whose required reviewers approve each dispatch before it starts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_key:
+        description: "The active snapshot to build (e.g. cs1.<32 hex>)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: milo-production-operations
+  cancel-in-progress: false
+
+jobs:
+  register-variants:
+    name: Register variants
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 90
+    steps:
+      - name: Refuse anything but main and a malformed snapshot key
+        env:
+          SNAPSHOT_KEY_INPUT: ${{ inputs.snapshot_key }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Dispatch this workflow from main only."
+            exit 1
+          fi
+          if [[ ! "${SNAPSHOT_KEY_INPUT}" =~ ^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$ ]]; then
+            echo "snapshot_key must be one snapshot key."
+            exit 1
+          fi
+
+      - name: Check out main
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: The checkout is still clean after authenticating
+        # google-github-actions/auth writes gha-creds-*.json into the workspace.
+        # It must be ignored (.gitignore, .dockerignore, .gcloudignore) so it
+        # is neither a local change nor uploaded by gcloud builds submit.
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [[ -n "${dirty}" ]]; then
+            echo "::error::The checkout changed while authenticating to Google Cloud. Only ignored files may appear (the auth step's gha-creds-*.json credentials file). Not ignored:"
+            printf '%s\n' "${dirty}"
+            exit 1
+          fi
+          if ! grep -qxF 'gha-creds-*.json' .gcloudignore; then
+            echo "::error::.gcloudignore does not exclude gha-creds-*.json: gcloud builds submit would upload the credentials file."
+            exit 1
+          fi
+          echo "Clean: the credentials file is ignored and nothing else changed."
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Operator configuration (identifiers only)
+        env:
+          MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
+        run: bash scripts/ops/write-operator-config.sh
+
+      - name: Build the snapshot's variants
+        env:
+          SNAPSHOT_KEY_INPUT: ${{ inputs.snapshot_key }}
+        run: bash scripts/ops/register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}"

@@ -258,6 +258,14 @@ class Repository(Protocol):
     def catalog_database_bytes(self) -> int: ...
     def prunable_register_snapshots(self) -> list[dict[str, Any]]: ...
     def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]: ...
+    # PR-L1: catalog variants and the discovery tree.
+    def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None: ...
+    def record_catalog_variants(self, snapshot_id: str, mapper_version: str, rows: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def catalog_browser_manufacturers(self, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]: ...
+    def catalog_browser_models(self, tozar: str, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]: ...
+    def catalog_browser_years(self, tozar: str, kinuy_mishari: str, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]: ...
+    def catalog_browser_variants(self, tozar: str, kinuy_mishari: str, shnat_yitzur: int, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]: ...
+    def catalog_browser_facets(self, tozar: str | None) -> dict[str, Any]: ...
     def acquire_catalog_variant_reservations(self, run_id: UUID, level: str, candidate_ids: list[str], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
 
@@ -2506,6 +2514,59 @@ class SupabaseRepository:
         return self._guarded_rpc("prune_register_snapshots", {
             "p_snapshot_keys": [str(k) for k in snapshot_keys], "p_digest": str(digest)},
             "register prune", refusals=self._REGISTER_REFUSALS)
+
+    # -- PR-L1: catalog variants (migration 20260930000100) --------------
+    def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None:
+        rows = self._read_rpc("catalog_variant_build_state", {
+            "p_snapshot_id": str(snapshot_id), "p_mapper_version": str(mapper_version)})
+        return rows[0] if rows else None
+
+    def record_catalog_variants(self, snapshot_id: str, mapper_version: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """One bounded build batch (service role; no lease: the build is
+        idempotent and derives every provenance fact in the database)."""
+        from backend.catalog.register.variants import DATABASE_REFUSALS
+
+        data = self._guarded_rpc("record_catalog_variants", {
+            "p_snapshot_id": str(snapshot_id), "p_mapper_version": str(mapper_version), "p_rows": list(rows)},
+            "catalog variants", refusals=DATABASE_REFUSALS)
+        if not isinstance(data, dict) or "built_rows" not in data:
+            raise AppError("REPOSITORY_ERROR", "catalog variant build returned an unreadable document", 502)
+        return data
+
+    @staticmethod
+    def _browser_filters(filters: dict[str, Any]) -> dict[str, Any]:
+        return {"p_segment": filters.get("segment"), "p_year_from": filters.get("year_from"),
+                "p_year_to": filters.get("year_to"), "p_delek_cd": filters.get("delek_cd"),
+                "p_merkav": filters.get("merkav")}
+
+    @staticmethod
+    def _browser_document(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        # ONE jsonb document: a row-set read would be cut at PostgREST's row cap.
+        if not rows or not isinstance(rows[0].get("items", rows[0].get("segments")), list):
+            raise AppError("REPOSITORY_ERROR", "catalog browser returned an unreadable document", 502)
+        return rows[0]
+
+    def catalog_browser_manufacturers(self, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+        return self._browser_document(self._read_rpc("catalog_browser_manufacturers", {
+            **self._browser_filters(filters), "p_limit": int(limit), "p_offset": int(offset)}))
+
+    def catalog_browser_models(self, tozar: str, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+        return self._browser_document(self._read_rpc("catalog_browser_models", {
+            "p_tozar": str(tozar), **self._browser_filters(filters), "p_limit": int(limit),
+            "p_offset": int(offset)}))
+
+    def catalog_browser_years(self, tozar: str, kinuy_mishari: str, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+        return self._browser_document(self._read_rpc("catalog_browser_years", {
+            "p_tozar": str(tozar), "p_kinuy_mishari": str(kinuy_mishari), **self._browser_filters(filters),
+            "p_limit": int(limit), "p_offset": int(offset)}))
+
+    def catalog_browser_variants(self, tozar: str, kinuy_mishari: str, shnat_yitzur: int, filters: dict[str, Any], *, limit: int, offset: int) -> dict[str, Any]:
+        return self._browser_document(self._read_rpc("catalog_browser_variants", {
+            "p_tozar": str(tozar), "p_kinuy_mishari": str(kinuy_mishari), "p_shnat_yitzur": int(shnat_yitzur),
+            **self._browser_filters(filters), "p_limit": int(limit), "p_offset": int(offset)}))
+
+    def catalog_browser_facets(self, tozar: str | None) -> dict[str, Any]:
+        return self._browser_document(self._read_rpc("catalog_browser_facets", {"p_tozar": tozar}))
 
     def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
         """Claim (or be answered with) the ONE preparation request of a revision."""

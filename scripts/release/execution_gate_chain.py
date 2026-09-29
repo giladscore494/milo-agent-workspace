@@ -396,6 +396,22 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_CATALOG_BROWSER",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO — it lets a project member browse the deterministic catalog "
+            "variants (read-only, $0, not a run)"),
+        when_to_enable=(
+            "After the release is deployed and its variants are built "
+            "(website-execution-activate.sh --apply-catalog-browser)"),
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "GET /projects/{id}/catalog/browser/* answers 404 and the Catalog "
+            "page is not shown. Nothing is read."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_REGISTER_CAPTURE_JOB",
         surface=WORKER_RUNTIME,
         current_default="false",

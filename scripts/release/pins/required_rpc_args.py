@@ -36,6 +36,21 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
         "p_batch_id", "p_bound_by", "p_expected_digest", "p_expected_revision",
         "p_run_id"
     },
+    "catalog_browser_facets": {"p_tozar"},
+    "catalog_browser_manufacturers": {
+        "p_delek_cd", "p_limit", "p_merkav", "p_offset", "p_segment", "p_year_from", "p_year_to"
+    },
+    "catalog_browser_models": {
+        "p_delek_cd", "p_limit", "p_merkav", "p_offset", "p_segment", "p_tozar", "p_year_from", "p_year_to"
+    },
+    "catalog_browser_variants": {
+        "p_delek_cd", "p_kinuy_mishari", "p_limit", "p_merkav", "p_offset", "p_segment",
+        "p_shnat_yitzur", "p_tozar", "p_year_from", "p_year_to"
+    },
+    "catalog_browser_years": {
+        "p_delek_cd", "p_kinuy_mishari", "p_limit", "p_merkav", "p_offset", "p_segment", "p_tozar",
+        "p_year_from", "p_year_to"
+    },
     "catalog_candidate_manufacturers": {"p_snapshot_id"},
     "catalog_candidate_model_years": {"p_commercial_model", "p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
@@ -48,6 +63,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_register_unit_states": set(),
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
+    "catalog_variant_build_state": {"p_mapper_version", "p_snapshot_id"},
     "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
     "catalog_variant_coverage_runs": {"p_after_finished_at", "p_after_run_id", "p_limit"},
     "catalog_variant_reservations_settling": {"p_limit"},
@@ -128,6 +144,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_claim_verdict_guarded": {
         "p_attempt", "p_lease_token", "p_run_id", "p_verdict", "p_worker_id"
     },
+    "record_catalog_variants": {"p_mapper_version", "p_rows", "p_snapshot_id"},
     "record_conflict_resolution_guarded": {
         "p_attempt", "p_lease_token", "p_resolution", "p_run_id", "p_worker_id"
     },

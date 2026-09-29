@@ -18,7 +18,9 @@ across snapshots):
      database, else the snapshot stays inactive with
      ``CATALOG_ARCHIVE_WRITE_FAILED``. No archive, no activation.
 4. activation (the database's own completeness gate), then the unit's
-   outcome with the snapshot's MEASURED bytes (computed in the database).
+   outcome with the snapshot's MEASURED bytes (computed in the database);
+5. PR-L1: the captured snapshot's catalog variants, built in bounded batches
+   (`variants.build_after_capture`; reported, never failing the unit).
 
 A snapshot that was already active (captured earlier, e.g. by Prepare) is
 reused as is: its archive is written if missing and its count verified. A
@@ -45,6 +47,7 @@ from backend.catalog.government.ingest import (GOVERNMENT_INGESTION_REASONS,
                                                GovernmentCatalogIngestor, GovernmentIngestionError)
 from backend.catalog.government.source import GOVERNMENT_SOURCE_REASONS, GovernmentSourceError
 from backend.catalog.register import archive as archive_module
+from backend.catalog.register.variants import build_after_capture
 from backend.errors import AppError, LEASE_FAILURE_CODES
 from backend.runtime import CancellationRequested
 
@@ -79,11 +82,13 @@ class UnitOutcome:
     api_total: int | None = None
     captured_rows: int | None = None
     failure_code: str = ""
+    #: PR-L1: the snapshot's variant build after capture (never fails the unit).
+    variants: dict[str, Any] | None = None
 
     def as_document(self) -> dict[str, Any]:
         return {"tozar": self.tozar, "status": self.status, "snapshot_key": self.snapshot_key,
                 "api_total": self.api_total, "captured_rows": self.captured_rows,
-                "failure_code": self.failure_code}
+                "failure_code": self.failure_code, "variants": self.variants}
 
 
 @dataclass
@@ -226,6 +231,10 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         record("captured", snapshot_id=report.snapshot_id, api_total=outcome.api_total,
                captured=outcome.captured_rows, verified=True)
         outcome.status, outcome.snapshot_key = "captured", report.snapshot_key
+        # PR-L1: the captured snapshot's variants, in bounded batches. A
+        # failed build is reported and leaves the unit captured (the operator
+        # backfill builds it again); an already built snapshot is a no-op.
+        outcome.variants = build_after_capture(repository, report.snapshot_id)
         return outcome
     except Exception as failure:  # noqa: BLE001 - reduced to a static code
         if _is_fatal(failure) or isinstance(failure, CancellationRequested):

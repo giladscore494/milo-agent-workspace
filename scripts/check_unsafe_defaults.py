@@ -47,6 +47,8 @@ EXECUTION_FLAGS = [
     # per-execution register switch. Never a default.
     "MILO_ENABLE_REGISTER_CAPTURE",
     "MILO_ENABLE_REGISTER_CAPTURE_JOB",
+    # PR-L1: the read-only catalog browser (API). Never a default.
+    "MILO_ENABLE_CATALOG_BROWSER",
     "GATEWAY_ALLOW_EXECUTION_ROUTES",
     "GATEWAY_ALLOW_RUN_START_ROUTES",
     "NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI",

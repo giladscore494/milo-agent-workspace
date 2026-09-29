@@ -80,6 +80,9 @@ EXECUTION_FLAGS = (
     # pinned false on both product surfaces like every other Stage A flag.
     "MILO_ENABLE_REGISTER_CAPTURE",
     "MILO_ENABLE_REGISTER_CAPTURE_JOB",
+    # PR-L1: the read-only catalog browser (API): pinned false on both
+    # product surfaces like every other Stage A flag.
+    "MILO_ENABLE_CATALOG_BROWSER",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

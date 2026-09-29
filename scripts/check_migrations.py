@@ -236,6 +236,21 @@ REQUIRED_PER_FILE["20260929000100_catalog_register_capture.sql"] = [
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
     "execute format('grant execute on function %s to %i', fn, ro.rolname);",
 ]
+REQUIRED_PER_FILE["20260930000100_catalog_variants.sql"] = [
+    # PR-L1: variants are service-path only (RLS, no policies), append-only,
+    # can never be orphaned by a prune (restrict FKs and the keep-set), carry
+    # a closed equipment key list, and the read-only role is granted
+    # explicitly.
+    "enable row level security",
+    "create table if not exists public.catalog_variants (",
+    "create unique index if not exists catalog_variants_record_uidx",
+    "forbid_catalog_variant_rewrite",
+    "references public.catalog_raw_records (snapshot_id, upstream_record_id) on delete restrict",
+    "check (public.catalog_variant_equipment_valid(equipment))",
+    "and not exists (select 1 from public.catalog_variants x where x.snapshot_id = sc.id)",
+    "revoke delete, truncate on table public.catalog_variants from service_role",
+    "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

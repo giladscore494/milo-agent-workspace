@@ -392,8 +392,11 @@ def test_the_register_snapshot_is_the_snapshot_prepare_makes():
             "\n".join(candidates).encode()).hexdigest()
 
     assert content(repo, register_snapshot) == content(plain, prepare_snapshot)
-    # No coverage ledger row is written by a register capture.
-    assert repo.catalog_variant_coverage == {}
+    # A register capture writes no `register`-level ledger row; PR-L1's
+    # variant build writes the two deterministic levels only.
+    assert repo.catalog_variant_coverage
+    assert {level for _key, level in repo.catalog_variant_coverage} == {"identity", "government_fields"}
+    assert plain.catalog_variant_coverage == {}
 
 
 def test_the_count_is_a_fresh_exact_limit_zero_count_taken_after_the_rows():

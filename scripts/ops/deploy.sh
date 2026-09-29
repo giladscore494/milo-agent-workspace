@@ -22,8 +22,9 @@
 #  10. production-verify.sh --gate deployed for that SHA
 #  11. only once 1-10 PASSED, and not in permanent mode: turn the website's
 #      plan tools back on (--restore-website-stage, scripts/ops/website-stage.sh)
-#      -- Stage P and/or E', and/or the Register page (register-capture;
-#      all = both + register-capture), which the Stage A deploy turned off.
+#      -- Stage P and/or E', and/or the Register page (register-capture),
+#      and/or the catalog browser (catalog-browser; all = both +
+#      register-capture + catalog-browser), which the Stage A deploy turned off.
 #      A failed deploy stops before it and restores nothing.
 #
 # It never starts a run, never prepares a plan and never arms Stage 2. Each
@@ -41,7 +42,7 @@ REQUIRED_CI_JOBS=(offline-checks frontend-and-docker postgres-checks e2e)
 usage() {
   cat << 'EOF'
 Usage: deploy.sh --sha <40-hex> [--permanent-mode true|false] [--dry-run]
-                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|all]
+                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|catalog-browser|all]
                  [--operator-config <path>]
 
 Deploys the checked-out release after proving CI, migrations, the website and
@@ -64,8 +65,8 @@ done
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { printf 'FAIL: --sha must be a full 40-character lowercase SHA\n' >&2; exit 2; }
 case "$PERMANENT" in true | false) ;; *) printf 'FAIL: --permanent-mode must be true or false\n' >&2; exit 2 ;; esac
 case "$RESTORE_STAGE" in
-  none | plan-authoring | web-preparation | both | register-capture | all) ;;
-  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture or all\n' >&2; exit 2 ;;
+  none | plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;
+  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture, catalog-browser or all\n' >&2; exit 2 ;;
 esac
 
 ops_load_config

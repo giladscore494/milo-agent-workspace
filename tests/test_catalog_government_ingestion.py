@@ -1315,6 +1315,12 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # reads a run's own preparation record. It constructs no client and no
         # transport and captures nothing.
         "backend/catalog/coverage.py",
+        # PR-L1: the deterministic variant mapper reads the reviewed
+        # vocabulary, the PR-V normalization (pure) and the WLTP resource
+        # constant; the browser reads the model-year bounds. Neither constructs
+        # a client or a transport: the build reads STORED raw records only.
+        "backend/catalog/register/variants.py",
+        "backend/catalog/register/browser.py",
     }
     # An IMPORT is the seam this guards. A bare occurrence of the dotted name
     # is not: `backend/testing/memory_repository.py` has to know the capture
