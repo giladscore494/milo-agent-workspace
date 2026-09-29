@@ -3844,7 +3844,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260927000100_catalog_variant_coverage.sql",
         "20260928000100_catalog_work_scope_preparation_requests.sql",
         "20260929000100_catalog_register_capture.sql",
-        "20260930000100_catalog_variants.sql"]
+        "20260930000100_catalog_variants.sql",
+        "20260930000200_catalog_work_scope_placeholder_exclusion.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -7683,7 +7684,8 @@ def _wsp_swarm_run(db, conversation: str, status: str = "queued") -> str:
 
 def _wsp_snapshot(db, args: str, label: str, rows: list[tuple[str, int]], *,
                   marque: str | None = WSP_TOYOTA, issues: int = 0,
-                  make: str = WSP_TOYOTA, **metadata) -> tuple[str, str, list[str]]:
+                  make: str = WSP_TOYOTA, models: dict[int, str] | None = None,
+                  **metadata) -> tuple[str, str, list[str]]:
     """An ACTIVE Government snapshot with one candidate per `(status, year)`.
 
     Returns (snapshot id, snapshot key, candidate ids in insertion order). The
@@ -7706,7 +7708,8 @@ def _wsp_snapshot(db, args: str, label: str, rows: list[tuple[str, int]], *,
     for index, ((status, year), record) in enumerate(zip(rows, records)):
         candidate = _catalog_candidate_json(snapshot, record, f"wsp-{label}-cand-{index}",
                                             status=status, make=make,
-                                            model=f"MODEL-{index:02d}", years=(year, year))
+                                            model=(models or {}).get(index, f"MODEL-{index:02d}"),
+                                            years=(year, year))
         candidates.append(_rpc_as_service(db, "select id from public.record_catalog_candidate_guarded("
                                               f"{args}, $j${candidate}$j$::jsonb)"))
     key = db.psql(f"select snapshot_key from public.catalog_source_snapshots where id='{snapshot}'")
@@ -8816,7 +8819,8 @@ SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100
 #: migration, (PR-R) the reasoning-aware usage migration, and (PR-Z) the
 #: variant coverage migration, and (E') the web preparation request migration.
 PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
-                              "20260928000100", "20260929000100", "20260930000100")
+                              "20260928000100", "20260929000100", "20260930000100",
+                              "20260930000200")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -8960,7 +8964,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 47
+        assert len(applied) == 41 and len(MIGRATIONS) == 48
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -8994,8 +8998,8 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/47" in state.stdout, state.stdout
-    assert "6 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/48" in state.stdout, state.stdout
+    assert "7 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
@@ -9016,7 +9020,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (47/47" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (48/48" in state.stdout, state.stdout
 
 
 
@@ -9967,7 +9971,8 @@ def test_pr_z_the_queue_build_leaves_out_what_the_ledger_settles(ledger_db):
                                   "vocabulary_version": db.psql(
                                       "select public.catalog_vocabulary_version()"),
                                   "excluded_already_enriched": 3,
-                                  "excluded_known_unresolved": 1}
+                                  "excluded_known_unresolved": 1,
+                                  "excluded_placeholder": 0}
     assert summary["units"][1]["coverage"] is None          # register_unverified: nothing
     queued = set(db.psql("select candidate_id from public.catalog_work_scope_queue_items "
                          f"where preparation_id='{summary['preparation']['id']}'").splitlines())
@@ -9986,6 +9991,35 @@ def test_pr_z_the_queue_build_leaves_out_what_the_ledger_settles(ledger_db):
                                             f"'{summary['preparation']['id']}') u"))
     assert counts == [{"unit_key": "toyota", "level": "register", "include_unresolved": False,
                        "excluded_already_enriched": 3, "excluded_known_unresolved": 1}]
+
+
+def test_p27_the_queue_build_leaves_a_placeholder_out_and_records_it(ledger_db):
+    """P27: PR-U's placeholder rule at the queue build -- not eligible, never
+    queued, recorded with its register id and reason, counted; the SQL rule is
+    the Python rule."""
+    from backend.catalog.government.preparation import is_placeholder_identity
+
+    db = ledger_db
+    for model, code in (("11111", None), ("4RUNNER", "11111111"), ("4RUNNER", "000"), ("111", None),
+                        ("1111A", None), ("12345", None), ("00", None), ("١١١", None), ("RAV4", "X")):
+        assert db.psql(f"select public.catalog_is_placeholder_identity({_sql_text(model)}, "
+                       f"{_sql_text(code)})") == ("t" if is_placeholder_identity(model, code) else "f")
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(max_items=25, batch_size=10)
+    created = _ws_create(db, conversation, user, scope)
+    _run, args = _wsp_capture_run(db, conversation)
+    snapshot, _key, candidates = _wsp_snapshot(db, args, f"p27-{conversation[:8]}",
+                                               [("candidate", 2019)] * 4, models={0: "11111"})
+    summary = _wsp_prepare(db, args, created["work_scope"]["id"], 1, scope.digest(), _wsp_units(snapshot))
+    toyota = summary["units"][0]
+    assert (toyota["eligible_count"], toyota["queued_count"]) == (3, 3)
+    assert toyota["coverage"]["excluded_placeholder"] == 1
+    queued = set(db.psql("select candidate_id from public.catalog_work_scope_queue_items "
+                         f"where preparation_id='{summary['preparation']['id']}'").splitlines())
+    assert queued == set(candidates[1:])
+    assert json.loads(db.psql("select excluded_records from public.catalog_work_scope_unit_coverage "
+                              f"where preparation_id='{summary['preparation']['id']}'")) == [
+        {"upstream_record_id": "1000", "reason": "excluded_placeholder_source_record"}]
 
 
 def test_pr_z_include_unresolved_on_the_revision_requeues_the_unresolved_only(ledger_db):

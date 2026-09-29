@@ -143,6 +143,10 @@ DECISION_QUEUE = "queue"
 EXCLUDED_ALREADY_ENRICHED = "excluded_already_enriched"
 EXCLUDED_KNOWN_UNRESOLVED = "excluded_known_unresolved"
 COVERAGE_DECISIONS = (DECISION_QUEUE, EXCLUDED_ALREADY_ENRICHED, EXCLUDED_KNOWN_UNRESOLVED)
+#: P27: the queue build's own decision for a placeholder source record
+#: (`preparation.EXCLUDED_PLACEHOLDER_SOURCE_RECORD`, the batch-time reason,
+#: in the decision spelling). Taken before the ledger's rule, at any level.
+EXCLUDED_PLACEHOLDER_SOURCE_RECORD = "excluded_placeholder_source_record"
 
 #: What claiming one candidate answers (`acquire_catalog_variant_reservations_
 #: guarded`): the run owns the paid work on it, the ledger already settles it,
@@ -779,8 +783,9 @@ __all__ = ["BACKFILL_SKIP_REASONS", "CLAIM_DECISIONS", "MAX_RECONCILE_RUNS",
            "BATCH_COVERAGE_LEVEL", "BackfillReport",
            "COVERAGE_DECISIONS", "COVERAGE_LEVELS", "COVERAGE_STATUSES", "CoverageDerivation",
            "DECISION_QUEUE", "ENRICHED", "EXCLUDED_ALREADY_ENRICHED",
-           "EXCLUDED_KNOWN_UNRESOLVED", "FAILED", "LEVEL_GOVERNMENT_FIELDS", "LEVEL_IDENTITY",
-           "LEVEL_REGISTER", "VARIANT_BUILD_LEVELS", "MAX_BACKFILL_PAGE",
+           "EXCLUDED_KNOWN_UNRESOLVED", "EXCLUDED_PLACEHOLDER_SOURCE_RECORD", "FAILED",
+           "LEVEL_GOVERNMENT_FIELDS", "LEVEL_IDENTITY", "LEVEL_REGISTER", "VARIANT_BUILD_LEVELS",
+           "MAX_BACKFILL_PAGE",
            "MAX_COVERAGE_ENTRIES", "MAX_IDENTITY_SCAN_ROWS", "PENDING", "STATUS_RANK",
            "UNRESOLVED_AMBIGUOUS", "UNRESOLVED_NOT_FOUND", "UNRESOLVED_STATUSES",
            "VARIANT_IDENTITY_CONTRACT", "VOLATILE_PAYLOAD_FIELDS", "assembled_output",

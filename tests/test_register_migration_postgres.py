@@ -99,7 +99,8 @@ def regdb():
             server.psql(file=migration)
         assert server.psql("select to_regclass('public.catalog_register_capture_units') is null") == "t"
         server.psql(file=_register_migration())
-        # Later migrations (PR-L1's variants) apply on top, as in production.
+        # Later migrations (PR-L1's variants, PR-HYG's placeholder exclusion) apply on
+        # top, as in production.
         for migration in after:
             server.psql(file=migration)
         yield server

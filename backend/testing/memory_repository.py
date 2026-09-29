@@ -29,6 +29,7 @@ from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILI
                                        stated_canonical_fields,
                                        stated_identity_dimensions, stated_source_locator,
                                        trust_state_for)
+from backend.catalog.government.preparation import is_placeholder_identity
 from backend.catalog.diff import MAX_DIFF_ITEMS, diff_rows
 from backend.catalog.digest import catalog_payload_digest
 from backend.engines.swarm_v2.current_verdict import (CurrentVerdict,
@@ -2916,7 +2917,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
             unit["coverage"] = None if row is None else {
                 key: row[key] for key in ("level", "vocabulary_version", "include_unresolved",
                                           "excluded_already_enriched",
-                                          "excluded_known_unresolved")}
+                                          "excluded_known_unresolved", "excluded_placeholder")}
         batches = sorted((row for row in self.work_scope_batches
                           if row["preparation_id"] == preparation["id"]),
                          key=lambda row: row["batch_number"])
@@ -3016,7 +3017,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                 marque = entry["register_marque"] if isinstance(entry["register_marque"], str) \
                     else None
                 readable = ambiguous = eligible = take = 0
-                enriched = unresolved = 0
+                enriched = unresolved = placeholder = 0
                 excluded: list[dict[str, str]] = []
                 reason: str | None = None
                 snapshot: dict[str, Any] | None = None
@@ -3061,7 +3062,10 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                                     if self._in_plan_years(row, year_from, year_to)]
                         readable = sum(1 for row in in_range if row["status"] != "ambiguous")
                         ambiguous = sum(1 for row in in_range if row["status"] == "ambiguous")
-                        eligible = sum(1 for row in in_range if row["status"] == "candidate")
+                        # P27: a placeholder is not queueable, so not eligible.
+                        eligible = sum(1 for row in in_range if row["status"] == "candidate"
+                                       and not is_placeholder_identity(row["commercial_model"],
+                                                                       row["official_model_code"]))
                         if ambiguous > readable:
                             state, reason = "vocabulary_insufficient", \
                                 "WORK_SCOPE_VOCABULARY_INSUFFICIENT"
@@ -3077,7 +3081,9 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                                 key=lambda entry: entry["upstream_record_id"].encode())
                             enriched = sum(1 for entry in excluded if entry["reason"]
                                            == catalog_coverage.EXCLUDED_ALREADY_ENRICHED)
-                            unresolved = len(excluded) - enriched
+                            placeholder = sum(1 for entry in excluded if entry["reason"]
+                                              == catalog_coverage.EXCLUDED_PLACEHOLDER_SOURCE_RECORD)
+                            unresolved = len(excluded) - enriched - placeholder
                             take = min(eligible - enriched - unresolved, budget)
                             budget -= take
                             prepared += 1
@@ -3094,7 +3100,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                                           .get("scope_key") if snapshot else None),
                     "readable": readable, "ambiguous": ambiguous, "eligible": eligible,
                     "take": take, "enriched": enriched, "unresolved": unresolved,
-                    "excluded": excluded})
+                    "placeholder": placeholder, "excluded": excluded})
 
             # Pass 2: write the whole decision.
             now = _now()
@@ -3124,6 +3130,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                         "include_unresolved": include,
                         "excluded_already_enriched": unit["enriched"],
                         "excluded_known_unresolved": unit["unresolved"],
+                        "excluded_placeholder": unit["placeholder"],
                         "excluded_records": [dict(entry) for entry in unit["excluded"]],
                         "created_at": now})
                 if not unit["take"]:
@@ -3597,6 +3604,9 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
             key, content, record = self._coverage_facts(candidate, records)
             decision, _ = self._coverage_decision(key, content,
                                                   catalog_coverage.LEVEL_REGISTER, include)
+            if is_placeholder_identity(candidate["commercial_model"],
+                                       candidate["official_model_code"]):
+                decision = catalog_coverage.EXCLUDED_PLACEHOLDER_SOURCE_RECORD
             decided.append((candidate, str(record["upstream_record_id"]), decision))
         return decided
 

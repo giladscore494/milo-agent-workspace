@@ -58,6 +58,9 @@ as the SOFT coverage gap `CANDIDATE_UNRESOLVED_AMBIGUOUS` /
 `CANDIDATE_UNRESOLVED_NOT_FOUND`: the outcome is `partial_success`, never a
 failed run. The surface renders those gaps; it does not render
 `candidate_outcomes` itself (unknown top-level keys are never rendered).
+P32 adds a third SOFT coverage gap, `REGISTER_FIELD_ABSENT`: every resolved
+register row of the task states no value for a field the task's evidence
+requires (e.g. `ramat_gimur`), so no fact could be quoted for it.
 
 `not_found` is implemented and rendered, and is **unreachable in production**:
 no registered tool can return `TRUSTED_SOURCE_NO_MATCH`, so

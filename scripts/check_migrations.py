@@ -251,6 +251,15 @@ REQUIRED_PER_FILE["20260930000100_catalog_variants.sql"] = [
     "revoke delete, truncate on table public.catalog_variants from service_role",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
+    # P27: the queue build leaves PR-U's placeholder records out (never
+    # eligible, never queued), records each with its reason and counts them.
+    "create or replace function public.catalog_is_placeholder_identity(",
+    "then 'excluded_placeholder_source_record'",
+    "count(*) filter (where c.status = 'candidate' and not public.catalog_is_placeholder_identity(",
+    "= excluded_already_enriched + excluded_known_unresolved + excluded_placeholder",
+    "perform public.assert_worker_lease(",
+]
 REQUIRED_PER_FILE["20260923000100_catalog_work_scope_preparation.sql"] = [
     # A scoped snapshot's declaration is held to the query it recorded, and the
     # preparation it feeds is written once, by an operator capture run only.

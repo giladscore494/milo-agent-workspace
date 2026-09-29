@@ -546,7 +546,8 @@ def test_the_outcome_is_read_only_from_the_resolve_variant_tool_result():
                              result=ambiguous, **common) is None
     assert candidate_outcome(tool=GOVERNMENT_TOOL_NAME, operation="resolve_variant",
                              result={**ambiguous, "ambiguous": "true"}, **common) is None
-    assert set(CANDIDATE_GAP_CODES.values()) == SOFT_GAP_CODES
+    # P32: the soft codes are the candidate gaps and REGISTER_FIELD_ABSENT.
+    assert set(CANDIDATE_GAP_CODES.values()) | {"REGISTER_FIELD_ABSENT"} == SOFT_GAP_CODES
 
 
 def test_a_task_result_without_outcomes_is_unchanged():
