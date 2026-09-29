@@ -33,7 +33,16 @@ const defaultClient: CatalogBrowserClient = {
   revisePlan: (planId, head, edit) => api.reviseWorkScope(planId, head, { edit }),
 };
 
-export type CatalogBrowserPanelProps = { projectId?: string; conversationId?: string; client?: CatalogBrowserClient };
+export type CatalogBrowserPanelProps = {
+  projectId?: string;
+  conversationId?: string;
+  /** The page's own answer to "may this person edit a Mapping Plan here"
+   *  (execution UI on AND plan writes on); nothing is offered otherwise. */
+  planWrites?: boolean;
+  /** Called after the plan was written, so the page's Mapping Plan reloads. */
+  onPlanChanged?: () => void;
+  client?: CatalogBrowserClient;
+};
 
 type Path = { tozar?: string; model?: string; year?: number };
 type Listing =
@@ -42,13 +51,17 @@ type Listing =
   | { level: 'years'; page: Page<ModelYear> }
   | { level: 'variants'; page: Page<Variant> };
 type Shown = { kind: 'hidden' } | { kind: 'loading' } | { kind: 'ready'; listing: Listing } | { kind: 'error'; message: string };
+/** `plan` undefined = not (yet) read, null = the conversation has none. */
+type PlanState = { capabilities?: WorkScopeCapabilities; directory?: WorkScopeDirectory; plan?: WorkScopeState | null };
 
 const READ_FALLBACK = 'The catalog could not be read. Try again.';
 const PLAN_FALLBACK = 'The plan could not be changed. Nothing was added.';
 const REFUSAL_COPY = {
   nothing_mappable: 'None of the selected manufacturers is in the plan directory with a verified register spelling.',
   too_many_units: 'The plan would hold more manufacturers than it may.',
-  no_change: 'The plan already covers that selection; nothing changed.',
+  no_change: 'The plan already holds every selected manufacturer; nothing changed.',
+  years_differ: 'The plan has one model-year range for all its manufacturers. Clear the year filter, or set it to the '
+    + 'plan\'s range, to add to it; change the range itself in the Mapping Plan.',
 } as const;
 
 function levelOf(path: Path): Exclude<BrowserLevel, 'facets'> {
@@ -66,10 +79,6 @@ function parseListing(level: Listing['level'], body: unknown): Listing | undefin
   }
 }
 
-function yearValue(value: string): number | undefined {
-  return /^[0-9]{4}$/.test(value.trim()) ? Number(value.trim()) : undefined;
-}
-
 /**
  * PR-CAT (D5 + D6) -- the Catalog page: the deterministic catalog variants
  * as a tree, manufacturer -> model -> year -> variants, every level paged by
@@ -78,7 +87,8 @@ function yearValue(value: string): number | undefined {
  * changes nothing; "Add to plan" only writes the conversation's Mapping Plan
  * through its existing routes -- it never prepares, arms or starts anything.
  */
-export function CatalogBrowserPanel({ projectId, conversationId, client = defaultClient }: CatalogBrowserPanelProps) {
+export function CatalogBrowserPanel({ projectId, conversationId, planWrites = false, onPlanChanged,
+  client = defaultClient }: CatalogBrowserPanelProps) {
   const [shown, setShown] = useState<Shown>({ kind: 'hidden' });
   const [open, setOpen] = useState(false);
   const [path, setPath] = useState<Path>({});
@@ -86,7 +96,12 @@ export function CatalogBrowserPanel({ projectId, conversationId, client = defaul
   const [filters, setFilters] = useState<BrowserFilters>({});
   const [facets, setFacets] = useState<Facets>();
   const [exists, setExists] = useState(false);
+  const [plan, setPlan] = useState<PlanState>({});
+  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
   const generation = useRef(0);
+  const planGeneration = useRef(0);
 
   const read = useCallback(async (project: string, where: Path, at: number, by: BrowserFilters, first: boolean) => {
     const mine = ++generation.current;
@@ -112,21 +127,79 @@ export function CatalogBrowserPanel({ projectId, conversationId, client = defaul
     setExists(false); setPath({}); setOffset(0); setFilters({}); setFacets(undefined);
     setShown({ kind: 'hidden' });
     if (!projectId) return;
+    const mine = generation.current + 1;
     void read(projectId, {}, 0, {}, true);
     void (async () => {
       try {
-        setFacets(parseFacets(await client.browse(projectId, 'facets', '')));
+        const body = await client.browse(projectId, 'facets', '');
+        // Facets of a project the page has since left are dropped.
+        if (generation.current <= mine) setFacets(parseFacets(body));
       } catch {
         // No facets: the filters offer "Any" only.
       }
     })();
   }, [projectId, client, read]);
 
+  // The conversation's plan state, read only once the page exists (the
+  // browser answered). Everything about the previous conversation is
+  // dropped FIRST, so nothing is ever written to another conversation's plan.
+  const loadPlan = useCallback(async () => {
+    const mine = ++planGeneration.current;
+    setPlan({});
+    if (!projectId || !conversationId || !planWrites || !exists) return;
+    try {
+      const [caps, dir, openPlan] = await Promise.all([
+        client.capabilities(projectId), client.directory(projectId), client.openPlan(conversationId)]);
+      if (mine !== planGeneration.current) return;
+      // An unreadable open plan is not "no plan": Add to plan stays off.
+      setPlan({ capabilities: parseCapabilities(caps), directory: parseDirectory(dir),
+                plan: parseOpenWorkScope(openPlan) });
+    } catch {
+      // No plan state: Add to plan stays off.
+    }
+  }, [client, projectId, conversationId, planWrites, exists]);
+
+  useEffect(() => {
+    setSelected(new Set());
+    setMessage('');
+    void loadPlan();
+  }, [loadPlan]);
+
   if (!projectId || !exists) return null;
 
   const go = (where: Path, at = 0, by = filters) => {
     setPath(where); setOffset(at); setFilters(by); setShown({ kind: 'loading' });
     void read(projectId, where, at, by, false);
+  };
+
+  const canPlan = planWrites && conversationId !== undefined && plan.capabilities?.available === true
+    && plan.directory !== undefined && plan.plan !== undefined;
+  const otherFilters = filters.segment !== undefined || filters.delekCd !== undefined || filters.merkav !== undefined;
+
+  const add = async () => {
+    if (!canPlan || !conversationId || busy || plan.capabilities === undefined || plan.plan === undefined) return;
+    const addition = planAddition({ tozars: [...selected], yearFrom: filters.yearFrom ?? null,
+                                    yearTo: filters.yearTo ?? null }, plan.plan, plan.directory?.entries ?? [],
+                                  plan.capabilities.limits);
+    if (addition.kind === 'refused') { setMessage(REFUSAL_COPY[addition.reason]); return; }
+    setBusy(true); setMessage('');
+    try {
+      const answer = addition.kind === 'create'
+        ? await client.createPlan(conversationId, addition.edit)
+        : await client.revisePlan(plan.plan!.id, addition.head, addition.edit);
+      if (parseWorkScopeMutation(answer) === undefined) throw new Error('unreadable');
+      setSelected(new Set());
+      setMessage(`Added to the Mapping Plan${addition.unmapped.length ? ` (left out: ${addition.unmapped.length} `
+        + 'without a verified register spelling)' : ''}. Prepare it from the Mapping Plan; nothing was started here.`);
+      onPlanChanged?.();
+    } catch (error) {
+      // A stale head or a plan opened elsewhere (409) is answered by reading
+      // the plan again: the next attempt is made against the current head.
+      setMessage(safeErrorText(error, PLAN_FALLBACK));
+    } finally {
+      setBusy(false);
+      await loadPlan();
+    }
   };
 
   return (
@@ -156,15 +229,41 @@ export function CatalogBrowserPanel({ projectId, conversationId, client = defaul
           {shown.kind === 'error' && <p className="alert" role="alert">{safeText(shown.message)}</p>}
           {shown.kind === 'ready' && (
             <>
-              <Listing listing={shown.listing} path={path} onOpen={(where) => go(where)} projectId={projectId}
-                conversationId={conversationId} client={client} filters={filters} />
+              <Listing listing={shown.listing} path={path} onOpen={(where) => go(where)} canPlan={canPlan}
+                entries={plan.directory?.entries ?? []} selected={selected} busy={busy}
+                onToggle={(tozar) => setSelected((current) => {
+                  const next = new Set(current);
+                  if (next.has(tozar)) next.delete(tozar); else next.add(tozar);
+                  return next;
+                })} />
               <Pager page={shown.listing.page} onPage={(at) => go(path, at)} offset={offset} />
             </>
           )}
+          {canPlan && (
+            <div className="button-row">
+              <button type="button" className="button button--primary"
+                disabled={busy || selected.size === 0 || otherFilters} onClick={() => void add()}>
+                {busy ? 'Adding…' : `Add to plan (${selected.size})`}</button>
+              <span className="muted">
+                {otherFilters
+                  ? 'A plan selects whole manufacturers by model year: clear the segment, fuel and body filters to add.'
+                  : `Year range: ${filters.yearFrom ?? 'any'}–${filters.yearTo ?? 'any'}. Variants the catalog already `
+                    + 'enriched are left out when the plan is prepared.'}
+              </span>
+            </div>)}
+          {message && <p className="muted" role="status">{safeText(message)}</p>}
         </div>
       )}
     </section>
   );
+}
+
+const MIN_YEAR = 1900;
+const MAX_YEAR = 2100;
+
+function yearValue(value: string): number | undefined {
+  const year = /^[0-9]{4}$/.test(value.trim()) ? Number(value.trim()) : undefined;
+  return year !== undefined && year >= MIN_YEAR && year <= MAX_YEAR ? year : undefined;
 }
 
 function FilterBar({ facets, filters, onApply }: { facets?: Facets; filters: BrowserFilters;
@@ -204,7 +303,7 @@ function FilterBar({ facets, filters, onApply }: { facets?: Facets; filters: Bro
           <option key={item.merkav} value={item.merkav}>{safeText(item.merkav)}</option>))}
       </select></label>
       <button type="submit" className="button button--quiet" disabled={invalid}>Apply filters</button>
-      {invalid && <span className="alert" role="alert">Years are four digits, the first not after the last.</span>}
+      {invalid && <span className="alert" role="alert">Years are {MIN_YEAR}–{MAX_YEAR}, the first not after the last.</span>}
     </form>
   );
 }
@@ -213,7 +312,7 @@ function Pager({ page, offset, onPage }: { page: Page<unknown>; offset: number; 
   if (page.total <= page.limit) return null;
   const last = Math.min(offset + page.items.length, page.total);
   return (
-    <div className="button-row" aria-label="Pages">
+    <div className="button-row" role="group" aria-label="Pages">
       <button type="button" className="button button--quiet" disabled={offset === 0}
         onClick={() => onPage(Math.max(0, offset - page.limit))}>Previous</button>
       <span className="muted">{offset + 1}–{last} of {page.total}</span>
@@ -223,32 +322,53 @@ function Pager({ page, offset, onPage }: { page: Page<unknown>; offset: number; 
   );
 }
 
-type ListingProps = { listing: Listing; path: Path; onOpen: (where: Path) => void; projectId: string;
-  conversationId?: string; client: CatalogBrowserClient; filters: BrowserFilters };
+const NOT_STATED = '(not stated)';
 
-function Listing({ listing, path, onOpen, projectId, conversationId, client, filters }: ListingProps) {
+type ListingProps = {
+  listing: Listing; path: Path; onOpen: (where: Path) => void; canPlan: boolean;
+  entries: WorkScopeDirectory['entries']; selected: ReadonlySet<string>; busy: boolean;
+  onToggle: (tozar: string) => void;
+};
+
+function Listing({ listing, path, onOpen, canPlan, entries, selected, busy, onToggle }: ListingProps) {
   if (listing.page.items.length === 0) {
     return <p className="muted">No catalog variants match. Built snapshots appear here once their build completes.</p>;
   }
   switch (listing.level) {
     case 'manufacturers':
-      return <Manufacturers page={listing.page} onOpen={(tozar) => onOpen({ tozar })} projectId={projectId}
-        conversationId={conversationId} client={client} filters={filters} />;
+      return (
+        <ul className="catalog-list">{listing.page.items.map((item) => {
+          const mapped = directoryKeyFor(item.tozar, entries) !== undefined;
+          return (
+            <li key={item.tozar}>
+              {canPlan && (
+                <input type="checkbox" aria-label={`Select ${item.tozar}`} disabled={!mapped || busy}
+                  checked={selected.has(item.tozar)} onChange={() => onToggle(item.tozar)} />)}
+              <button type="button" className="button button--quiet" onClick={() => onOpen({ tozar: item.tozar })}>
+                {safeText(item.tozar)}</button>
+              {' '}<span className="muted">{item.variants} variants</span>
+            </li>);
+        })}</ul>);
     case 'models':
       return (
         <>
           <p className="note">A Mapping Plan selects whole manufacturers by model year; a model is browsed here but
             cannot be added to a plan on its own.</p>
           <ul className="catalog-list">{listing.page.items.map((item) => (
-            <li key={item.kinuyMishari}><button type="button" className="button button--quiet"
-              onClick={() => onOpen({ tozar: path.tozar, model: item.kinuyMishari })}>{safeText(item.kinuyMishari)}</button>
+            <li key={item.kinuyMishari ?? NOT_STATED}>
+              {item.kinuyMishari === null ? <span>{NOT_STATED}</span> : (
+                <button type="button" className="button button--quiet"
+                  onClick={() => onOpen({ tozar: path.tozar, model: item.kinuyMishari! })}>
+                  {safeText(item.kinuyMishari)}</button>)}
               {' '}<span className="muted">{item.variants} variants, {item.yearMin ?? '—'}–{item.yearMax ?? '—'}</span></li>))}
           </ul>
         </>);
     case 'years':
       return <ul className="catalog-list">{listing.page.items.map((item) => (
-        <li key={item.year}><button type="button" className="button button--quiet"
-          onClick={() => onOpen({ ...path, year: item.year })}>{item.year}</button>
+        <li key={item.year ?? NOT_STATED}>
+          {item.year === null ? <span>{NOT_STATED}</span> : (
+            <button type="button" className="button button--quiet"
+              onClick={() => onOpen({ ...path, year: item.year! })}>{item.year}</button>)}
           {' '}<span className="muted">{item.variants} variants</span></li>))}</ul>;
     default:
       return <Variants items={listing.page.items} />;
@@ -262,7 +382,7 @@ function Variants({ items }: { items: Variant[] }) {
         <p>Source: Government register (Ministry of Transport), record{' '}
           <span className="identifier">{safeText(item.upstreamRecordId)}</span> of snapshot{' '}
           <span className="identifier">{safeText(item.snapshotKey)}</span> — {SEGMENT_COPY[item.segment]}</p>
-        <p aria-label="Coverage">{COVERAGE_LEVELS.map((level) => {
+        <p role="group" aria-label="Coverage">{COVERAGE_LEVELS.map((level) => {
           const badge = item.coverage[level];
           return (
             <span key={level} className="badge" data-level={level}>
@@ -275,88 +395,4 @@ function Variants({ items }: { items: Variant[] }) {
         {item.parseIssues > 0 && <p className="note">{item.parseIssues} register value(s) could not be read and are shown as not stated.</p>}
       </li>))}
     </ul>);
-}
-
-type PlanState = { capabilities?: WorkScopeCapabilities; directory?: WorkScopeDirectory; plan?: WorkScopeState | null };
-
-function Manufacturers({ page, onOpen, projectId, conversationId, client, filters }: {
-  page: Page<Manufacturer>; onOpen: (tozar: string) => void; projectId: string; conversationId?: string;
-  client: CatalogBrowserClient; filters: BrowserFilters }) {
-  const [plan, setPlan] = useState<PlanState>({});
-  const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState('');
-
-  useEffect(() => {
-    if (!conversationId) return;
-    let live = true;
-    void (async () => {
-      try {
-        const [caps, dir, open] = await Promise.all([client.capabilities(projectId), client.directory(projectId),
-                                                     client.openPlan(conversationId)]);
-        // An unreadable open plan is not "no plan": Add to plan stays off.
-        if (live) setPlan({ capabilities: parseCapabilities(caps), directory: parseDirectory(dir),
-                            plan: parseOpenWorkScope(open) });
-      } catch {
-        // No plan state: Add to plan stays off.
-      }
-    })();
-    return () => { live = false; };
-  }, [client, projectId, conversationId]);
-
-  const canPlan = conversationId !== undefined && plan.capabilities?.available === true
-    && plan.directory !== undefined && plan.plan !== undefined;
-  const entries = plan.directory?.entries ?? [];
-
-  const add = async () => {
-    if (!canPlan || !conversationId || busy || plan.capabilities === undefined) return;
-    if (plan.plan === undefined) return;
-    const addition = planAddition({ tozars: [...selected], yearFrom: filters.yearFrom ?? null,
-                                    yearTo: filters.yearTo ?? null }, plan.plan, entries,
-                                  plan.capabilities.limits);
-    if (addition.kind === 'refused') { setMessage(REFUSAL_COPY[addition.reason]); return; }
-    setBusy(true); setMessage('');
-    try {
-      const answer = addition.kind === 'create'
-        ? await client.createPlan(conversationId, addition.edit)
-        : await client.revisePlan(plan.plan!.id, addition.head, addition.edit);
-      // The saved head; an unreadable answer leaves the plan unknown (off).
-      setPlan((current) => ({ ...current, plan: parseWorkScopeMutation(answer)?.state }));
-      setSelected(new Set());
-      setMessage(`Added to the Mapping Plan${addition.unmapped.length ? ` (left out: ${addition.unmapped.length} without a verified register spelling)` : ''}. Prepare it from the Mapping Plan; nothing was started here.`);
-    } catch (error) {
-      setMessage(safeErrorText(error, PLAN_FALLBACK));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <>
-      <ul className="catalog-list">{page.items.map((item) => {
-        const mapped = directoryKeyFor(item.tozar, entries) !== undefined;
-        return (
-          <li key={item.tozar}>
-            {canPlan && (
-              <input type="checkbox" aria-label={`Select ${item.tozar}`} disabled={!mapped || busy}
-                checked={selected.has(item.tozar)} onChange={() => setSelected((current) => {
-                  const next = new Set(current);
-                  if (next.has(item.tozar)) next.delete(item.tozar); else next.add(item.tozar);
-                  return next;
-                })} />)}
-            <button type="button" className="button button--quiet" onClick={() => onOpen(item.tozar)}>
-              {safeText(item.tozar)}</button>
-            {' '}<span className="muted">{item.variants} variants</span>
-          </li>);
-      })}</ul>
-      {canPlan && (
-        <div className="button-row">
-          <button type="button" className="button button--primary" disabled={busy || selected.size === 0}
-            onClick={() => void add()}>{busy ? 'Adding…' : `Add to plan (${selected.size})`}</button>
-          <span className="muted">Year range: {filters.yearFrom ?? 'any'}–{filters.yearTo ?? 'any'}. Variants the
-            catalog already enriched are left out when the plan is prepared.</span>
-        </div>)}
-      {message && <p className="muted" role="status">{safeText(message)}</p>}
-    </>
-  );
 }

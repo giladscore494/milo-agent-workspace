@@ -1532,7 +1532,14 @@ export default function WorkspacePage() {
             It renders only while the server has the catalog browser on (its
             read answers 404 otherwise). "Add to plan" only writes the Mapping
             Plan through its existing routes; it prepares and starts nothing. */}
-        <CatalogBrowserPanel projectId={selectedProject?.id} conversationId={activeConversation?.id} />
+        <CatalogBrowserPanel
+          projectId={selectedProject?.id}
+          conversationId={activeConversation?.id}
+          planWrites={planAvailable}
+          onPlanChanged={() => {
+            if (activeConversation) loadPlan(activeConversation.id, scope.current, true);
+          }}
+        />
         {/* CODE-3 — durable catalog state, not run state. It is shown for any
             selected project regardless of `executionUi`: the execution UI flag
             hides EXECUTION controls, and there are none here. Hiding a

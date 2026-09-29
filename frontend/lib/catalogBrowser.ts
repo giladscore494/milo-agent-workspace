@@ -39,8 +39,10 @@ export type BrowserFilters = {
 
 export type Page<T> = { total: number; limit: number; offset: number; items: T[] };
 export type Manufacturer = { tozar: string; variants: number };
-export type Model = { kinuyMishari: string; variants: number; yearMin: number | null; yearMax: number | null };
-export type ModelYear = { year: number; variants: number };
+/** `null` is the register's own "not stated": listed, never opened (the
+ *  next level needs a value to ask for). */
+export type Model = { kinuyMishari: string | null; variants: number; yearMin: number | null; yearMax: number | null };
+export type ModelYear = { year: number | null; variants: number };
 
 export const COVERAGE_LEVELS = ['register', 'identity', 'government_fields'] as const;
 export type CoverageLevel = (typeof COVERAGE_LEVELS)[number];
@@ -61,6 +63,8 @@ export const VARIANT_FIELDS: ReadonlyArray<readonly [string, string]> = [
   ['kvutzat_zihum', 'Pollution group'], ['madad_yarok', 'Green index'], ['nikud_betihut', 'Safety score'],
   ['ramat_eivzur_betihuty', 'Safety equipment level'], ['mispar_kariot_avir', 'Airbags'],
   ['abs_ind', 'ABS'], ['bakarat_yatzivut_ind', 'ESC'], ['sug_tkina_nm', 'Homologation standard'],
+  ['nox_wltp', 'NOx WLTP'], ['co_wltp', 'CO WLTP'], ['hc_wltp', 'HC WLTP'], ['sug_mamir_nm', 'Converter type'],
+  ['tozeret_nm', 'Manufacturer (register)'], ['tozeret_eretz_nm', 'Country of manufacture'],
 ];
 
 export type Variant = {
@@ -116,7 +120,8 @@ export function parseManufacturer(value: unknown): Manufacturer | undefined {
 
 export function parseModel(value: unknown): Model | undefined {
   const source = obj(value);
-  const [kinuyMishari, variants] = [text(source.kinuy_mishari), count(source.variants)];
+  const kinuyMishari = source.kinuy_mishari === null ? null : text(source.kinuy_mishari);
+  const variants = count(source.variants);
   const [yearMin, yearMax] = [yearOrNull(source.year_min), yearOrNull(source.year_max)];
   if (kinuyMishari === undefined || variants === undefined || yearMin === undefined || yearMax === undefined) {
     return undefined;
@@ -126,7 +131,7 @@ export function parseModel(value: unknown): Model | undefined {
 
 export function parseModelYear(value: unknown): ModelYear | undefined {
   const source = obj(value);
-  const [year, variants] = [count(source.shnat_yitzur), count(source.variants)];
+  const [year, variants] = [yearOrNull(source.shnat_yitzur), count(source.variants)];
   return year === undefined || variants === undefined ? undefined : { year, variants };
 }
 
@@ -155,6 +160,10 @@ export function parseVariant(value: unknown): Variant | undefined {
     coverage[level] = typeof entry.status === 'string' && COVERAGE_STATUSES.has(entry.status)
       ? { status: entry.status, current: entry.current === true } : null;
   }
+  const equipment = obj(source.equipment);
+  // The closed indicators the register marks present (1); sources excluded.
+  const assists = Object.entries(equipment).filter(([key, value]) => !key.endsWith('_hatkana') && value === 1).length;
+  if (Object.keys(equipment).length > 0) fields.push(['Driver-assistance systems stated', String(assists)]);
   const issues = Array.isArray(source.parse_issues) ? source.parse_issues.length : 0;
   return { upstreamRecordId, snapshotKey, segment: seg, fields, coverage, parseIssues: issues };
 }
@@ -210,15 +219,12 @@ export type PlanSelection = { tozars: string[]; yearFrom: number | null; yearTo:
 export type PlanAddition =
   | { kind: 'create'; edit: WorkScopeEdit; unmapped: string[] }
   | { kind: 'revise'; edit: WorkScopeEdit; unmapped: string[]; head: { revision: number; digest: string } }
-  | { kind: 'refused'; reason: 'nothing_mappable' | 'too_many_units' | 'no_change'; unmapped: string[] };
+  | { kind: 'refused'; reason: 'nothing_mappable' | 'too_many_units' | 'no_change' | 'years_differ';
+      unmapped: string[] };
 
 /** A tozar's directory key: only a VERIFIED exact register spelling maps. */
 export function directoryKeyFor(tozar: string, entries: readonly DirectoryEntry[]): string | undefined {
   return entries.find((entry) => entry.registerMarqueVerified && entry.registerMarque === tozar)?.key;
-}
-
-function widest(a: number | null, b: number | null, pick: (x: number, y: number) => number): number | null {
-  return a === null || b === null ? null : pick(a, b);
 }
 
 /**
@@ -226,8 +232,10 @@ function widest(a: number | null, b: number | null, pick: (x: number, y: number)
  *
  * No plan yet: a new plan of the selected manufacturers and year range, with
  * the server's default limit and batch size. An open plan: its units plus the
- * selected ones (its order kept, new ones after), and a year range that
- * CONTAINS both -- adding never narrows what the plan already covers. Its
+ * selected ones (its order kept, new ones after). The plan has ONE year range
+ * for all its manufacturers, so adding keeps it: a selection without a year
+ * range takes the plan's, and a DIFFERENT range is refused (it would change
+ * what the plan already covers -- that is the Mapping Plan's own edit). Its
  * limit, batch size and include_unresolved are kept as they are.
  */
 export function planAddition(selection: PlanSelection, plan: WorkScopeState | null,
@@ -249,11 +257,12 @@ export function planAddition(selection: PlanSelection, plan: WorkScopeState | nu
   const units = [...current.units, ...keys.filter((key) => !current.units.includes(key))];
   const unique = [...new Set(units)];
   if (unique.length > limits.maxUnits) return { kind: 'refused', reason: 'too_many_units', unmapped };
-  const from = widest(current.modelYearFrom, selection.yearFrom, Math.min);
-  const to = widest(current.modelYearTo, selection.yearTo, Math.max);
-  if (unique.length === current.units.length && from === current.modelYearFrom && to === current.modelYearTo) {
-    return { kind: 'refused', reason: 'no_change', unmapped };
+  const stated = selection.yearFrom !== null || selection.yearTo !== null;
+  if (stated && (selection.yearFrom !== current.modelYearFrom || selection.yearTo !== current.modelYearTo)) {
+    return { kind: 'refused', reason: 'years_differ', unmapped };
   }
+  if (unique.length === current.units.length) return { kind: 'refused', reason: 'no_change', unmapped };
+  const [from, to] = [current.modelYearFrom, current.modelYearTo];
   return {
     kind: 'revise', unmapped, head: { revision: plan.revision, digest: plan.digest },
     edit: { units: unique, model_year_from: from, model_year_to: to, max_items: current.maxItems,

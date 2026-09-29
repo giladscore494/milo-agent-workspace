@@ -7,7 +7,8 @@
  * the tree pages through the server (offset), and filters travel as exactly
  * the route's query parameters; "Add to plan" sends exactly the edit the
  * existing plan routes take -- a new plan, or the open plan's units plus the
- * selection with a year range that contains both -- and never anything else;
+ * selection under the plan's own year range (a different stated range is
+ * refused, never silently widened or narrowed) -- and never anything else;
  * and the gateway proxies the five reads as reads and nothing else.
  */
 
@@ -76,9 +77,12 @@ function client(answers: Partial<Record<string, unknown>> = {}, overrides: Parti
   };
 }
 
-async function openPanel(api: CatalogBrowserClient, conversationId: string | null = CONVERSATION) {
-  render(<CatalogBrowserPanel projectId={PROJECT} conversationId={conversationId ?? undefined} client={api} />);
+async function openPanel(api: CatalogBrowserClient, conversationId: string | null = CONVERSATION,
+  props: { planWrites?: boolean; onPlanChanged?: () => void } = {}) {
+  const view = render(<CatalogBrowserPanel projectId={PROJECT} conversationId={conversationId ?? undefined}
+    planWrites={props.planWrites ?? true} onPlanChanged={props.onPlanChanged} client={api} />);
   fireEvent.click(await screen.findByRole('button', { name: 'Show' }));
+  return view;
 }
 
 afterEach(() => {
@@ -131,14 +135,31 @@ describe('planAddition', () => {
                          batch_size: 10 } });
   });
 
-  it('adds to the open plan and never narrows it', () => {
+  it('adds to the open plan under the plan\'s own year range', () => {
     const plan = parseWorkScopeState(stateBody())!;          // toyota + lexus, 2018 onwards
-    expect(planAddition({ tozars: [MAZDA], yearFrom: 2015, yearTo: 2020 }, plan, entries, limits)).toEqual({
+    const revised = {
       kind: 'revise', unmapped: [], head: { revision: 1, digest: DIGEST },
-      edit: { units: ['toyota', 'lexus', 'mazda'], model_year_from: 2015, model_year_to: null,
-              max_items: 800, batch_size: 10 } });
-    expect(planAddition({ tozars: [TOYOTA], yearFrom: 2020, yearTo: null }, plan, entries, limits))
+      edit: { units: ['toyota', 'lexus', 'mazda'], model_year_from: 2018, model_year_to: null,
+              max_items: 800, batch_size: 10 } };
+    expect(planAddition({ tozars: [MAZDA], yearFrom: null, yearTo: null }, plan, entries, limits)).toEqual(revised);
+    expect(planAddition({ tozars: [MAZDA], yearFrom: 2018, yearTo: null }, plan, entries, limits)).toEqual(revised);
+    expect(planAddition({ tozars: [TOYOTA], yearFrom: null, yearTo: null }, plan, entries, limits))
       .toEqual({ kind: 'refused', reason: 'no_change', unmapped: [] });
+  });
+
+  it('refuses a stated year range other than the plan\'s: one range covers every manufacturer', () => {
+    const plan = parseWorkScopeState(stateBody())!;
+    for (const [yearFrom, yearTo] of [[2015, 2020], [2020, null], [null, 2024]] as const) {
+      expect(planAddition({ tozars: [MAZDA], yearFrom, yearTo }, plan, entries, limits))
+        .toEqual({ kind: 'refused', reason: 'years_differ', unmapped: [] });
+    }
+  });
+
+  it('keeps include_unresolved when the open plan has it', () => {
+    const plan = parseWorkScopeState(stateBody())!;
+    const withUnresolved = { ...plan, plan: { ...plan.plan, includeUnresolved: true } };
+    const addition = planAddition({ tozars: [MAZDA], yearFrom: null, yearTo: null }, withUnresolved, entries, limits);
+    expect(addition.kind === 'revise' && addition.edit.include_unresolved).toBe(true);
   });
 
   it('refuses what the plan contract cannot express', () => {
@@ -152,9 +173,11 @@ describe('planAddition', () => {
 describe('CatalogBrowserPanel', () => {
   it('does not exist while the server answers 404 (flag off)', async () => {
     const api = client({ manufacturers: new ApiError(404, 'CATALOG_BROWSER_DISABLED', 'not enabled') });
-    const { container } = render(<CatalogBrowserPanel projectId={PROJECT} client={api} />);
+    const { container } = render(<CatalogBrowserPanel projectId={PROJECT} conversationId={CONVERSATION} planWrites
+      client={api} />);
     await waitFor(() => expect(api.browse).toHaveBeenCalled());
     expect(container.innerHTML).toBe('');
+    expect(api.openPlan).not.toHaveBeenCalled();
   });
 
   it('renders the manufacturers', async () => {
@@ -239,15 +262,87 @@ describe('CatalogBrowserPanel', () => {
     fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${MAZDA}` }));
     fireEvent.click(screen.getByRole('button', { name: 'Add to plan (1)' }));
     await waitFor(() => expect(api.revisePlan).toHaveBeenCalledWith(PLAN, { revision: 1, digest: DIGEST }, {
-      // No year range selected ("any"): the plan widens to any year, never narrows.
-      units: ['toyota', 'lexus', 'mazda'], model_year_from: null, model_year_to: null, max_items: 800,
+      // No year range selected: the plan keeps its own range.
+      units: ['toyota', 'lexus', 'mazda'], model_year_from: 2018, model_year_to: null, max_items: 800,
       batch_size: 10 }));
+  });
+
+  it('reads the plan again after a write and tells the page', async () => {
+    const onPlanChanged = vi.fn();
+    const api = client();
+    await openPanel(api, CONVERSATION, { onPlanChanged });
+    fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${TOYOTA}` }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to plan (1)' }));
+    await waitFor(() => expect(onPlanChanged).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.openPlan).toHaveBeenCalledTimes(2));
+    expect((screen.getByRole('checkbox', { name: `Select ${TOYOTA}` }) as HTMLInputElement).checked).toBe(false);
+  });
+
+  it('writes nothing when the stated year range differs from the open plan\'s', async () => {
+    const api = client({}, { openPlan: vi.fn(async () => ({ work_scope: stateBody() })) });
+    await openPanel(api);
+    await screen.findByRole('button', { name: TOYOTA });
+    fireEvent.change(screen.getByLabelText('From year'), { target: { value: '2015' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+    fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${MAZDA}` }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add to plan (1)' }));
+    expect((await screen.findByRole('status')).textContent).toContain('one model-year range');
+    expect(api.revisePlan).not.toHaveBeenCalled();
+    expect(api.createPlan).not.toHaveBeenCalled();
+  });
+
+  it('offers no add while segment, fuel or body narrows the view', async () => {
+    const api = client();
+    await openPanel(api);
+    await screen.findByRole('button', { name: TOYOTA });
+    for (const [label, value] of [['Segment', 'private'], ['Fuel', '1'], ['Body', 'פנאי-שטח']]) {
+      fireEvent.change(screen.getByLabelText(label), { target: { value } });
+      fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+      fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${TOYOTA}` }));
+      expect((screen.getByRole('button', { name: /Add to plan/ }) as HTMLButtonElement).disabled).toBe(true);
+      expect(screen.getByText(/clear the segment, fuel and body filters/)).toBeTruthy();
+      fireEvent.click(screen.getByRole('checkbox', { name: `Select ${TOYOTA}` }));
+      fireEvent.change(screen.getByLabelText(label), { target: { value: '' } });
+    }
+    expect(api.createPlan).not.toHaveBeenCalled();
+  });
+
+  it('drops the selection and the plan when the conversation changes', async () => {
+    const other = '2f90f4ce-7844-4031-91d6-b74e40e1884e';
+    const api = client({}, { openPlan: vi.fn(async (id: string) => ({ work_scope: id === CONVERSATION ? stateBody() : null })) });
+    const { rerender } = await openPanel(api);
+    fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${MAZDA}` }));
+    rerender(<CatalogBrowserPanel projectId={PROJECT} conversationId={other} planWrites client={api} />);
+    await waitFor(() => expect(api.openPlan).toHaveBeenLastCalledWith(other));
+    const box = await screen.findByRole('checkbox', { name: `Select ${MAZDA}` });
+    expect((box as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole('button', { name: 'Add to plan (1)' }));
+    // The other conversation has no plan: a new plan there, never a revision of the first one's.
+    await waitFor(() => expect(api.createPlan).toHaveBeenCalledWith(other, expect.objectContaining({ units: ['mazda'] })));
+    expect(api.revisePlan).not.toHaveBeenCalled();
+  });
+
+  it('shows a model or year the register does not state, without opening it', async () => {
+    const api = client({ models: page([{ kinuy_mishari: null, variants: 2, year_min: null, year_max: null }]),
+                         years: page([{ shnat_yitzur: null, variants: 1 }]) });
+    await openPanel(api);
+    fireEvent.click(await screen.findByRole('button', { name: TOYOTA }));
+    expect(await screen.findByText('(not stated)')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '(not stated)' })).toBeNull();
+    expect(screen.getByText('2 variants, —–—')).toBeTruthy();
   });
 
   it('offers no plan action without a conversation or while plan writes are off', async () => {
     await openPanel(client(), null);
     await screen.findByRole('button', { name: TOYOTA });
     expect(screen.queryByRole('checkbox')).toBeNull();
+    cleanup();
+    const pageOff = client();
+    await openPanel(pageOff, CONVERSATION, { planWrites: false });
+    await screen.findByRole('button', { name: TOYOTA });
+    expect(screen.queryByRole('checkbox')).toBeNull();
+    expect(pageOff.openPlan).not.toHaveBeenCalled();
     cleanup();
     const off = client({}, { capabilities: vi.fn(async () => ({ ...CAPABILITIES, available: false })) });
     await openPanel(off);
