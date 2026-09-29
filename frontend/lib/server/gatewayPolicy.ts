@@ -128,6 +128,15 @@ const SAFE_RULES: GatewayRule[] = [
     method: 'GET',
     path: new RegExp(`^/projects/${UUID}/register$`, 'i'),
   },
+  /**
+   * PR-CAT: the catalog browser -- PR-L1's paged discovery tree, one exact
+   * path per level. A membership-gated READ, GET only, answered 404 while
+   * MILO_ENABLE_CATALOG_BROWSER is off. It has no write.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/catalog/browser/(manufacturers|models|years|variants|facets)$`, 'i'),
+  },
 ];
 
 const EXECUTION_RULES: GatewayRule[] = [

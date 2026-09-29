@@ -67,7 +67,9 @@ describe('the CODE-3 API client', () => {
       expect(names).not.toContain(forbidden);
     }
     const catalogMethods = names.filter((name) => name.toLowerCase().includes('catalog'));
-    expect(catalogMethods.sort()).toEqual(['catalogCanonical', 'catalogReviewCandidates']);
+    // PR-CAT adds one more READ (the browser's GET, asserted GET-only in
+    // tests/catalogBrowser.test.tsx) -- still no mutating catalog method.
+    expect(catalogMethods.sort()).toEqual(['catalogBrowser', 'catalogCanonical', 'catalogReviewCandidates']);
   });
 
   it('builds the query string from a closed set of parameter names', async () => {
