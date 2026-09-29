@@ -15,15 +15,24 @@
 #      Run, Cloud Build, Artifact Registry, Service Usage and Cloud Logging
 #      (where the builds log);
 #   2. a workload identity pool and a GitHub OIDC provider whose ATTRIBUTE
-#      CONDITION admits only this repository, on main, in the `production` or
-#      `production-kill-switch` GitHub environment -- a token from a fork, a
+#      CONDITION admits only this repository, on main, in the `production`,
+#      `production-kill-switch` or `production-backup` GitHub environment (an
+#      existing provider's condition is updated IN PLACE and read back on
+#      --apply) -- a token from a fork, a
 #      branch, a pull request or any other repository is refused by Google
-#      before any role is consulted;
+#      before any role is consulted. The condition is written AFTER the
+#      deployer is narrowed to its two environments (4) and read back, so
+#      admitting production-backup can never also admit it to the deployer;
 #   3. a deploy service account with the MINIMUM roles the deploy scripts use
 #      (listed below, each with the command that needs it), and
 #      `iam.serviceAccountUser` on the three runtime identities only;
-#   4. `roles/iam.workloadIdentityUser` on that account for principals of this
-#      repository only;
+#   4. `roles/iam.workloadIdentityUser` on that account for EXACTLY two
+#      principals -- the `production` and `production-kill-switch` GitHub
+#      environments (principalSet attribute.environment/<env>), both held to
+#      this repository and refs/heads/main by the provider condition -- and
+#      never the repository-wide principalSet, which is removed (after the two
+#      are bound and read back) so production-backup, or any other
+#      environment, can never impersonate the deployer;
 #   5. the dedicated BUILD identity (CLOUD_BUILD_SERVICE_ACCOUNT, e.g.
 #      milo-cloudbuild@) that both image builds run as, with exactly three
 #      bindings: artifactregistry.writer on the image repository only,
@@ -46,7 +55,11 @@ GITHUB_REPOSITORY_NAME="${MILO_GITHUB_REPOSITORY:-giladscore494/milo-agent-works
 POOL_ID="milo-github"
 PROVIDER_ID="github-actions"
 DEPLOY_ACCOUNT_ID="milo-github-deployer"
-ALLOWED_ENVIRONMENTS=("production" "production-kill-switch")
+# production-backup (PR-OBS): the scheduled Supabase backup and its restore
+# test. It has no required reviewer (it runs on a schedule); its identities
+# (milo-backup-writer / milo-backup-reader, scripts/ops/setup-backup.sh) are
+# bound to this environment's principalSet only.
+ALLOWED_ENVIRONMENTS=("production" "production-kill-switch" "production-backup")
 
 usage() {
   cat << 'EOF'
@@ -88,7 +101,17 @@ PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(project
 DEPLOY_SA="${DEPLOY_ACCOUNT_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
 POOL_NAME="projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${POOL_ID}"
 PROVIDER_NAME="${POOL_NAME}/providers/${PROVIDER_ID}"
-PRINCIPALS="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.repository/${GITHUB_REPOSITORY_NAME}"
+# The deployer is impersonable from EXACTLY these two GitHub environments --
+# never production-backup, never any other. Both are held to this repository
+# and refs/heads/main by the provider condition (CONDITION below).
+DEPLOYER_ENVIRONMENTS=("production" "production-kill-switch")
+DEPLOYER_PRINCIPALS=()
+for environment in "${DEPLOYER_ENVIRONMENTS[@]}"; do
+  DEPLOYER_PRINCIPALS+=("principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/${environment}")
+done
+# The former repository-wide principal: removed from the deployer, only after
+# the two above are bound and read back.
+REPOSITORY_PRINCIPALS="principalSet://iam.googleapis.com/${POOL_NAME}/attribute.repository/${GITHUB_REPOSITORY_NAME}"
 # Cloud Build's default identity in this project. The deployer never acts as it.
 COMPUTE_DEFAULT_SA="${PROJECT_NUMBER}-compute@developer.gserviceaccount.com"
 CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
@@ -187,29 +210,13 @@ for api in "${REQUIRED_APIS[@]}"; do
   fi
 done
 
-# 2. Pool and provider.
+# 2. The pool. (The provider and its condition: 4b, after the deployer.)
 if gcloud iam workload-identity-pools describe "$POOL_ID" --location global --project "$PROJECT_ID" > /dev/null 2>&1; then
   ok "pool ${POOL_ID}"
 else
   step CREATE "workload identity pool ${POOL_ID}" gcloud iam workload-identity-pools create "$POOL_ID" \
     --location global --project "$PROJECT_ID" --display-name "MILO GitHub Actions"
 fi
-current_condition="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
-  --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
-  --format='value(attributeCondition)' 2> /dev/null || printf '%s' '<missing>')"
-provider_args=(--workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID"
-               --issuer-uri "https://token.actions.githubusercontent.com"
-               --attribute-mapping "$MAPPING" --attribute-condition "$CONDITION")
-if [[ "$current_condition" == "<missing>" ]]; then
-  step CREATE "OIDC provider ${PROVIDER_ID} (condition: ${CONDITION})" \
-    gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" "${provider_args[@]}"
-elif [[ "$current_condition" != "$CONDITION" ]]; then
-  step UPDATE "OIDC provider ${PROVIDER_ID} condition -> ${CONDITION}" \
-    gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" "${provider_args[@]}"
-else
-  ok "provider ${PROVIDER_ID} admits only ${GITHUB_REPOSITORY_NAME}, main, ${ALLOWED_ENVIRONMENTS[*]}"
-fi
-
 # 3. The deploy service account and its minimum roles.
 if gcloud iam service-accounts describe "$DEPLOY_SA" --project "$PROJECT_ID" > /dev/null 2>&1; then
   ok "service account ${DEPLOY_SA}"
@@ -277,14 +284,154 @@ else
     --member "serviceAccount:${DEPLOY_SA}" --role roles/storage.admin
 fi
 
-# 4. Only this repository's principals may impersonate the deployer.
-policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
-if has_member "$policy" roles/iam.workloadIdentityUser "$PRINCIPALS"; then
-  ok "workloadIdentityUser for ${GITHUB_REPOSITORY_NAME}"
+# 4. The deployer may be impersonated ONLY from the production and
+#    production-kill-switch environments. Order, enforced here: bind both
+#    environment principals, READ THEM BACK, and only then remove the former
+#    repository-wide binding -- so a deploy is never left without a working
+#    binding -- then read back that the members are EXACTLY those two. The
+#    provider condition (4b) is written only after that read-back passes. An
+#    environment principal matches only a provider that maps
+#    attribute.environment; one that does not is refused before anything
+#    changes.
+wif_members() {
+  # wif_members POLICY_JSON -> the workloadIdentityUser members, one per line,
+  # sorted. A member bound under an IAM CONDITION is listed with a
+  # " [conditional]" suffix, so it never counts as one of the two exact
+  # environment principals.
+  python3 -c '
+import json, sys
+policy = json.loads(sys.argv[1] or "{}")
+members = sorted({m + (" [conditional]" if b.get("condition") else "")
+                  for b in policy.get("bindings") or []
+                  if b.get("role") == "roles/iam.workloadIdentityUser" for m in b.get("members") or []})
+print("\n".join(members))' "$1"
+}
+# The provider, read ONCE: its mapping decides whether an environment
+# principal can match a token, and its condition is compared in 4b. Only
+# NOT_FOUND means "no provider yet" (a fresh project, created in 4b); any
+# other error is a FAIL before anything changes.
+provider_err="$(mktemp)"
+provider_status=0
+provider_json="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+  --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+  --format=json 2> "$provider_err")" || provider_status=$?
+if [[ "$provider_status" -ne 0 ]] && ! grep -q "NOT_FOUND" "$provider_err"; then
+  rm -f "$provider_err"
+  printf 'FAIL   provider %s could not be read (gcloud exit %s). The deployer and the condition were not changed.\n' \
+    "$PROVIDER_ID" "$provider_status" >&2
+  exit 1
+fi
+rm -f "$provider_err"
+if [[ "$provider_status" -ne 0 ]]; then
+  current_condition="<missing>"
 else
-  step BIND "roles/iam.workloadIdentityUser on ${DEPLOY_SA} for ${GITHUB_REPOSITORY_NAME} only" \
-    gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA" --project "$PROJECT_ID" \
-    --member "$PRINCIPALS" --role roles/iam.workloadIdentityUser
+  if ! current_condition="$(python3 -c '
+import json, sys
+doc = json.loads(sys.argv[1])
+mapping = doc.get("attributeMapping") or {}
+if mapping.get("attribute.environment") != "assertion.environment":
+    sys.exit(3)
+print(doc.get("attributeCondition") or "")' "$provider_json")"; then
+    printf 'FAIL   provider %s does not map attribute.environment = assertion.environment: an environment\n' "$PROVIDER_ID" >&2
+    printf '       principal would match no token. The deployer and the condition were not changed.\n' >&2
+    exit 1
+  fi
+fi
+policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
+for index in "${!DEPLOYER_PRINCIPALS[@]}"; do
+  if has_member "$policy" roles/iam.workloadIdentityUser "${DEPLOYER_PRINCIPALS[$index]}"; then
+    ok "workloadIdentityUser on ${DEPLOY_ACCOUNT_ID} for environment ${DEPLOYER_ENVIRONMENTS[$index]}"
+  else
+    step BIND "roles/iam.workloadIdentityUser on ${DEPLOY_ACCOUNT_ID} for environment ${DEPLOYER_ENVIRONMENTS[$index]} only" \
+      gcloud iam service-accounts add-iam-policy-binding "$DEPLOY_SA" --project "$PROJECT_ID" \
+      --member "${DEPLOYER_PRINCIPALS[$index]}" --role roles/iam.workloadIdentityUser
+  fi
+done
+if [[ "$MODE" == "apply" ]]; then
+  # Both environment bindings must read back BEFORE anything is removed.
+  policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
+  for index in "${!DEPLOYER_PRINCIPALS[@]}"; do
+    if ! has_member "$policy" roles/iam.workloadIdentityUser "${DEPLOYER_PRINCIPALS[$index]}"; then
+      printf 'FAIL   %s: the %s environment binding did not read back. Nothing was removed and the\n' \
+        "$DEPLOY_ACCOUNT_ID" "${DEPLOYER_ENVIRONMENTS[$index]}" >&2
+      printf '       provider condition was not changed.\n' >&2
+      exit 1
+    fi
+  done
+  printf 'PASS   %s environment bindings read back: %s\n' "$DEPLOY_ACCOUNT_ID" "${DEPLOYER_ENVIRONMENTS[*]}"
+fi
+if has_member "$policy" roles/iam.workloadIdentityUser "$REPOSITORY_PRINCIPALS"; then
+  step UNBIND "roles/iam.workloadIdentityUser on ${DEPLOY_ACCOUNT_ID} for the repository-wide principalSet (every environment of ${GITHUB_REPOSITORY_NAME})" \
+    gcloud iam service-accounts remove-iam-policy-binding "$DEPLOY_SA" --project "$PROJECT_ID" \
+    --member "$REPOSITORY_PRINCIPALS" --role roles/iam.workloadIdentityUser
+fi
+expected_members="$(printf '%s\n' "${DEPLOYER_PRINCIPALS[@]}" | LC_ALL=C sort)"
+DEPLOYER_NARROWED=0
+if [[ "$MODE" == "apply" ]]; then
+  policy="$(gcloud iam service-accounts get-iam-policy "$DEPLOY_SA" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
+  if [[ "$(wif_members "$policy" | LC_ALL=C sort)" == "$expected_members" ]]; then
+    printf 'PASS   %s workloadIdentityUser members read back: exactly principalSet %s of pool %s\n' \
+      "$DEPLOY_ACCOUNT_ID" "$(printf 'attribute.environment/%s\n' "${DEPLOYER_ENVIRONMENTS[@]}" | sed '$!s/$/ and/' | paste -sd' ' -)" \
+      "$POOL_ID"
+    DEPLOYER_NARROWED=1
+  else
+    printf 'FAIL   %s workloadIdentityUser members are not exactly the production and production-kill-switch\n' "$DEPLOY_ACCOUNT_ID" >&2
+    printf '       principalSets (the repository-wide principalSet or another member remains). Remove the\n' >&2
+    printf '       extra member(s) and re-run. The provider condition was NOT changed.\n' >&2
+    exit 1
+  fi
+else
+  known=(-e "$REPOSITORY_PRINCIPALS")
+  for principal in "${DEPLOYER_PRINCIPALS[@]}"; do known+=(-e "$principal"); done
+  others="$(wif_members "$policy" | grep -vxF "${known[@]}" || true)"
+  if [[ -n "$others" ]]; then
+    printf 'WARN   %s has %s other workloadIdentityUser member(s): --apply will bind and unbind as listed, then FAIL\n' \
+      "$DEPLOY_ACCOUNT_ID" "$(grep -c . <<< "$others")"
+    printf '       before the provider condition. Remove them first.\n'
+  fi
+fi
+
+# 4b. The provider and its condition -- ONLY after the deployer is narrowed
+#     (enforced: --apply cannot reach this point otherwise), so admitting
+#     production-backup never admits it to the deployer.
+if [[ "$MODE" == "apply" && "$DEPLOYER_NARROWED" -ne 1 ]]; then
+  printf 'FAIL   the deployer is not narrowed; the provider condition was not changed.\n' >&2
+  exit 1
+fi
+# current_condition: read once, in 4 ("<missing>" only for NOT_FOUND).
+provider_args=(--workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID"
+               --issuer-uri "https://token.actions.githubusercontent.com"
+               --attribute-mapping "$MAPPING" --attribute-condition "$CONDITION")
+if [[ "$current_condition" == "<missing>" ]]; then
+  step CREATE "OIDC provider ${PROVIDER_ID} (condition: ${CONDITION})" \
+    gcloud iam workload-identity-pools providers create-oidc "$PROVIDER_ID" "${provider_args[@]}"
+elif [[ "$current_condition" != "$CONDITION" ]]; then
+  # In place, the CONDITION only: the issuer and the attribute mapping of the
+  # existing provider are left exactly as they are.
+  step UPDATE "OIDC provider ${PROVIDER_ID} condition -> ${CONDITION}" \
+    gcloud iam workload-identity-pools providers update-oidc "$PROVIDER_ID" \
+    --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+    --attribute-condition "$CONDITION"
+else
+  ok "provider ${PROVIDER_ID} admits only ${GITHUB_REPOSITORY_NAME}, main, ${ALLOWED_ENVIRONMENTS[*]}"
+fi
+# 4c. Read-back (--apply): the LIVE condition must be exactly CONDITION (this
+#     repository, refs/heads/main, exactly the allowed environments).
+if [[ "$MODE" == "apply" ]]; then
+  readback="$(gcloud iam workload-identity-pools providers describe "$PROVIDER_ID" \
+    --workload-identity-pool "$POOL_ID" --location global --project "$PROJECT_ID" \
+    --format='value(attributeCondition)' 2> /dev/null || true)"
+  # EXACTLY the condition this script writes -- which pins the repository and
+  # refs/heads/main and lists exactly ALLOWED_ENVIRONMENTS. Anything else (an
+  # appended `||`, a loosened clause) is a FAIL, never a PASS.
+  if [[ -n "$readback" && "$readback" == "$CONDITION" ]]; then
+    printf 'PASS   provider %s condition read back: repository %s, ref refs/heads/main, environments %s\n' \
+      "$PROVIDER_ID" "$GITHUB_REPOSITORY_NAME" "$(IFS=,; printf '%s' "${ALLOWED_ENVIRONMENTS[*]}" | sed 's/,/, /g')"
+  else
+    printf 'FAIL   provider %s condition read back does not pin %s + refs/heads/main with exactly the environments %s\n' \
+      "$PROVIDER_ID" "$GITHUB_REPOSITORY_NAME" "${ALLOWED_ENVIRONMENTS[*]}" >&2
+    exit 1
+  fi
 fi
 
 # 5. The build identity's bindings (the account itself is created in 3, before

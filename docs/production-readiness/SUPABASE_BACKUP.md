@@ -90,3 +90,10 @@ describes: stop, and do not treat it as a recovery point for a migration.
 For recovery, first restore into a new isolated Supabase project. Do not
 restore directly over production without a separately reviewed recovery plan.
 Production schema changes roll forward through a corrective migration.
+
+## Scheduled backups (PR-OBS)
+
+A daily, unattended, encrypted backup to Cloud Storage and a monthly restore
+test run alongside this manual procedure, with their own environment,
+identities and passphrase: see [SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).
+This manual workflow is unchanged.

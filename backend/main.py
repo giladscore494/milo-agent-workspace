@@ -82,6 +82,13 @@ from backend.production_config import validate_production_config  # noqa: E402
 
 validate_production_config()
 
+# Error reporting: a no-op unless SENTRY_DSN is configured (backend/observability.py
+# decides what an event may carry). Before the app exists, so the FastAPI
+# integration sees it.
+from backend import observability  # noqa: E402
+
+observability.init_sentry("milo-agent-api", web=True)
+
 app = FastAPI(title=settings.api_title)
 # Added first so it sits innermost of the middleware stack while still running
 # before routing and request-body validation for every request.

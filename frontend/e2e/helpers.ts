@@ -24,6 +24,14 @@ export const APPROVED_PUBLIC_VARS = [
   'NEXT_PUBLIC_SUPABASE_URL',
   'NEXT_PUBLIC_SUPABASE_ANON_KEY',
   'NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI',
+  // PR-OBS: error reporting -- the same public names
+  // scripts/no-secret-bundle-check.mjs approves. A Sentry DSN is a public
+  // ingest address by design; the rest are not secrets either.
+  'NEXT_PUBLIC_SENTRY_DSN',
+  'NEXT_PUBLIC_MILO_SENTRY_TRACES_SAMPLE_RATE',
+  'NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA',
+  'NEXT_PUBLIC_VERCEL_ENV',
+  'NEXT_PUBLIC_VERCEL_TARGET_ENV',
 ];
 
 const MOCK_SUPABASE = 'http://127.0.0.1:9998';

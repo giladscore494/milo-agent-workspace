@@ -156,3 +156,9 @@ Detect (signal above) → freeze (the emergency order in
 (revision digests, ledger rows, logs — no secret values) → diagnose →
 forward-fix or roll back per [ROLLBACK.md](ROLLBACK.md) → verify with
 smoke tests → write up with the Stage C acceptance-record fields.
+
+## Error reporting and backup signals (PR-OBS)
+
+Sentry (backend and frontend, off without a DSN), the scheduled backup, the
+monthly restore test and their failure events: see
+[SCHEDULED_BACKUP_AND_SENTRY.md](SCHEDULED_BACKUP_AND_SENTRY.md).

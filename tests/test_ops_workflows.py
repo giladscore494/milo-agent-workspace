@@ -450,8 +450,15 @@ if args[:3] == ["iam", "workload-identity-pools", "create"]:
     state["pools"].append(args[3]); save(); sys.exit(0)
 if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:
     if args[4] not in state["providers"]:
-        sys.exit(1)
+        sys.stderr.write("ERROR: (gcloud) NOT_FOUND: Requested entity was not found.\n"); sys.exit(1)
+    if "--format=json" in args:
+        print(json.dumps({"attributeCondition": state["providers"][args[4]],
+                          "attributeMapping": state.get("mappings", {}).get(args[4], {})}))
+        sys.exit(0)
     print(state["providers"][args[4]]); sys.exit(0)
+if args[:4] == ["iam", "workload-identity-pools", "providers", "create-oidc"]:
+    state.setdefault("mappings", {})[args[4]] = dict(
+        item.split("=", 1) for item in flag("--attribute-mapping").split(","))
 if args[:4] == ["iam", "workload-identity-pools", "providers", "create-oidc"] or \
         args[:4] == ["iam", "workload-identity-pools", "providers", "update-oidc"]:
     state["providers"][args[4]] = flag("--attribute-condition"); save(); sys.exit(0)
@@ -517,7 +524,7 @@ def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
     assert mutations == [], "--plan changed something"
     condition = ("assertion.repository == 'giladscore494/milo-agent-workspace' && "
                  "assertion.ref == 'refs/heads/main' && "
-                 "assertion.environment in ['production', 'production-kill-switch']")
+                 "assertion.environment in ['production', 'production-kill-switch', 'production-backup']")
     assert condition in plan.stdout
     planned = len(CHANGE_LINE.findall(plan.stdout))
     assert planned > 0
@@ -529,11 +536,14 @@ def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
     applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
     assert applied.returncode == 0, applied.stdout + applied.stderr
     assert len(CHANGE_LINE.findall(applied.stdout)) == planned
+    assert ("PASS   provider github-actions condition read back: repository "
+            "giladscore494/milo-agent-workspace, ref refs/heads/main, environments "
+            "production, production-kill-switch, production-backup") in applied.stdout
     calls = tree.tool_calls()
     assert not [call for call in calls if "keys create" in call], "no key is ever created"
     wif_user = [call for call in calls if "roles/iam.workloadIdentityUser" in call]
-    assert wif_user and all("attribute.repository/giladscore494/milo-agent-workspace" in call
-                            for call in wif_user)
+    assert len(wif_user) == 2 and not [call for call in wif_user if "attribute.repository/" in call]
+    assert deployer_wif_members(state_path_of(tmp_path)) == DEPLOYER_PRINCIPALS
     state = json.loads((tmp_path / "wif.json").read_text())
     deployer_roles = {role for role, member in state["project_bindings"] if member == DEPLOYER}
     assert deployer_roles == {"roles/run.admin", "roles/cloudbuild.builds.editor",
@@ -597,3 +607,290 @@ def test_the_reviewed_worker_model_env_is_a_valid_model_contract():
                    "MILO_SWARM_WORKER_MODEL": "kimi-k2.6"}
     assert validate_swarm_model_contract(env, require_present=True) == \
         ("kimi-k3", "kimi-k2.6", ("kimi-k3", "kimi-k2.6"))
+
+
+
+# -- PR-OBS: production-backup in the provider condition ----------------------------
+
+SETUP_WIF_TEXT = (OPS / "setup-wif.sh").read_text(encoding="utf-8")
+OLD_CONDITION = ("assertion.repository == 'giladscore494/milo-agent-workspace' && "
+                 "assertion.ref == 'refs/heads/main' && "
+                 "assertion.environment in ['production', 'production-kill-switch']")
+NEW_CONDITION = ("assertion.repository == 'giladscore494/milo-agent-workspace' && "
+                 "assertion.ref == 'refs/heads/main' && "
+                 "assertion.environment in ['production', 'production-kill-switch', 'production-backup']")
+
+
+def test_allowed_environments_are_exactly_the_three():
+    match = re.search(r"^ALLOWED_ENVIRONMENTS=\((.*)\)$", SETUP_WIF_TEXT, re.M)
+    assert match, "ALLOWED_ENVIRONMENTS is not a single literal array"
+    assert re.findall(r'"([^"]+)"', match.group(1)) == ["production", "production-kill-switch", "production-backup"]
+
+
+def test_the_condition_still_requires_the_repository_and_main():
+    line = next(l for l in SETUP_WIF_TEXT.splitlines() if l.startswith("CONDITION="))
+    assert line == ('CONDITION="assertion.repository == \'${GITHUB_REPOSITORY_NAME}\' && '
+                    "assertion.ref == 'refs/heads/main' && "
+                    'assertion.environment in [${environments_cel%, }]"')
+    # The deployer: exactly the production and production-kill-switch
+    # environment principalSets (the repository-wide one is only removed).
+    assert re.search(r'^DEPLOYER_ENVIRONMENTS=\("production" "production-kill-switch"\)$', SETUP_WIF_TEXT, re.M)
+    assert ('DEPLOYER_PRINCIPALS+=("principalSet://iam.googleapis.com/${POOL_NAME}/attribute.environment/${environment}")'
+            in SETUP_WIF_TEXT)
+    assert '--member "$REPOSITORY_PRINCIPALS" --role roles/iam.workloadIdentityUser' in SETUP_WIF_TEXT
+    assert "add-iam-policy-binding \"$DEPLOY_SA\" --project \"$PROJECT_ID\" \\\n      --member \"$REPOSITORY" \
+        not in SETUP_WIF_TEXT
+    assert 'POOL_ID="milo-github"' in SETUP_WIF_TEXT and 'PROVIDER_ID="github-actions"' in SETUP_WIF_TEXT
+
+
+def test_an_existing_provider_is_updated_in_place_and_read_back(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD)
+    state_path = tmp_path / "wif.json"
+    env = {"OPS_TEST_WIF_STATE": str(state_path)}
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    # The provider as it is in production today: the two-environment condition.
+    state = json.loads(state_path.read_text())
+    state["providers"]["github-actions"] = OLD_CONDITION
+    state_path.write_text(json.dumps(state))
+    before = {key: value for key, value in state.items() if key != "providers"}
+
+    plan = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert CHANGE_LINE.findall(plan.stdout) == ["UPDATE"]
+    tree.calls.write_text("", encoding="utf-8")
+    applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    calls = tree.tool_calls()
+    assert [c for c in calls if "providers update-oidc" in c]
+    assert not [c for c in calls if "providers create-oidc" in c or "pools create" in c]
+    after = json.loads(state_path.read_text())
+    assert after["providers"]["github-actions"] == NEW_CONDITION
+    # Nothing else moved: the deployer's and every other binding are identical.
+    assert {key: value for key, value in after.items() if key != "providers"} == before
+    assert "PASS   provider github-actions condition read back" in applied.stdout
+
+
+def test_a_read_back_that_does_not_match_is_a_failure(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'state["providers"][args[4]] = flag("--attribute-condition"); save(); sys.exit(0)',
+        'state["providers"][args[4]] = flag("--attribute-condition").replace(", \'production-backup\'", ""); '
+        'save(); sys.exit(0)'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env={"OPS_TEST_WIF_STATE": str(tmp_path / "wif.json")})
+    assert result.returncode == 1
+    assert "FAIL   provider github-actions condition read back does not pin" in result.stderr
+    assert "PASS   provider" not in result.stdout
+
+
+
+def test_a_forged_read_back_is_a_failure_not_a_pass(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'state["providers"][args[4]] = flag("--attribute-condition"); save(); sys.exit(0)',
+        'state["providers"][args[4]] = flag("--attribute-condition") + " || true"; save(); sys.exit(0)'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env={"OPS_TEST_WIF_STATE": str(tmp_path / "wif.json")})
+    assert result.returncode == 1
+    assert "PASS   provider" not in result.stdout
+
+
+def test_the_in_place_update_changes_the_condition_only(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD)
+    state_path = tmp_path / "wif.json"
+    env = {"OPS_TEST_WIF_STATE": str(state_path)}
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    state = json.loads(state_path.read_text())
+    state["providers"]["github-actions"] = OLD_CONDITION
+    state_path.write_text(json.dumps(state))
+    tree.calls.write_text("", encoding="utf-8")
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    update = [c for c in tree.tool_calls() if "providers update-oidc" in c]
+    assert len(update) == 1
+    assert "--attribute-mapping" not in update[0] and "--issuer-uri" not in update[0]
+    assert "--attribute-condition" in update[0]
+
+
+# -- PR-OBS follow-up: the deployer narrowed to production + production-kill-switch ----
+
+POOL = "projects/123456789/locations/global/workloadIdentityPools/milo-github"
+DEPLOYER_EMAIL = "milo-github-deployer@test-project.iam.gserviceaccount.com"
+REPOSITORY_PRINCIPAL = f"principalSet://iam.googleapis.com/{POOL}/attribute.repository/giladscore494/milo-agent-workspace"
+DEPLOYER_PRINCIPALS = [f"principalSet://iam.googleapis.com/{POOL}/attribute.environment/production",
+                       f"principalSet://iam.googleapis.com/{POOL}/attribute.environment/production-kill-switch"]
+
+
+def state_path_of(tmp_path: Path) -> Path:
+    return tmp_path / "wif.json"
+
+
+def deployer_wif_members(state_path: Path) -> list[str]:
+    state = json.loads(state_path.read_text())
+    return sorted(member for role, member in state["sa_bindings"].get(DEPLOYER_EMAIL, [])
+                  if role == "roles/iam.workloadIdentityUser")
+
+
+def production_today(tmp_path: Path) -> tuple[OpsTree, dict[str, str]]:
+    """Everything setup-wif.sh made before this PR: the two-environment
+    condition and the deployer bound to the REPOSITORY-wide principalSet."""
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD)
+    state_path = state_path_of(tmp_path)
+    env = {"OPS_TEST_WIF_STATE": str(state_path)}
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    state = json.loads(state_path.read_text())
+    state["providers"]["github-actions"] = OLD_CONDITION
+    state["sa_bindings"][DEPLOYER_EMAIL] = [
+        pair for pair in state["sa_bindings"][DEPLOYER_EMAIL] if pair[0] != "roles/iam.workloadIdentityUser"]
+    state["sa_bindings"][DEPLOYER_EMAIL].append(["roles/iam.workloadIdentityUser", REPOSITORY_PRINCIPAL])
+    state_path.write_text(json.dumps(state))
+    tree.calls.write_text("", encoding="utf-8")
+    return tree, env
+
+
+def _index(calls: list[str], *needles: str) -> list[int]:
+    return [i for i, call in enumerate(calls) if all(needle in call for needle in needles)]
+
+
+def test_the_deployer_is_narrowed_first_then_the_condition_admits_backup(tmp_path):
+    tree, env = production_today(tmp_path)
+    plan = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    # Planned in the order they apply: two BINDs, the UNBIND, then the UPDATE.
+    assert CHANGE_LINE.findall(plan.stdout) == ["BIND", "BIND", "UNBIND", "UPDATE"]
+    tree.calls.write_text("", encoding="utf-8")
+
+    applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    calls = tree.tool_calls()
+    add_production = _index(calls, "service-accounts add-iam-policy-binding", "attribute.environment/production ")
+    add_kill_switch = _index(calls, "service-accounts add-iam-policy-binding", "attribute.environment/production-kill-switch")
+    removal = _index(calls, "service-accounts remove-iam-policy-binding", REPOSITORY_PRINCIPAL)
+    readbacks = _index(calls, "service-accounts get-iam-policy", DEPLOYER_EMAIL)
+    update = _index(calls, "providers update-oidc")
+    assert len(add_production) == len(add_kill_switch) == len(removal) == len(update) == 1
+    additions = max(add_production[0], add_kill_switch[0])
+    # A read-back of the deployer's policy between the additions and the removal...
+    assert [i for i in readbacks if additions < i < removal[0]]
+    # ...another after the removal, and the condition update only after that.
+    assert [i for i in readbacks if removal[0] < i < update[0]]
+    assert deployer_wif_members(state_path_of(tmp_path)) == DEPLOYER_PRINCIPALS
+    out = applied.stdout
+    assert out.index("PASS   milo-github-deployer environment bindings read back: production production-kill-switch") \
+        < out.index("PASS   milo-github-deployer workloadIdentityUser members read back: exactly principalSet "
+                    "attribute.environment/production and attribute.environment/production-kill-switch of pool milo-github") \
+        < out.index("PASS   provider github-actions condition read back")
+    assert json.loads(state_path_of(tmp_path).read_text())["providers"]["github-actions"] == NEW_CONDITION
+    again = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert CHANGE_LINE.findall(again.stdout) == []
+
+
+def test_a_failed_environment_binding_removes_nothing_and_leaves_the_condition(tmp_path):
+    tree, env = production_today(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:',
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"] and "production-kill-switch" in joined:\n'
+        '    sys.stderr.write("PERMISSION_DENIED\\n"); sys.exit(1)\n'
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode != 0
+    calls = tree.tool_calls()
+    assert not [c for c in calls if "remove-iam-policy-binding" in c]
+    assert not [c for c in calls if "update-oidc" in c]
+    state = json.loads(state_path_of(tmp_path).read_text())
+    assert ["roles/iam.workloadIdentityUser", REPOSITORY_PRINCIPAL] in state["sa_bindings"][DEPLOYER_EMAIL]
+    assert state["providers"]["github-actions"] == OLD_CONDITION
+
+
+def test_a_binding_that_does_not_read_back_removes_nothing(tmp_path):
+    tree, env = production_today(tmp_path)
+    # The add "succeeds" but the binding never lands.
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:',
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"] and "attribute.environment" in joined:\n'
+        '    sys.exit(0)\n'
+        'if args[:3] == ["iam", "service-accounts", "add-iam-policy-binding"]:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert "environment binding did not read back. Nothing was removed" in result.stderr
+    calls = tree.tool_calls()
+    assert not [c for c in calls if "remove-iam-policy-binding" in c or "update-oidc" in c]
+
+
+def test_another_member_left_on_the_deployer_is_a_failure_and_the_condition_waits(tmp_path):
+    tree, env = production_today(tmp_path)
+    state = json.loads(state_path_of(tmp_path).read_text())
+    other = f"principalSet://iam.googleapis.com/{POOL}/attribute.environment/production-backup"
+    state["sa_bindings"][DEPLOYER_EMAIL].append(["roles/iam.workloadIdentityUser", other])
+    state_path_of(tmp_path).write_text(json.dumps(state))
+    plan = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert "WARN   milo-github-deployer has 1 other workloadIdentityUser member(s)" in plan.stdout
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert "members are not exactly the production and production-kill-switch" in result.stderr
+    assert "PASS   milo-github-deployer workloadIdentityUser members" not in result.stdout
+    assert not [c for c in tree.tool_calls() if "update-oidc" in c]
+    assert json.loads(state_path_of(tmp_path).read_text())["providers"]["github-actions"] == OLD_CONDITION
+
+
+def test_a_provider_without_the_environment_mapping_changes_nothing(tmp_path):
+    tree, env = production_today(tmp_path)
+    state = json.loads(state_path_of(tmp_path).read_text())
+    state["mappings"]["github-actions"].pop("attribute.environment")
+    state_path_of(tmp_path).write_text(json.dumps(state))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert "does not map attribute.environment" in result.stderr
+    assert not [c for c in tree.tool_calls()
+                if "add-iam-policy-binding" in c and "attribute.environment" in c or "update-oidc" in c
+                or "remove-iam-policy-binding" in c]
+
+
+def test_no_workflow_outside_production_and_the_kill_switch_uses_the_deployer():
+    assert not list((REPO / ".github").glob("actions/**/*.y*ml")), "a composite action would need this check too"
+    for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")]):
+        text = path.read_text(encoding="utf-8")
+        if "GCP_DEPLOY_SERVICE_ACCOUNT" not in text:
+            continue
+        (job,) = yaml.safe_load(text)["jobs"].values()
+        assert job["environment"] in ("production", "production-kill-switch"), path.name
+    backup = (WORKFLOWS / "backup-supabase-scheduled.yml").read_text(encoding="utf-8")
+    assert "GCP_DEPLOY_SERVICE_ACCOUNT" not in backup
+
+
+def test_an_unreadable_provider_is_a_failure_before_anything_changes(tmp_path):
+    tree, env = production_today(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:',
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"] and "--format=json" in args:\n'
+        '    sys.stderr.write("PERMISSION_DENIED\\n"); sys.exit(1)\n'
+        'if args[:4] == ["iam", "workload-identity-pools", "providers", "describe"]:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1 and "could not be read" in result.stderr
+    assert not [c for c in tree.tool_calls() if "iam-policy-binding" in c and "workloadIdentityUser" in c
+                or "update-oidc" in c]
+
+
+def test_a_failed_removal_leaves_the_condition_unchanged(tmp_path):
+    tree, env = production_today(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:3] == ["iam", "service-accounts", "remove-iam-policy-binding"]:',
+        'if args[:3] == ["iam", "service-accounts", "remove-iam-policy-binding"]:\n'
+        '    sys.stderr.write("PERMISSION_DENIED\\n"); sys.exit(1)\n'
+        'if False:'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode != 0
+    assert not [c for c in tree.tool_calls() if "update-oidc" in c]
+    assert json.loads(state_path_of(tmp_path).read_text())["providers"]["github-actions"] == OLD_CONDITION
+
+
+def test_a_conditional_environment_binding_is_not_the_exact_member(tmp_path):
+    tree, env = production_today(tmp_path)
+    # Present, but only under an IAM condition: it must not count.
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]}))',
+        'print(json.dumps({"bindings": [dict({"role": r, "members": [m]}, **({"condition": {"title": "t"}} '
+        'if "attribute.environment/production-kill-switch" in m else {})) for r, m in bindings]}))'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert "members are not exactly the production and production-kill-switch" in result.stderr
+    assert not [c for c in tree.tool_calls() if "update-oidc" in c]

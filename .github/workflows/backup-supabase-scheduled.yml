@@ -1,0 +1,233 @@
+name: backup-supabase-scheduled
+
+# PR-OBS (OBS-1, OBS-2). Automatic, unattended companion of the MANUAL
+# backup-supabase-production.yml, which is unchanged and still the procedure
+# before a migration (docs/production-readiness/SUPABASE_BACKUP.md).
+#
+#   * backup        daily at 02:17 UTC: pg_dump of schema public (schema and
+#                   data) through the READ-ONLY role, encrypted exactly like
+#                   the manual workflow, verified, uploaded create-only to
+#                   gs://<MILO_BACKUP_BUCKET>/supabase/<UTC date>/.
+#   * restore-test  monthly, on the 3rd at 04:41 UTC: the newest backup is
+#                   downloaded, decrypted and restored into a throwaway
+#                   PostgreSQL of the same major, then verified. Counts only.
+#
+# Environment `production-backup`: NO required reviewer (a reviewer would
+# block every scheduled run), deployments from main only. It authenticates
+# through the deploy provider (GCP_WORKLOAD_IDENTITY_PROVIDER), whose condition
+# pins this repository and main and admits production-backup
+# (scripts/ops/setup-wif.sh); its two service accounts are bound to THIS
+# environment's principalSet only and can only CREATE objects (backup) or READ
+# them (restore-test) in the backup bucket. Set up by
+# scripts/ops/setup-wif.sh, then scripts/ops/setup-backup.sh.
+#
+# A failure is red, and, when the environment secret SENTRY_DSN is set,
+# reported to Sentry as ONE event naming the job (no secret, no log text).
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+    - cron: '41 4 3 * *'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        type: choice
+        options:
+          - backup
+          - restore-test
+        default: backup
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '17 2 * * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.job == 'backup')
+    runs-on: ubuntu-latest
+    environment: production-backup
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+    # One run of this job at a time; never cancelled mid-way.
+    concurrency:
+      group: supabase-scheduled-backup
+      cancel-in-progress: false
+    steps:
+      # Checkout first (no secret is involved) so the failure report below
+      # exists even when the main-only guard refuses.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Refuse anything but main
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "FAIL: the scheduled backup runs from refs/heads/main only."
+            exit 1
+          fi
+
+      - name: Install the PostgreSQL client of the server's major
+        shell: bash
+        env:
+          MILO_BACKUP_DB_URL: ${{ secrets.MILO_BACKUP_DB_URL }}
+        run: |
+          set -euo pipefail
+          set +x
+          major="$(python3 scripts/ops/supabase_backup.py server-major)" || { echo "${major}"; exit 1; }
+          if ! [[ "${major}" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: the server major version could not be read"
+            exit 1
+          fi
+          bash scripts/ops/install-pg-client.sh "${major}"
+          echo "MILO_PG_BIN=/usr/lib/postgresql/${major}/bin" >> "${GITHUB_ENV}"
+
+      - name: Create, encrypt and verify the backup
+        shell: bash
+        env:
+          MILO_BACKUP_DB_URL: ${{ secrets.MILO_BACKUP_DB_URL }}
+          MILO_BACKUP_PASSPHRASE: ${{ secrets.MILO_BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ops/supabase_backup.py create --out "${RUNNER_TEMP}/milo-scheduled-backup"
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.MILO_BACKUP_WRITER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload create-only to Cloud Storage
+        shell: bash
+        env:
+          MILO_BACKUP_BUCKET: ${{ vars.MILO_BACKUP_BUCKET }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ops/supabase_backup.py upload \
+            --dir "${RUNNER_TEMP}/milo-scheduled-backup" --bucket "${MILO_BACKUP_BUCKET}"
+
+      - name: Report the failure to Sentry (only when SENTRY_DSN is set)
+        if: failure()
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          if [ -f scripts/ops/sentry_report.py ]; then
+            python3 scripts/ops/sentry_report.py --workflow backup-supabase-scheduled --job backup || true
+          fi
+
+      - name: Cleanup backup workspace
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "${RUNNER_TEMP}/milo-scheduled-backup"
+
+  restore-test:
+    if: >-
+      (github.event_name == 'schedule' && github.event.schedule == '41 4 3 * *') ||
+      (github.event_name == 'workflow_dispatch' && inputs.job == 'restore-test')
+    runs-on: ubuntu-latest
+    environment: production-backup
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+    # One run of this job at a time; never cancelled mid-way.
+    concurrency:
+      group: supabase-scheduled-restore-test
+      cancel-in-progress: false
+    services:
+      postgres:
+        # The major of the backups (MILO_BACKUP_PG_MAJOR, written by
+        # setup-backup.sh). The restore refuses to run if it differs from the
+        # major recorded in the backup's manifest.
+        image: postgres:${{ vars.MILO_BACKUP_PG_MAJOR || '17' }}
+        env:
+          POSTGRES_PASSWORD: restore-test-only
+          POSTGRES_DB: restore
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      # Checkout first (no secret is involved) so the failure report below
+      # exists even when the main-only guard refuses.
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Refuse anything but main
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "FAIL: the restore test runs from refs/heads/main only."
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud (Workload Identity Federation, no key)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.MILO_BACKUP_READER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Download the newest backup
+        shell: bash
+        env:
+          MILO_BACKUP_BUCKET: ${{ vars.MILO_BACKUP_BUCKET }}
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ops/supabase_backup.py fetch-latest \
+            --bucket "${MILO_BACKUP_BUCKET}" --out "${RUNNER_TEMP}/milo-restore-test"
+
+      - name: Install the PostgreSQL client of the backup's major
+        shell: bash
+        run: |
+          set -euo pipefail
+          major="$(python3 -c 'import glob, json, sys; print(json.load(open(glob.glob(sys.argv[1] + "/*.manifest.json")[0]))["server_major"])' "${RUNNER_TEMP}/milo-restore-test")"
+          if ! [[ "${major}" =~ ^[0-9]+$ ]]; then
+            echo "FAIL: the backup manifest names no server major"
+            exit 1
+          fi
+          bash scripts/ops/install-pg-client.sh "${major}"
+          echo "MILO_PG_BIN=/usr/lib/postgresql/${major}/bin" >> "${GITHUB_ENV}"
+
+      - name: Restore into the throwaway database and verify
+        shell: bash
+        env:
+          MILO_BACKUP_PASSPHRASE: ${{ secrets.MILO_BACKUP_PASSPHRASE }}
+          MILO_RESTORE_DB_URL: postgresql://postgres:restore-test-only@localhost:5432/restore
+        run: |
+          set -euo pipefail
+          set +x
+          python3 scripts/ops/supabase_backup.py restore \
+            --dir "${RUNNER_TEMP}/milo-restore-test" --migrations supabase/migrations
+
+      - name: Report the failure to Sentry (only when SENTRY_DSN is set)
+        if: failure()
+        shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: |
+          if [ -f scripts/ops/sentry_report.py ]; then
+            python3 scripts/ops/sentry_report.py --workflow backup-supabase-scheduled --job restore-test || true
+          fi
+
+      - name: Cleanup restore workspace
+        if: always()
+        shell: bash
+        run: |
+          rm -rf "${RUNNER_TEMP}/milo-restore-test"

@@ -7,7 +7,8 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 from backend.budget import BudgetConfig, BudgetExceeded, BudgetTracker, ModelCallReservation, build_guarded_client_factory, paid_execution_enabled
 from backend.execution_usage import merge_usage_snapshots, public_usage_projection
-from backend.finalization import RunFinalizer, TerminalClaim
+from backend.finalization import FinalizationResult, RunFinalizer, TerminalClaim
+from backend import observability
 from backend.runtime_policy import RuntimePolicyError, policy_failure_code, resolve_runtime_policy
 from backend.config import get_settings
 from backend.errors import AppError
@@ -23,6 +24,26 @@ from backend.run_identity import (
     execution_identity_problems,
     persisted_identity,
 )
+
+
+class _ReportingFinalizer(RunFinalizer):
+    """The worker's finalizer: reports a run it terminalized as ``failed`` ONCE.
+
+    Only the call that performed the durable write reports (``wrote``), and
+    the finalizer is idempotent, so a second finalize of the same run -- or a
+    superseded claim -- never reports again. The event carries the static
+    error code only (backend/observability.py); reporting is a no-op unless a
+    Sentry DSN is configured and can never change the outcome.
+    """
+
+    def finalize(self, claim: TerminalClaim) -> FinalizationResult:
+        result = super().finalize(claim)
+        if result.wrote and result.status == "failed":
+            decided = result.claim or claim
+            error = decided.error if isinstance(decided.error, dict) else {}
+            observability.report_run_failed(self.run_id, error.get("code"),
+                                            getattr(decided.outcome, "engine", None))
+        return result
 
 
 def resolve_run_id(cli_run_id: str | None) -> UUID:
@@ -172,8 +193,8 @@ def execute_run(run_id: UUID, repo: Repository, engine: Engine | None = None, bu
     # No event sink is handed to it: the terminal event commits inside
     # `finalize_run_guarded` with the status it belongs to, so there is no
     # second write for the finalizer to make and none for it to lose.
-    finalizer = RunFinalizer(repo=repo, run_id=run_id, engine="",
-                             lease_ctx=lease_ctx)
+    finalizer = _ReportingFinalizer(repo=repo, run_id=run_id, engine="",
+                                    lease_ctx=lease_ctx)
     lease_lost = threading.Event()
     stop_heartbeat = threading.Event()
     heartbeat_thread: threading.Thread | None = None
@@ -1440,12 +1461,22 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id")
     args = parser.parse_args(argv)
+    observability.init_sentry("milo-agent-worker")
     try:
         run_id = resolve_run_id(args.run_id)
+        observability.set_run_id(run_id)
         return execute_run(run_id, SupabaseRepository(get_settings()))
     except AppError as exc:
         print(f"{exc.code}: {exc.message}")
         return 1
+    except Exception as exc:
+        # An infrastructure crash (lease loss, a terminal write that could not
+        # be made): reported as its exception TYPE and stack, then re-raised
+        # unchanged so Cloud Run sees the same failed task as before.
+        observability.report_exception(exc)
+        raise
+    finally:
+        observability.flush()
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import { eventBelongsToRun, runBelongsToScope } from './ownership';
 import { initialWorkspaceState, reduceRunEvent } from './runReducer';
 import { runIdentityWorkflowKey } from './runIdentity';
 import { isTerminalRunStatus } from './runStatus';
+import { setRunIdTag } from './observability';
 import { SwarmRunViewModel, buildSwarmRunViewModel } from './swarmViewModel';
 import { Run, RunEvent, WorkspaceState } from './types';
 
@@ -72,6 +73,8 @@ export function useRunRealtime(
   const failures = useRef(0);
   const timer = useRef<ReturnType<typeof setTimeout>>();
   const stopped = useRef(false);
+  // Error reports (when Sentry is configured) name the run on screen.
+  useEffect(() => setRunIdTag(runId), [runId]);
   // Monotonic generation: bumps whenever the active run (or user/session)
   // changes, so a late response from run A can never mutate run B's state.
   const generation = useRef(0);
