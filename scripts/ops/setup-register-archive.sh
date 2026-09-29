@@ -144,11 +144,21 @@ app_csv="$(IFS=,; printf '%s' "${APP_IDENTITIES[*]}")"
 delete_csv="$(IFS=,; printf '%s' "${DELETE_CAPABLE_ROLES[*]}")"
 
 bucket_json() { gcloud storage buckets describe "$URL" --project "$PROJECT_ID" --format=json 2> /dev/null; }
+# policy_facts: the facts, or exit 3 when an IAM read was DENIED to this
+# identity (the deployer's case) and 1 on any other failure. gcloud's stderr
+# is only matched, never shown (it can quote an account address).
 policy_facts() {
-  local policy project
-  policy="$(gcloud storage buckets get-iam-policy "$URL" --project "$PROJECT_ID" --format=json 2> /dev/null)" || return 1
+  local policy project err
+  err="$(mktemp)"
+  if ! policy="$(gcloud storage buckets get-iam-policy "$URL" --project "$PROJECT_ID" --format=json 2> "$err")" \
+     || ! project="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> "$err")"; then
+    if grep -qE 'PERMISSION_DENIED|HTTPError 403|does not have [a-z.]*getIamPolicy' "$err"; then
+      rm -f "$err"; return 3
+    fi
+    rm -f "$err"; return 1
+  fi
+  rm -f "$err"
   python3 -c "$POLICY_PY" "$CAPTURE_MEMBER" "$roles_csv" "$app_csv" "$delete_csv" <<< "$policy"
-  project="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> /dev/null)" || return 1
   python3 -c "$POLICY_PY" "" "" "$app_csv" "$delete_csv" <<< "$project" | sed -n 's/^DELETE /PROJECT_DELETE /p'
 }
 holds_all() {  # holds_all FACTS -- the member holds every archive role
@@ -173,9 +183,16 @@ if [[ "$MODE" == "check" ]]; then
     printf 'FAIL bucket %s is not closed to the public (public access prevention %s)\n' "$BUCKET" "$pap"
     exit 0
   fi
-  if ! facts="$(policy_facts)"; then
-    # What a describe proves is checked; the IAM half is the operator's to
-    # verify (public access prevention already rules out a public grant).
+  facts_status=0
+  facts="$(policy_facts)" || facts_status=$?
+  if [[ "$facts_status" -ne 0 && "$facts_status" -ne 3 ]]; then
+    printf 'UNREADABLE the IAM policy of %s or of the project could not be read\n' "$BUCKET"
+    exit 0
+  fi
+  if [[ "$facts_status" -eq 3 ]]; then
+    # IAM read DENIED (the deployer): what a describe proves is checked; the
+    # IAM half is the operator's to verify (public access prevention already
+    # rules out a public grant).
     if [[ "$uniform" != "true" || "$location" != "$REGISTER_ARCHIVE_LOCATION" ]]; then
       printf 'GAP bucket %s is not in %s with uniform access (location %s, uniform %s)\n' \
         "$BUCKET" "$REGISTER_ARCHIVE_LOCATION" "${location:-unknown}" "$uniform"

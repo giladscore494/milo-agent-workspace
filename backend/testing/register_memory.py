@@ -140,7 +140,11 @@ class RegisterMemoryMixin:
             or (run is not None and run.get("status") in _TERMINAL)
             or (run is not None and run.get("status") == "queued" and not run.get("worker_id") and started < now - grace)
             or (run is not None and run.get("status") in ("starting", "running") and run.get("lease_expires_at")
-                and _as_time(run["lease_expires_at"]) < now - grace))
+                and _as_time(run["lease_expires_at"]) < now - grace)
+            or (run is not None
+                and (run.get("status") in ("launching", "waiting", "cancellation_requested")
+                     or (run.get("status") == "queued" and run.get("worker_id")))
+                and _as_time(run.get("lease_expires_at") or started) < now - grace))
 
     def request_register_directory_refresh(self, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
         """Mirror of public.request_register_directory_refresh: one live refresh at a time."""

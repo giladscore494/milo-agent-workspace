@@ -719,11 +719,54 @@ def test_one_directory_refresh_at_a_time():
     assert again.status_code == 200, again.text
     assert again.json() == {**first.json(), "started": False}
     assert len(trigger.calls) == 1
+    # Killed while its cancellation was pending: stale once the grace has passed.
+    from datetime import UTC, datetime, timedelta
+
+    run = repo.runs[first.json()["run_id"]]
+    run.update(status="cancellation_requested",
+               lease_expires_at=(datetime.now(UTC) - timedelta(minutes=5)).isoformat())
+    assert api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body).status_code == 200
+    run["lease_expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    killed = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body)
+    assert killed.status_code == 202 and killed.json()["group_id"] != first.json()["group_id"]
+    assert len(trigger.calls) == 2
     # Once that run has ended, a new refresh starts.
+    first = killed
     repo.runs[first.json()["run_id"]]["status"] = "completed"
     third = api.post(f"/projects/{w['project']}/register/directory", headers=as_user(), json=body)
     assert third.status_code == 202 and third.json()["group_id"] != first.json()["group_id"]
-    assert len(trigger.calls) == 2
+    assert len(trigger.calls) == 3
+
+
+def test_an_existing_refresh_names_its_run_only_to_its_requester():
+    repo, w = world()
+    trigger = FakeTrigger()
+    first = register_service.request_directory_refresh(repo, USER, UUID(w["project"]),
+                                                       conversation_id=UUID(w["conversation"]), trigger=trigger)
+    # Another user, in their own project: the register (and its refresh) is global.
+    project = str(uuid4())
+    repo.seed_project(project, f"p-{project[:8]}", "P", [str(OUTSIDER)], workflow_key="swarm_v2")
+    conversation = repo.create_conversation(UUID(project), "register", OUTSIDER)["id"]
+    answer = register_service.request_directory_refresh(repo, OUTSIDER, UUID(project),
+                                                        conversation_id=UUID(conversation), trigger=trigger)
+    assert answer == {"started": False, "group_id": first["group_id"], "run_id": None}
+    mine = register_service.request_directory_refresh(repo, USER, UUID(w["project"]),
+                                                      conversation_id=UUID(w["conversation"]), trigger=trigger)
+    assert mine["run_id"] == first["run_id"] and len(trigger.calls) == 1
+
+
+def test_a_directory_group_is_never_captured_as_a_capture_group():
+    from backend.catalog.register.capture import RegisterCaptureError
+
+    repo, w = world()
+    answer = register_service.request_directory_refresh(repo, USER, UUID(w["project"]),
+                                                        conversation_id=UUID(w["conversation"]),
+                                                        trigger=FakeTrigger())
+    lease = claimed_lease(repo, answer["run_id"])
+    with pytest.raises(RegisterCaptureError) as refused:
+        capture_group(repo, lease, client=scoped_client(planned_records()), group_id=answer["group_id"],
+                      archive_writer=FakeWriter())
+    assert refused.value.reason_code == "CATALOG_REGISTER_UNIT_NOT_THIS_RUN"
 
 
 def test_register_actions_have_their_own_rate_limit_bucket(monkeypatch):

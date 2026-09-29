@@ -21,7 +21,10 @@ across snapshots):
    outcome with the snapshot's MEASURED bytes (computed in the database).
 
 A snapshot that was already active (captured earlier, e.g. by Prepare) is
-reused as is: its archive is written if missing and its count verified.
+reused as is: its archive is written if missing and its count verified. A
+count mismatch there fails the unit (never `captured`) but cannot deactivate
+a snapshot another run activated; `unverified_snapshots` in REGISTER_COVERAGE
+counts it.
 A lost lease or a cancellation ends the whole group; any other failure ends
 only its unit, recorded with a static code.
 
@@ -247,7 +250,7 @@ def capture_group(repository: Any, lease: Any, *, client: DataGovClient, group_i
                   event_sink: Callable[[str, Mapping[str, Any]], None] | None = None) -> GroupReport:
     answer = repository.register_capture_group(group_id)
     group = answer.get("group") or {}
-    if str(group.get("run_id")) != str(lease.run_id):
+    if str(group.get("run_id")) != str(lease.run_id) or group.get("kind", "capture") != "capture":
         raise RegisterCaptureError("CATALOG_REGISTER_UNIT_NOT_THIS_RUN")
     report = GroupReport(group_id=str(group_id))
     for unit in answer.get("units") or []:

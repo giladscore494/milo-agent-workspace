@@ -177,7 +177,8 @@ create table if not exists public.catalog_register_capture_groups (
   -- directory refresh (no units, no version). One execution of the capture
   -- job each; the same trigger record and liveness rule for both.
   kind text not null default 'capture' check (kind in ('capture', 'directory')),
-  register_version text check ((kind = 'capture' and register_version ~ '^[0-9a-f]{64}$')
+  register_version text check ((kind = 'capture' and register_version is not null
+                                and register_version ~ '^[0-9a-f]{64}$')
                                or (kind = 'directory' and register_version is null)),
   -- An audit fact, not a foreign key (as elsewhere for requesters).
   requested_by uuid not null,
@@ -200,8 +201,11 @@ create index if not exists catalog_register_capture_groups_kind_idx
 -- is STALE -- its work will not happen, so it may be requested again and it
 -- holds no capacity -- when its trigger failed, it was claimed but never got
 -- a run within the grace, its run ended, its run was never claimed by a
--- worker within the grace, or its run's lease expired longer ago than the
--- grace (a killed job). Used by request_register_capture (retries and the
+-- worker within the grace, its run's lease expired longer ago than the
+-- grace (a killed job), or its run sits in any other live status (launching,
+-- waiting, cancellation_requested, a claimed queued run) with nothing --
+-- lease, trigger, claim -- newer than the grace (a job killed mid-cancel).
+-- Used by request_register_capture (retries and the
 -- in-flight capacity), request_register_directory_refresh (one at a time)
 -- and mirrored by the page (backend/catalog/register/service.py).
 create or replace function public.catalog_register_group_stale(p_group_id uuid, p_grace interval)
@@ -219,6 +223,10 @@ as $$
             and coalesce(g.triggered_at, g.claimed_at) < now() - p_grace)
         or (r.id is not null and r.status in ('starting', 'running') and r.lease_expires_at is not null
             and r.lease_expires_at < now() - p_grace)
+        or (r.id is not null
+            and (r.status in ('launching', 'waiting', 'cancellation_requested')
+                 or (r.status = 'queued' and r.worker_id is not null))
+            and coalesce(r.lease_expires_at, g.triggered_at, g.claimed_at) < now() - p_grace)
       from public.catalog_register_capture_groups g
       left join public.runs r on r.id = g.run_id
      where g.id = p_group_id), true)

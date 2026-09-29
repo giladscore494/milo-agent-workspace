@@ -54,6 +54,8 @@ if os.environ.get("OPS_TEST_IAM_DENIED") and "get-iam-policy" in args:
     # bucket or the project.
     sys.stderr.write("ERROR: PERMISSION_DENIED: storage.buckets.getIamPolicy / resourcemanager.projects.getIamPolicy\n")
     sys.exit(1)
+if os.environ.get("OPS_TEST_IAM_ERROR") and "get-iam-policy" in args:
+    sys.stderr.write("ERROR: (gcloud) 503 backend error\n"); sys.exit(1)
 if args[:3] == ["run", "jobs", "describe"]:
     print(json.loads(os.environ.get("OPS_TEST_JOB_IMAGES", "{}")).get(args[3], "")); sys.exit(0)
 if args[:3] == ["storage", "buckets", "describe"]:
@@ -185,6 +187,9 @@ def test_the_deployer_check_verifies_the_bucket_posture_and_leaves_iam_to_the_op
     assert len(mutations(tree)) == applied
     # The operator (IAM readable) still gets the whole check.
     assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith("PASS ")
+    # Only a DENIED IAM read is PARTIAL; any other failure stays UNREADABLE.
+    assert tree.run("setup-register-archive.sh", "--check",
+                    extra_env={**env, "OPS_TEST_IAM_ERROR": "1"}).stdout.startswith("UNREADABLE the IAM policy")
     path = tmp_path / "storage.json"
     state = json.loads(path.read_text())
     state["buckets"][BUCKET]["public_access_prevention"] = "inherited"

@@ -139,7 +139,7 @@ if [[ "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
   register_step=(3 c)
   [[ "$STAGE" == "all" ]] && register_step=(4 d)
   run_step "$(step_name "${register_step[0]}" "${register_step[1]}" register-capture)" \
-    "PR-D1 (the Register page): the register archive read back; the API identity runs and reads the capture job; MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
+    "PR-D1 (the Register page): the register archive gate (PASS; or PARTIAL = WARN: its IAM is verified from Cloud Shell, setup-register-archive.sh --check); the API identity runs and reads the capture job; MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
     "register capture was not applied (above); the Register page stays off" \
     "${activate[@]}" --apply-register-capture
 fi

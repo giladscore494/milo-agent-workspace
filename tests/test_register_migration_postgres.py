@@ -425,8 +425,25 @@ def test_one_directory_refresh_at_a_time(regdb):
     # Its run ends (killed long ago): the next request claims a new refresh.
     run_id = _leased_group(regdb, first)
     assert refresh()["group"]["id"] == first["group"]["id"]
+    # Killed while its cancellation was pending: live within the grace ...
+    regdb.psql(f"update public.runs set status = 'cancellation_requested', "
+               f"lease_expires_at = now() - interval '5 minutes' where id = '{run_id}'")
+    assert refresh()["group"]["id"] == first["group"]["id"]
+    # ... stale past it (it would otherwise lock every refresh out for good).
+    regdb.psql(f"update public.runs set lease_expires_at = now() - interval '1 hour' where id = '{run_id}'")
+    killed = refresh()
+    assert killed["decision"] == "claimed" and killed["group"]["id"] != first["group"]["id"]
+    first = killed
+    run_id = _leased_group(regdb, first)
     regdb.psql(f"update public.runs set status = 'failed' where id = '{run_id}'")
     third = refresh()
     assert third["decision"] == "claimed" and third["group"]["id"] != first["group"]["id"]
     assert "CATALOG_REGISTER_REQUEST_INVALID" in _refusal(
         regdb, f"select public.request_register_directory_refresh('{uuid.uuid4()}', 10)")
+
+
+def test_a_capture_group_needs_its_directory_version(regdb):
+    with pytest.raises(AssertionError) as refused:
+        regdb.psql("insert into public.catalog_register_capture_groups (kind, register_version, requested_by, "
+                   f"expected_rows) values ('capture', null, '{uuid.uuid4()}', 1)")
+    assert "violates check constraint" in str(refused.value)

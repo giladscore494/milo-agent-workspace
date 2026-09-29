@@ -93,7 +93,27 @@ dry-run's digest names (SHA-256 of the sorted keys, one per line).
    `milo_release_readonly_<suffix>` (LOGIN, BYPASSRLS, not a member of
    `pg_read_all_data`; matched by that prefix, never a hard-coded suffix),
    `supabase_read_only_user`, and any other BYPASSRLS login role in
-   `pg_read_all_data`. Never a superuser or a platform role.
+   `pg_read_all_data`. Never a superuser or a platform role. The grant is
+   made when the migration runs: a release read-only role created or
+   rotated LATER gets no EXECUTE (the read functions are revoked from
+   PUBLIC), and `REGISTER_COVERAGE` / retention then read "not available" /
+   refuse. Grant it the same way (SQL editor, as `postgres`):
+
+   ```sql
+   grant select on public.catalog_register_directory_versions, public.catalog_register_directory_units,
+     public.catalog_register_capture_groups, public.catalog_register_capture_units,
+     public.catalog_register_snapshot_archives, public.catalog_register_archive_lines to <role>;
+   grant execute on function public.catalog_register_version(text,jsonb),
+     public.catalog_register_database_bytes(), public.catalog_register_snapshot_bytes(uuid),
+     public.catalog_register_prunable_snapshots(), public.catalog_register_prune_digest(text[]),
+     public.catalog_register_coverage(), public.catalog_register_latest_directory(),
+     public.catalog_register_unit_states(), public.catalog_register_prunable_list(),
+     public.catalog_register_group_stale(uuid,interval) to <role>;
+   ```
+
+   Retention's list also reads the snapshot-referencing tables (runs,
+   evidence, claims, work scopes, ...) as that role: the migration-state check's
+   (`check-migration-state.sh`) `READONLY_ROLE_LACKS_SELECT` covers its SELECT on them.
 2. **Archive bucket** (Cloud Shell, idempotent): set
    `REGISTER_ARCHIVE_BUCKET=<new globally unique name>` in the operator
    configuration (and the `MILO_OPERATOR_CONFIG` repository variable), then

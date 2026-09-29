@@ -119,8 +119,10 @@ def _time(value: Any) -> datetime | None:
 
 def _stalled(group: Mapping[str, Any], run: Mapping[str, Any], now: datetime) -> bool:
     """The database's retry rule (request_register_capture), read for the page:
-    a claim that never got a run, a run no worker ever claimed, or a running
-    capture whose lease expired -- each longer ago than the grace."""
+    a claim that never got a run, a run no worker ever claimed, a running
+    capture whose lease expired, or a run left in any other live status
+    (launching, waiting, cancellation_requested) -- each longer ago than the
+    grace (public.catalog_register_group_stale)."""
     limit = now - timedelta(seconds=START_GRACE_SECONDS)
     claimed = _time(group.get("claimed_at"))
     started = _time(group.get("triggered_at")) or claimed
@@ -129,7 +131,10 @@ def _stalled(group: Mapping[str, Any], run: Mapping[str, Any], now: datetime) ->
         (group.get("trigger_state") == "claimed" and not group.get("run_id")
          and claimed is not None and claimed < limit)
         or (run.get("status") == "queued" and not run.get("worker_id") and started is not None and started < limit)
-        or (run.get("status") in ("starting", "running") and lease is not None and lease < limit))
+        or (run.get("status") in ("starting", "running") and lease is not None and lease < limit)
+        or ((run.get("status") in ("launching", "waiting", "cancellation_requested")
+             or (run.get("status") == "queued" and run.get("worker_id")))
+            and (lease or started) is not None and (lease or started) < limit))
 
 
 def _state(unit: Mapping[str, Any] | None, runs: Mapping[str, Mapping[str, Any]],
@@ -346,7 +351,11 @@ def request_directory_refresh(repo: Any, user_id: UUID, project_id: UUID, *, con
         claim = repo.request_register_directory_refresh(user_id, grace_seconds=START_GRACE_SECONDS)
         group = claim["group"]
         if claim["decision"] != "claimed":
-            return {"started": False, "group_id": str(group["id"]), "run_id": group.get("run_id")}
+            # The register is global; its run lives in the requester's
+            # conversation, so only they are told which run it is.
+            mine = str(group.get("requested_by")) == str(user_id)
+            return {"started": False, "group_id": str(group["id"]),
+                    "run_id": group.get("run_id") if mine else None}
 
         def record(state: str, run_id: str | None, execution: str | None = None) -> None:
             repo.record_register_capture_trigger(group["id"], run_id=run_id, trigger_state=state,
