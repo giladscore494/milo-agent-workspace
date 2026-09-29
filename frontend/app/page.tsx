@@ -67,6 +67,7 @@ import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector'
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { MappingPlanPanel } from '@/components/scope/MappingPlanPanel';
 import { RegisterPanel } from '@/components/register/RegisterPanel';
+import { CatalogBrowserPanel } from '@/components/catalog/CatalogBrowserPanel';
 import { FinalResultPanel } from '@/components/result/FinalResultPanel';
 import { RunExportControl } from '@/components/result/RunExportControl';
 import { VehicleCatalogResultPanel } from '@/components/result/VehicleCatalogResultPanel';
@@ -1527,6 +1528,11 @@ export default function WorkspacePage() {
             register capture on (its read answers 404 otherwise), independently
             of `executionUi`: capture is $0 and is not a run. */}
         <RegisterPanel projectId={selectedProject?.id} conversationId={activeConversation?.id} />
+        {/* PR-CAT — the Catalog page (the deterministic variants, read-only).
+            It renders only while the server has the catalog browser on (its
+            read answers 404 otherwise). "Add to plan" only writes the Mapping
+            Plan through its existing routes; it prepares and starts nothing. */}
+        <CatalogBrowserPanel projectId={selectedProject?.id} conversationId={activeConversation?.id} />
         {/* CODE-3 — durable catalog state, not run state. It is shown for any
             selected project regardless of `executionUi`: the execution UI flag
             hides EXECUTION controls, and there are none here. Hiding a

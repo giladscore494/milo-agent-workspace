@@ -2,6 +2,7 @@ import { EventId, eventCursorParam } from './eventId';
 import { parseJsonPreservingBigIntegers } from './losslessJson';
 import { getCurrentAccessToken } from './supabaseClient';
 import { Conversation, Project, Proposal, Run, RunEvent, RunSummary } from './types';
+import type { BrowserLevel } from './catalogBrowser';
 import type { WorkScopeEdit } from './workScope';
 
 const API = '/api/gateway';
@@ -151,6 +152,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ register_version: registerVersion, tozars, conversation_id: conversationId }),
     }),
+
+  /**
+   * PR-CAT: one level of the catalog browser (PR-L1's discovery tree). GET
+   * only; the server pages every level and answers 404 while
+   * MILO_ENABLE_CATALOG_BROWSER is off. `query` is `lib/catalogBrowser.ts`'s
+   * `browserQuery`, never free text.
+   */
+  catalogBrowser: (projectId: string, level: BrowserLevel, query: string) =>
+    request<unknown>(`/projects/${projectId}/catalog/browser/${level}${query}`),
 
   requestRegisterDirectory: (projectId: string, conversationId: string) =>
     request<unknown>(`/projects/${projectId}/register/directory`, {

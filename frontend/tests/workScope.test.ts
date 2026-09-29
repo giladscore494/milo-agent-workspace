@@ -188,7 +188,7 @@ describe('what the API client puts on the wire', () => {
 
   it('adds no catalog-named method', () => {
     const names = Object.keys(api).filter((name) => name.toLowerCase().includes('catalog'));
-    expect(names.sort()).toEqual(['catalogCanonical', 'catalogReviewCandidates']);
+    expect(names.sort()).toEqual(['catalogBrowser', 'catalogCanonical', 'catalogReviewCandidates']);
   });
 });
 
