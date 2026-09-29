@@ -167,6 +167,9 @@ class Register:
         # the per-match `distinguishing` fields to an ambiguous answer. These
         # runs PREDATE both, so their recorded answers never stated them.
         result.pop("distinguishing", None)
+        # PR-L1b (P32) added `register_unstated` beside a resolved row's source
+        # record; these runs PREDATE it too.
+        result.pop("register_unstated", None)
         for field in ("tozeret_cd", "degem_cd", "sug_degem"):
             (result.get("source_record") or {}).pop(field, None)
         for variant in result.get("variants") or []:

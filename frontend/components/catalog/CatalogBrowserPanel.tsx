@@ -184,8 +184,11 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
   const otherFilters = filters.segment !== undefined || filters.delekCd !== undefined || filters.merkav !== undefined;
   // An open plan keeps ITS year range (planAddition); only a new plan takes the filter's.
   const openPlan = plan.plan?.plan;
+  const yearsDiffer = openPlan !== undefined && (filters.yearFrom !== undefined || filters.yearTo !== undefined)
+    && ((filters.yearFrom ?? null) !== openPlan.modelYearFrom || (filters.yearTo ?? null) !== openPlan.modelYearTo);
   const years = openPlan
     ? `the plan's own ${openPlan.modelYearFrom ?? 'any'}–${openPlan.modelYearTo ?? 'any'}, kept when it is revised`
+      + (yearsDiffer ? ' (clear the year filter, or set it to that range, to add)' : '')
     : `${filters.yearFrom ?? 'any'}–${filters.yearTo ?? 'any'}`;
 
   const add = async () => {
@@ -257,7 +260,7 @@ export function CatalogBrowserPanel({ projectId, conversationId, planWrites = fa
                 disabled={busy || selected.size === 0 || otherFilters} onClick={() => void add()}>
                 {busy ? 'Adding…' : `Add to plan (${selected.size})`}</button>
               {selected.size > 0 && (
-                <span aria-label="Selected manufacturers">Selected: {[...selected].map(safeText).join(', ')}</span>)}
+                <span>Selected: {[...selected].map(safeText).join(', ')}</span>)}
               <span className="muted">
                 {otherFilters
                   ? 'A plan selects whole manufacturers by model year: clear the segment, fuel and body filters to add.'

@@ -34,17 +34,19 @@ projected, limit, in bytes) in the response body (`error.capacity`) and on the
 page. Measured bytes per snapshot are recorded when a unit finishes:
 `sum(pg_column_size(row))` over the snapshot's raw records and candidates
 (`measurement_method = pg_column_size(raw_records+candidates)`), shown on the
-page as bytes per row. PR-L1b: when the snapshot's variant build completes,
-the measurement is taken again over the raw records, candidates, variants and
-the ledger rows at `identity` / `government_fields` that name the snapshot
-(`measurement_method = pg_column_size(raw_records+candidates+variants+ledger)`,
-`catalog_register_measured_bytes`). Heap sizes only (a floor): the estimate
-below includes indexes.
+page as bytes per row. PR-L1b: the measurement covers the raw records,
+candidates, variants and the ledger rows at `identity` / `government_fields`
+that name the snapshot (`measurement_method =
+pg_column_size(raw_records+candidates+variants+ledger)`,
+`catalog_register_measured_bytes`): taken again whenever the snapshot's
+variant build completes, and at once for a unit that reuses an already built
+snapshot. Heap sizes only (a floor): the estimate below includes indexes.
 
-The estimate (PR-L1b, 5,500 B/row) is the measured total per register row,
+The estimate (PR-L1b, 6,000 B/row) is the measured total per register row,
 tables + TOAST + indexes, rounded up to the next 500: raw record + candidate
-3,512 B (production, 25,495 rows), variant 975 B, ledger at two levels 996 B
-(`tests/test_catalog_variants_postgres.py`, L1-6).
+3,512 B (production, 25,495 rows), variant 975-1,039 B, ledger at two levels
+~996 B (`tests/test_catalog_variants_postgres.py`, L1-6): 5,547 B at the
+upper reading.
 
 ### Archive
 
@@ -85,10 +87,13 @@ items, one per line).
 PR-L1b (20261001000100): a pruned snapshot's variants and variant builds are
 deleted with it, in the same transaction (the variants' append-only trigger
 is suspended only inside `prune_register_snapshots` and re-enabled before it
-returns). Ledger rows at `identity` / `government_fields` that name it are
-kept unchanged as history: a newer build already re-points every key it
-states, so such a row names a key no newer build states; its snapshot key
-stays citable through the archive. They never block a prune. Also prunable,
+returns). Ledger rows at `identity` / `government_fields` that name it never
+block the prune and are never deleted: where the tozar's CURRENT build
+states the same key (a newer snapshot's partial build wrote the row, then was
+superseded), the prune re-points the row to that build by the build's own
+rule (`ledger_repointed` in its answer); any other row is kept unchanged as
+history -- the register no longer states that key, and a captured snapshot's
+archive keeps its key citable. Also prunable,
 listed as `PRUNABLE-VARIANTS <snapshot_key> mapper_version=<v>`: the variant
 rows of a mapper version other than the current one, once the snapshot's
 build under the current mapper version is complete. Their digest item is
@@ -101,7 +106,7 @@ build under the current mapper version is complete. Their digest item is
 | `MILO_ENABLE_REGISTER_CAPTURE` | off | the website stage flag |
 | `MILO_DB_CAPACITY_BYTES` | `500000000` (500 MB) | |
 | `MILO_DB_CAPACITY_THRESHOLD` | `0.80` | |
-| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `5500` | raw + candidate + variant + two ledger levels, per row (PR-L1b) |
+| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `6000` | raw + candidate + variant + two ledger levels, per row (PR-L1b) |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |

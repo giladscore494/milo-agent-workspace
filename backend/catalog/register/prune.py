@@ -10,9 +10,10 @@ executed by scripts/ops/register-retention.sh with argument overrides:
 and hands both to `public.prune_register_snapshots`, which recomputes and
 refuses again under a table lock. Database rows only: an archive object is
 never touched. PR-L1b: a pruned snapshot's variants and variant builds go
-with it, and an old mapper version's variant build is listed (and pruned) on
-its own once the snapshot's build under the current mapper version is
-complete; its digest item is `<snapshot_key> <mapper_version>`. Prints snapshot keys, counts and the digest -- nothing else.
+with it, and an old mapper version's variant build is listed (and pruned)
+on its own once the snapshot's build under the current mapper version is
+complete; its digest item is `<snapshot_key> <mapper_version>`. Prints
+snapshot keys, counts and the digest -- nothing else.
 Exit 0 on success, 2 on a refusal, 1 on a failure.
 """
 
@@ -100,7 +101,8 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None) -> int:
         return EXIT_FAILED
     print(f"PRUNED snapshots={int(result.get('snapshots') or 0)} raw_records={int(result.get('raw_records') or 0)} "
           f"candidates={int(result.get('candidates') or 0)} variants={int(result.get('variants') or 0)} "
-          f"variant_builds={int(result.get('variant_builds') or 0)} (archive objects untouched)")
+          f"variant_builds={int(result.get('variant_builds') or 0)} "
+          f"ledger_repointed={int(result.get('ledger_repointed') or 0)} (archive objects untouched)")
     return EXIT_OK
 
 

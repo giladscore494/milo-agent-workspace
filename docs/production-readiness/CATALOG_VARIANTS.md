@@ -48,8 +48,8 @@ The driver-assistance equipment is stored as two 19-bit masks
 stated); the build still validates the mapper's document against the closed
 key list (`CATALOG_VARIANT_EQUIPMENT_KEY_UNKNOWN`), and the browser returns
 the same `equipment` document (`catalog_variant_equipment`). Measured
-(L1-6, 5,000 rows): 975 B per variant row including TOAST and indexes (was
-2,345 B with the jsonb document), and 996 B per row for the two ledger
+(L1-6, 5,000 rows): 975-1,039 B per variant row including TOAST and indexes
+(was 2,345 B with the jsonb document), and ~996 B per row for the two ledger
 levels. A superseded snapshot's variants are pruned with it (see
 REGISTER_CAPTURE.md, Retention).
 

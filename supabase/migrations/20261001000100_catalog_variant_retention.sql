@@ -12,11 +12,13 @@
 --     except that the coverage ledger keeps a snapshot only through a
 --     `register`-level row, and variants keep only the CURRENT build of a
 --     tozar (the one catalog_variants_current serves). Ledger rows at
---     `identity` / `government_fields` naming a pruned snapshot are KEPT AS
---     HISTORY (status, snapshot_key, content): a newer build already re-points
---     every key it states, so such a row names a key no newer build states,
---     and its archive object (which a prune never touches) keeps the key
---     citable. They never block a prune and are never deleted.
+--     `identity` / `government_fields` naming a pruned snapshot never block
+--     the prune and are never deleted: where the tozar's current build states
+--     the same key (e.g. a newer snapshot's partial build wrote the row, then
+--     was superseded) the prune RE-POINTS the row to that build, by the
+--     build's own rule; otherwise the row is KEPT AS HISTORY, unchanged (the
+--     register no longer states that key; a captured snapshot's archive, which
+--     a prune never touches, keeps it citable).
 --   * Retention: the variant rows of an OLD mapper version are prunable once
 --     the same snapshot's build under the current mapper version is complete
 --     (catalog_register_prunable_variant_builds()). The dry-run lists both,
@@ -43,7 +45,9 @@
 --     by snapshot id (the tree index), never the whole table.
 --   * Measured bytes: a snapshot's measured storage includes its variants and
 --     its ledger rows at the two variant levels; a completed build refreshes
---     the measurement of the register units that captured it.
+--     the measurement of the register units that captured it, and a unit
+--     captured on a snapshot that is already built is measured the same way.
+--   * A mapper version is one token (it is half of a digest item).
 --
 -- Nothing else moves: no raw record, candidate, content hash, Prepare, run or
 -- `register`-level ledger row. Forward-only and rerun-safe.
@@ -208,6 +212,31 @@ as $$
                                                        where v.snapshot_id = p_snapshot_id
                                                          and v.variant_identity_key is not null)), 0)
 $$;
+
+-- record_register_unit_status (20260929000100) measures raw records +
+-- candidates under that label. For a snapshot that is already built (a
+-- capture that reuses a content-addressed snapshot) that is not the whole
+-- storage: this trigger takes the full measurement instead.
+create or replace function public.catalog_register_unit_measure() returns trigger
+language plpgsql
+set search_path = pg_catalog
+as $$
+begin
+  if new.snapshot_id is not null and new.measurement_method = 'pg_column_size(raw_records+candidates)' then
+    new.measured_bytes := public.catalog_register_measured_bytes(new.snapshot_id);
+    new.measurement_method := 'pg_column_size(raw_records+candidates+variants+ledger)';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists catalog_register_capture_units_measure on public.catalog_register_capture_units;
+create trigger catalog_register_capture_units_measure
+  before insert or update on public.catalog_register_capture_units
+  for each row execute function public.catalog_register_unit_measure();
+
+alter table public.catalog_variant_builds drop constraint if exists catalog_variant_builds_mapper_version_token;
+alter table public.catalog_variant_builds add constraint catalog_variant_builds_mapper_version_token
+  check (mapper_version ~ '^[A-Za-z0-9._:-]{1,80}$');
 
 -- ---------------------------------------------------------------------------
 -- 3. The build: rank-1 eligibility, compact equipment, the measurement.
@@ -416,8 +445,7 @@ begin
        set measured_bytes = public.catalog_register_measured_bytes(p_snapshot_id),
            measurement_method = 'pg_column_size(raw_records+candidates+variants+ledger)',
            updated_at = now()
-     where snapshot_id = p_snapshot_id and status = 'captured'
-       and measurement_method is distinct from 'pg_column_size(raw_records+candidates+variants+ledger)';
+     where snapshot_id = p_snapshot_id and status = 'captured';
   end if;
 
   return jsonb_build_object('snapshot_key', v_snapshot.snapshot_key, 'mapper_version', p_mapper_version,
@@ -733,6 +761,8 @@ declare
   v_digest text;
   v_variants bigint;
   v_builds bigint;
+  v_count bigint;
+  v_repointed bigint;
   v_candidates bigint;
   v_records bigint;
   v_snapshots bigint;
@@ -744,7 +774,7 @@ begin
   -- Lock the source and variant tables first, so the lists cannot move under the check.
   lock table public.catalog_source_snapshots, public.catalog_raw_records,
              public.catalog_candidate_variants, public.catalog_variant_builds,
-             public.catalog_variants in share row exclusive mode;
+             public.catalog_variants, public.catalog_variant_coverage in share row exclusive mode;
   select coalesce(array_agg(p.snapshot_key order by p.snapshot_key collate "C"), '{}'),
          coalesce(array_agg(p.snapshot_id), '{}')
     into v_keys, v_ids
@@ -762,18 +792,65 @@ begin
   end if;
   if cardinality(v_ids) = 0 and cardinality(v_items) = 0 then
     return jsonb_build_object('snapshots', 0, 'raw_records', 0, 'candidates', 0, 'variants', 0,
-                              'variant_builds', 0, 'digest', v_digest);
+                              'variant_builds', 0, 'ledger_repointed', 0, 'digest', v_digest);
   end if;
+  -- Ledger rows at the variant levels that name a pruned snapshot: where its
+  -- tozar's CURRENT build states the key (a newer snapshot's partial build
+  -- wrote them, then was superseded), they are re-pointed to that build, by
+  -- the build's own rule; any other is kept unchanged, as history.
+  with cur as (
+    select distinct on (b.tozar) b.tozar, b.snapshot_id, b.snapshot_key
+      from public.catalog_variant_builds b
+     where b.mapper_version = public.catalog_variant_mapper_version() and b.completed_at is not null
+     order by b.tozar, b.activated_at desc, b.snapshot_id
+  ),
+  named as (
+    select cv.id, cv.variant_identity_key as k, c.snapshot_id as cur_id, c.snapshot_key as cur_key
+      from public.catalog_variant_coverage cv
+      join public.catalog_source_snapshots ps on ps.snapshot_key = cv.snapshot_key and ps.id = any(v_ids)
+      join cur c on c.tozar = ps.retrieval_metadata->'capture_scope'->'filters'->>'tozar'
+     where cv.level in ('identity', 'government_fields')
+  ),
+  contents as (
+    select n.k, n.cur_id, n.cur_key, count(distinct v.content_sha256) as distinct_contents,
+           min(v.content_sha256 collate "C") as only_content,
+           encode(sha256(convert_to(string_agg(distinct v.content_sha256, ','
+                                               order by v.content_sha256), 'UTF8')), 'hex') as collision_content
+      from (select distinct k, cur_id, cur_key from named) n
+      join public.catalog_variants v
+        on v.snapshot_id = n.cur_id and v.variant_identity_key = n.k
+       and v.mapper_version = public.catalog_variant_mapper_version()
+     group by n.k, n.cur_id, n.cur_key
+  )
+  update public.catalog_variant_coverage cv
+     set status = case when x.distinct_contents > 1 then 'failed' else 'enriched' end,
+         last_run_id = s.created_by_run_id, snapshot_key = x.cur_key,
+         content_sha256 = case when x.distinct_contents > 1 then x.collision_content else x.only_content end,
+         vocabulary_version = public.catalog_vocabulary_version(),
+         reason_code = case when x.distinct_contents > 1 then 'CATALOG_COVERAGE_KEY_COLLISION' end,
+         updated_at = now()
+    from named n
+    join contents x on x.k = n.k and x.cur_id = n.cur_id
+    join public.catalog_source_snapshots s on s.id = x.cur_id
+   where cv.id = n.id;
+  get diagnostics v_repointed = row_count;
+
   alter table public.catalog_variants disable trigger catalog_variants_append_only;
-  delete from public.catalog_variants v
-   where v.snapshot_id = any(v_ids)
-      or (v.snapshot_id, v.mapper_version) in (select * from unnest(v_build_ids, v_build_versions));
+  delete from public.catalog_variants where snapshot_id = any(v_ids);
   get diagnostics v_variants = row_count;
+  delete from public.catalog_variants v
+   using unnest(v_build_ids, v_build_versions) as u(snapshot_id, mapper_version)
+   where v.snapshot_id = u.snapshot_id and v.mapper_version = u.mapper_version;
+  get diagnostics v_count = row_count;
+  v_variants := v_variants + v_count;
   alter table public.catalog_variants enable trigger catalog_variants_append_only;
-  delete from public.catalog_variant_builds b
-   where b.snapshot_id = any(v_ids)
-      or (b.snapshot_id, b.mapper_version) in (select * from unnest(v_build_ids, v_build_versions));
+  delete from public.catalog_variant_builds where snapshot_id = any(v_ids);
   get diagnostics v_builds = row_count;
+  delete from public.catalog_variant_builds b
+   using unnest(v_build_ids, v_build_versions) as u(snapshot_id, mapper_version)
+   where b.snapshot_id = u.snapshot_id and b.mapper_version = u.mapper_version;
+  get diagnostics v_count = row_count;
+  v_builds := v_builds + v_count;
   alter table public.catalog_candidate_variants disable trigger catalog_candidate_variants_identity_immutable;
   alter table public.catalog_raw_records disable trigger catalog_raw_records_append_only;
   alter table public.catalog_source_snapshots disable trigger catalog_source_snapshots_append_only;
@@ -788,7 +865,7 @@ begin
   alter table public.catalog_source_snapshots enable trigger catalog_source_snapshots_append_only;
   return jsonb_build_object('snapshots', v_snapshots, 'raw_records', v_records,
                             'candidates', v_candidates, 'variants', v_variants,
-                            'variant_builds', v_builds, 'digest', v_digest);
+                            'variant_builds', v_builds, 'ledger_repointed', v_repointed, 'digest', v_digest);
 end;
 $$;
 

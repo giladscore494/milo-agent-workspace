@@ -167,8 +167,9 @@ class VariantsMemoryMixin:
             if build["mapper_version"] != mapper.MAPPER_VERSION or not build["completed_at"]:
                 continue
             held = newest.get(build["tozar"])
-            if held is None or (str(build["activated_at"]), build["snapshot_id"]) > \
-                    (str(held["activated_at"]), held["snapshot_id"]):
+            # The database's order: activated_at DESC, then snapshot_id ASC.
+            if held is None or (str(build["activated_at"]), held["snapshot_id"]) > \
+                    (str(held["activated_at"]), build["snapshot_id"]):
                 newest[build["tozar"]] = build
         return {b["snapshot_id"] for b in newest.values()}
 

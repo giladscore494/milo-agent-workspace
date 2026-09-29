@@ -312,11 +312,15 @@ describe('CatalogBrowserPanel', () => {
     fireEvent.change(screen.getByLabelText('To year'), { target: { value: '2024' } });
     fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
     fireEvent.click(await screen.findByRole('checkbox', { name: `Select ${MAZDA}` }));
-    expect(await screen.findByText(/Year range: the plan's own 2018–any, kept when it is revised/)).toBeTruthy();
+    expect(await screen.findByText(/Year range: the plan's own 2018–any, kept when it is revised \(clear the year filter/))
+      .toBeTruthy();
     expect(screen.queryByText(/Year range: any–2024/)).toBeNull();
-    expect(screen.getByLabelText('Selected manufacturers').textContent).toBe(`Selected: ${MAZDA}`);
+    expect(screen.getByText(`Selected: ${MAZDA}`)).toBeTruthy();
     fireEvent.click(screen.getByRole('checkbox', { name: `Select ${TOYOTA}` }));
-    expect(screen.getByLabelText('Selected manufacturers').textContent).toBe(`Selected: ${MAZDA}, ${TOYOTA}`);
+    expect(screen.getByText(`Selected: ${MAZDA}, ${TOYOTA}`)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('To year'), { target: { value: '' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Apply filters' }));
+    expect(await screen.findByText(/Year range: the plan's own 2018–any, kept when it is revised\. /)).toBeTruthy();
   });
 
   it('states the filter\'s year range when there is no plan yet', async () => {

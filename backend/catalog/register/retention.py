@@ -5,15 +5,17 @@ migration 20260929000100), so the dry-run, the apply and any operator query
 agree by construction. Kept, always:
 
 * per tozar, the ACTIVE snapshot and the one before it (the two latest
-  activations);
+  activations), and (PR-L1b, 20261001000100) its CURRENT variant build;
 * the snapshot of the latest CAPTURED register unit of each tozar;
 * any snapshot referenced by evidence, claims (canonical field provenance),
   runs (adoptions, run checkpoints), work-scope units / batches / queue items,
-  the coverage ledger, or whose candidates are referenced anywhere;
+  a `register`-level coverage-ledger row, or whose candidates are referenced
+  anywhere;
 * any snapshot whose writer run is still live.
 
-Everything else among the SCOPED Government snapshots is prunable. Prune
-deletes database rows only -- never an archive object -- and only for the
+Everything else among the SCOPED Government snapshots is prunable, with its
+variants (and an old mapper version's variant build once the current one is
+complete). Prune deletes database rows only -- never an archive object -- and only for the
 exact list whose digest the dry-run printed.
 
 This module holds the digest (mirror of `public.catalog_register_prune_digest`)

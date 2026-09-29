@@ -452,6 +452,32 @@ def test_a_superseded_snapshot_is_pruned_with_its_variants_and_referenced_ones_n
     assert page["total"] == 1 and page["items"][0]["variants"] == 1
 
 
+def test_a_pruned_partial_build_s_ledger_rows_are_repointed_to_the_current_build(vdb):
+    """A newer snapshot's PARTIAL build wrote ledger rows for a key the older,
+    complete (current) build also states; it is superseded and pruned. Those
+    rows are re-pointed to the current build -- its snapshot, content and
+    writer run -- never left naming a snapshot that no longer exists."""
+    marque = "חלקי"
+    one, two = dict(record(37425), _id=950001, tozar=marque), dict(record(37439), _id=950002, tozar=marque)
+    current = _snapshot(vdb, [one, two], "partial-current", marque=marque)
+    _build(vdb, current)
+    partial = _snapshot(vdb, [dict(one, madad_yarok=321.0), two], "partial-newer", marque=marque)
+    assert _build(vdb, partial, [dict(one, madad_yarok=321.0)])["complete"] is False
+    key = _variant(vdb, current, "950001", "variant_identity_key")
+    ledger = (f"select level, status, snapshot_key, content_sha256, last_run_id from public.catalog_variant_coverage "
+              f"where variant_identity_key='{key}' order by level")
+    assert {line.split("|")[2] for line in vdb.psql(ledger).splitlines()} == {partial["key"]}
+    for index in (1, 2):
+        _snapshot(vdb, [one, two], f"partial-later-{index}", marque=marque)
+    listing = _prunable(vdb)
+    assert partial["key"] in {entry["snapshot_key"] for entry in listing["snapshots"]}
+    assert current["key"] not in {entry["snapshot_key"] for entry in listing["snapshots"]}
+    assert _prune(vdb, listing)["ledger_repointed"] >= 2
+    content = _variant(vdb, current, "950001", "content_sha256")
+    assert vdb.psql(ledger).splitlines() == [
+        f"{level}|enriched|{current['key']}|{content}|{current['run_id']}" for level in ("government_fields", "identity")]
+
+
 def test_old_mapper_version_rows_are_pruned_once_the_current_build_is_complete(vdb):
     marque, older = "גרסה", "gov.wltp.variant-mapper.0"
     snapshot = _snapshot(vdb, [dict(record(37425), _id=930001, tozar=marque)], "mapper-old", marque=marque)
@@ -505,11 +531,17 @@ def test_a_complete_build_re_measures_its_captured_units(vdb, built):
              "status, snapshot_id, snapshot_key, api_total, captured_rows, count_verified, measured_bytes, "
              f"measurement_method) values ('{group}', '{'c' * 64}', '{TOYOTA}', 16, 'captured', '{built['id']}', "
              f"'{built['key']}', 16, 16, true, 1, 'pg_column_size(raw_records+candidates)')")
+    full = int(vdb.psql(f"select public.catalog_register_measured_bytes('{built['id']}')"))
+    unit = f"select measured_bytes, measurement_method from public.catalog_register_capture_units where group_id='{group}'"
+    # A unit recorded on a snapshot that is ALREADY built (a reused,
+    # content-addressed snapshot) is measured in full at once.
+    assert vdb.psql(unit) == f"{full}|pg_column_size(raw_records+candidates+variants+ledger)"
+    # And a completed build measures it again (e.g. after a new mapper version).
+    vdb.psql(f"update public.catalog_register_capture_units set measured_bytes = 1 where group_id='{group}'")
     _build(vdb, built)
-    measured, method = vdb.psql(f"select measured_bytes, measurement_method from public.catalog_register_capture_units "
-                                f"where group_id='{group}'").split("|")
+    measured, method = vdb.psql(unit).split("|")
     assert method == "pg_column_size(raw_records+candidates+variants+ledger)"
-    assert int(measured) == int(vdb.psql(f"select public.catalog_register_measured_bytes('{built['id']}')"))
+    assert int(measured) == full
     assert int(measured) > int(vdb.psql(f"select public.catalog_register_snapshot_bytes('{built['id']}')")) > int(
         vdb.psql(f"select sum(pg_column_size(r.*)) from public.catalog_raw_records r where snapshot_id='{built['id']}'"))
 
