@@ -127,6 +127,21 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['WORK_SCOPE_PREPARATION_TRIGGER_FAILED', 'The capture job could not be started. Prepare can be tried again.'],
   ['WORK_SCOPE_PREPARATION_NEEDS_OPERATOR', 'The last preparation stopped part way, so a new one was not started. An operator reconciles it first.'],
 
+  // PR-D1: the Register page's Capture and directory refresh. Each is a
+  // refusal the server answered with its own static code
+  // (backend/catalog/register/service.py REQUEST_REASONS); the page is read
+  // again after every one. Only TRIGGER_FAILED comes after anything was
+  // recorded, and it may be retried.
+  ['CATALOG_REGISTER_NO_DIRECTORY', 'The register directory has not been read yet, so nothing was captured. Refresh the directory first.'],
+  ['CATALOG_REGISTER_VERSION_STALE', 'The register directory changed since the page was read. It has been reloaded; choose again.'],
+  ['CATALOG_REGISTER_UNIT_UNKNOWN', 'A chosen tozar is not in the current register directory, so nothing was captured.'],
+  ['CATALOG_REGISTER_GROUP_TOO_LARGE', 'Those tozars together exceed the group cap of expected rows, so nothing was captured. Choose fewer, or capture a large one alone.'],
+  ['CATALOG_CAPACITY_THRESHOLD_EXCEEDED', 'That capture would take the database above its capacity threshold, so nothing was started.'],
+  ['CATALOG_REGISTER_JOB_NOT_RELEASE', 'The capture job does not run the deployed release, so nothing was started. An operator must update the capture job first.'],
+  ['CATALOG_REGISTER_JOB_UNREADABLE', 'The server could not read the capture job or the worker job, so nothing was started.'],
+  ['CATALOG_REGISTER_TRIGGER_FAILED', 'The capture job could not be started. Capture can be tried again.'],
+  ['CATALOG_REGISTER_CONVERSATION_UNAVAILABLE', 'Open a conversation of this project first; register capture is recorded under it.'],
+
   // An ordinary task in a project whose runs read the Government catalog:
   // catalog work starts only from a prepared Mapping Plan batch. Nothing was
   // created.
@@ -229,6 +244,11 @@ export const PREPARATION_REFUSAL_CODES: readonly string[] = [
 
 /** The Prepare button's own sentence when a refusal carries no code of ours. */
 export const PREPARATION_REQUEST_FALLBACK = 'The revision could not be prepared.';
+
+/** PR-D1: the Register page's own fallback sentences. */
+export const REGISTER_CAPTURE_FALLBACK = 'The capture could not be requested.';
+export const REGISTER_DIRECTORY_FALLBACK = 'The register directory refresh could not be requested.';
+export const REGISTER_READ_FALLBACK = 'The register could not be read.';
 
 /** What the website shows when a Prepare is refused: the code's own reason. */
 export function preparationRequestErrorText(error: unknown): string {

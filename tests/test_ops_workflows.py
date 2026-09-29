@@ -40,10 +40,11 @@ REPO = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO / ".github" / "workflows"
 OPS = REPO / "scripts" / "ops"
 PRODUCTION_WORKFLOWS = ("deploy.yml", "kill-switch.yml", "capture-flag.yml", "gates.yml", "arm.yml",
-                        "website-stage.yml")
+                        "website-stage.yml", "register-retention.yml")
 OPS_SCRIPTS = ("common.sh", "deploy.sh", "kill-switch.sh", "capture-flag.sh", "gates.sh", "arm.sh",
                "setup-wif.sh", "write-operator-config.sh", "link-vercel.sh", "website-stage.sh",
-               "deployed-release.sh", "preflight-deployer.sh")
+               "deployed-release.sh", "preflight-deployer.sh", "register-retention.sh",
+               "setup-register-archive.sh")
 
 #: Sentinel secrets: if one of these ever reaches stdout, stderr or the job
 #: summary, a script printed a secret.
@@ -259,12 +260,15 @@ def dry_runs(tree: OpsTree) -> dict[str, tuple[str, ...]]:
         "gates.sh": ("--gate", "prepared", *WS, "--dry-run"),
         "arm.sh": (*WS, "--dry-run"),
         "preflight-deployer.sh": ("--sha", tree.sha, "--dry-run"),
+        "register-retention.sh": ("--list", "--dry-run"),
+        "register-retention.sh (apply)": ("--apply", "--confirm", "PRUNE", "--digest", "e" * 64, "--dry-run"),
     }
 
 
 @pytest.mark.parametrize("label", ["deploy.sh", "deploy.sh (permanent)", "kill-switch.sh",
                                    "capture-flag.sh on", "capture-flag.sh off", "gates.sh",
-                                   "arm.sh", "preflight-deployer.sh"])
+                                   "arm.sh", "preflight-deployer.sh", "register-retention.sh",
+                                   "register-retention.sh (apply)"])
 def test_every_dry_run_calls_nothing_and_prints_no_secret(tmp_path, label):
     tree = OpsTree(tmp_path)
     args = dry_runs(tree)[label]

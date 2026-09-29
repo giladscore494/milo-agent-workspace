@@ -7,11 +7,13 @@ from uuid import UUID, uuid4
 
 from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
+from backend.catalog.register import service as register_service
 from backend.catalog.scope import batches as work_scope_batches
 from backend.catalog.scope import service as work_scopes
 from backend.catalog.scope import web_preparation as work_scope_preparation
@@ -36,6 +38,8 @@ from backend.schemas import (
     ProposalProjectCreate,
     ProposalRevise,
     ProposalRunCreate,
+    RegisterCaptureRequest,
+    RegisterDirectoryRequest,
     Run,
     RunCancelRequest,
     RunCancelResponse,
@@ -765,6 +769,45 @@ def request_work_scope_preparation(work_scope_id: UUID, request: WorkScopePrepar
 def get_work_scope_preparation(work_scope_id: UUID, revision: int = Query(ge=1, le=999999999), digest: str = Query(pattern=r"^[0-9a-f]{64}$"), user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
     return work_scope_preparation.status(repo, user.user_id, work_scope_id, revision, digest,
                                          trigger=trigger)
+
+
+# PR-D1: the Register page -- the Government register's directory, each exact
+# tozar's capture state and the capacity bar -- and its two writes: Capture
+# (one tozar or a group, idempotent per tozar and directory version) and a
+# directory refresh. Both writes execute the EXISTING capture job through the
+# E' trigger (release refusal first). Capture is $0 and NOT a product run: it
+# depends on MILO_ENABLE_REGISTER_CAPTURE alone -- never on run creation, the
+# run-start gateway flag or Arm. Flag off: the read is 404 (the page does not
+# exist) and the writes are 403 (ExecutionSurfaceGuardMiddleware, and again
+# here). The paths sit outside /catalog/, whose routes stay GET-only.
+@app.get("/projects/{project_id}/register")
+def get_register(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    return register_service.register_view(repo, user.user_id, project_id, trigger=trigger)
+
+
+@app.post("/projects/{project_id}/register/captures")
+def request_register_capture(project_id: UUID, request: RegisterCaptureRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)):
+    require_stage_enabled(register_service.REGISTER_FLAG, "register capture")
+    enforce_rate_limit("run_creation_user", str(user.user_id))
+    try:
+        answer, started = register_service.request_capture(
+            repo, user.user_id, project_id, register_version=request.register_version,
+            tozars=request.tozars, conversation_id=request.conversation_id, trigger=trigger)
+    except register_service.CapacityRefusal as refused:
+        # The numbers the page shows: current, projected and limit, in bytes.
+        return JSONResponse(status_code=refused.status_code, content={"error": {
+            "code": refused.code, "message": refused.message, "capacity": refused.capacity}})
+    response.status_code = 202 if started else 200
+    return answer
+
+
+@app.post("/projects/{project_id}/register/directory", status_code=202)
+def request_register_directory(project_id: UUID, request: RegisterDirectoryRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    require_stage_enabled(register_service.REGISTER_FLAG, "register directory refresh")
+    enforce_rate_limit("run_creation_user", str(user.user_id))
+    return register_service.request_directory_refresh(repo, user.user_id, project_id,
+                                                      conversation_id=request.conversation_id,
+                                                      trigger=trigger)
 
 
 @app.post("/work-scopes/{work_scope_id}/pause", response_model=WorkScopeControlResult)

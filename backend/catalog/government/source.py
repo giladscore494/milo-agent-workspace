@@ -190,6 +190,13 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
     # scoped catalog PR2: a declared capture scope must describe the query sent
     "GOV_CAPTURE_SCOPE_MISMATCH":
         "a scoped capture's declared scope does not describe the query it sent",
+    # PR-D1: the register directory (distinct tozar values and their counts)
+    "GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED":
+        "the register directory needs more requests than its hard request cap",
+    "GOV_DIRECTORY_TIME_BUDGET_EXCEEDED":
+        "the register directory took longer than its hard time cap",
+    "GOV_DIRECTORY_RESULT_INVALID":
+        "a register directory answer is not the shape a count or a distinct read must have",
 }
 
 

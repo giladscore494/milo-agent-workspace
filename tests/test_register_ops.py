@@ -1,0 +1,341 @@
+"""PR-D1 operations, offline against stand-ins: the register archive setup
+(scripts/ops/setup-register-archive.sh), retention (scripts/ops/register-
+retention.sh and its workflow), the register-capture website stage, and the
+REGISTER_COVERAGE line of the gates.
+
+Proves: the archive setup converges once and is idempotent, grants the
+capture identity roles/storage.objectCreator on that bucket only, and its
+check reports a public bucket or a delete-capable application role as FAIL;
+retention lists read-only and prunes only with PRUNE and the exact digest,
+through the capture job, never touching an archive object; the website stage
+runs the canonical tools in order and needs the archive bucket; the gates
+line is informational except above the threshold; nothing prints a secret.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from pathlib import Path
+
+import yaml
+
+from tests.test_ops_workflows import (OPS, SENTINEL_FRAGMENTS, WORKFLOWS, OpsTree, steps, triggers,
+                                      workflow)
+
+BUCKET = "test-project-milo-register-archive"
+CAPTURE = "serviceAccount:capture@test-project.iam.gserviceaccount.com"
+DIGEST = "d" * 64
+
+STORAGE_GCLOUD = r'''#!/usr/bin/env python3
+"""gcloud with a tiny Cloud Storage world (buckets + bucket IAM)."""
+import json, os, sys
+args = sys.argv[1:]
+path = os.environ["OPS_TEST_STORAGE_STATE"]
+state = json.load(open(path)) if os.path.exists(path) else {"buckets": {}, "bindings": {}}
+with open(os.environ["OPS_TEST_CALLS"], "a") as log:
+    log.write("gcloud " + " ".join(args) + "\n")
+def save():
+    json.dump(state, open(path, "w"))
+def flag(name):
+    for i, a in enumerate(args):
+        if a == name:
+            return args[i + 1]
+    return None
+if args[:2] == ["auth", "list"]:
+    print("owner@example.test"); sys.exit(0)
+if args[:3] == ["config", "get-value", "project"]:
+    print("test-project"); sys.exit(0)
+if args[:3] == ["config", "get-value", "account"]:
+    print("owner@example.test"); sys.exit(0)
+name = args[3].replace("gs://", "") if len(args) > 3 else ""
+if args[:3] == ["storage", "buckets", "describe"]:
+    if name not in state["buckets"]:
+        sys.exit(1)
+    print(json.dumps(state["buckets"][name])); sys.exit(0)
+if args[:3] == ["storage", "buckets", "create"]:
+    state["buckets"][name] = {"location": flag("--location").upper(),
+        "uniform_bucket_level_access": "--uniform-bucket-level-access" in args,
+        "public_access_prevention": "enforced" if "--public-access-prevention" in args else "inherited"}
+    save(); sys.exit(0)
+if args[:3] == ["storage", "buckets", "update"]:
+    b = state["buckets"][name]
+    if "--uniform-bucket-level-access" in args: b["uniform_bucket_level_access"] = True
+    if "--public-access-prevention" in args: b["public_access_prevention"] = "enforced"
+    save(); sys.exit(0)
+if args[:3] == ["storage", "buckets", "get-iam-policy"]:
+    if name not in state["buckets"]:
+        sys.exit(1)
+    bindings = state["bindings"].get(name, [])
+    print(json.dumps({"bindings": [{"role": r, "members": [m]} for r, m in bindings]})); sys.exit(0)
+if args[:3] == ["storage", "buckets", "add-iam-policy-binding"]:
+    state["bindings"].setdefault(name, []).append([flag("--role"), flag("--member")]); save(); sys.exit(0)
+sys.stderr.write("unmocked gcloud " + " ".join(args) + "\n"); sys.exit(2)
+'''
+
+
+def archive_tree(tmp_path: Path, *, bucket: str | None = BUCKET) -> tuple[OpsTree, dict[str, str]]:
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", STORAGE_GCLOUD)
+    if bucket is not None:
+        tree.config.write_text(tree.config.read_text() + f"REGISTER_ARCHIVE_BUCKET={bucket}\n")
+    return tree, {"OPS_TEST_STORAGE_STATE": str(tmp_path / "storage.json")}
+
+
+def mutations(tree: OpsTree) -> list[str]:
+    return [c for c in tree.tool_calls() if re.search(r"buckets (create|update|add-iam-policy-binding)", c)]
+
+
+def no_secret(*texts: str) -> None:
+    for fragment in SENTINEL_FRAGMENTS:
+        assert fragment not in "".join(texts)
+
+
+# =============================================================================
+# 1. setup-register-archive.sh
+# =============================================================================
+
+def test_the_archive_setup_plans_applies_once_and_is_idempotent(tmp_path):
+    tree, env = archive_tree(tmp_path)
+    plan = tree.run("setup-register-archive.sh", extra_env=env)
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    assert mutations(tree) == [], "--plan changed something"
+    assert re.findall(r"^(CREATE|UPDATE|BIND) ", plan.stdout, re.M) == ["CREATE", "BIND"]
+    assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith("UNREADABLE ")
+
+    applied = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    state = json.loads((tmp_path / "storage.json").read_text())
+    assert state["buckets"][BUCKET] == {"location": "US-CENTRAL1", "uniform_bucket_level_access": True,
+                                        "public_access_prevention": "enforced"}
+    # Exactly one grant: objectCreator for the capture identity, on this bucket.
+    assert state["bindings"] == {BUCKET: [["roles/storage.objectCreator", CAPTURE]]}
+    assert "PASS bucket test-project-milo-register-archive: us-central1" in applied.stdout
+    again = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
+    assert again.returncode == 0
+    assert re.findall(r"^(CREATE|UPDATE|BIND) ", again.stdout, re.M) == []
+    assert json.loads((tmp_path / "storage.json").read_text()) == state
+    no_secret(plan.stdout, plan.stderr, applied.stdout, applied.stderr)
+
+
+def test_without_a_capture_account_the_worker_identity_is_the_one_granted(tmp_path):
+    tree, env = archive_tree(tmp_path)
+    tree.config.write_text(tree.config.read_text().replace(
+        "CAPTURE_SERVICE_ACCOUNT=capture@test-project.iam.gserviceaccount.com\n", ""))
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    state = json.loads((tmp_path / "storage.json").read_text())
+    assert state["bindings"][BUCKET] == [["roles/storage.objectCreator",
+                                         "serviceAccount:worker@test-project.iam.gserviceaccount.com"]]
+
+
+def test_the_check_reports_a_gap_without_a_bucket_name(tmp_path):
+    tree, env = archive_tree(tmp_path, bucket=None)
+    check = tree.run("setup-register-archive.sh", "--check", extra_env=env)
+    assert check.returncode == 0 and check.stdout.startswith("GAP REGISTER_ARCHIVE_BUCKET is not configured")
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 2
+
+
+def test_a_delete_capable_role_or_a_public_bucket_is_a_failure(tmp_path):
+    tree, env = archive_tree(tmp_path)
+    assert tree.run("setup-register-archive.sh", "--apply", extra_env=env).returncode == 0
+    path = tmp_path / "storage.json"
+    state = json.loads(path.read_text())
+    state["bindings"][BUCKET].append(["roles/storage.objectAdmin",
+                                      "serviceAccount:api@test-project.iam.gserviceaccount.com"])
+    path.write_text(json.dumps(state))
+    check = tree.run("setup-register-archive.sh", "--check", extra_env=env)
+    assert check.stdout.startswith("FAIL an application identity holds a delete-capable role")
+    assert "roles/storage.objectAdmin" in check.stdout
+    applied = tree.run("setup-register-archive.sh", "--apply", extra_env=env)
+    assert applied.returncode == 1 and "delete-capable" in applied.stderr
+    state["bindings"][BUCKET] = [["roles/storage.objectCreator", CAPTURE], ["roles/storage.objectViewer", "allUsers"]]
+    path.write_text(json.dumps(state))
+    assert tree.run("setup-register-archive.sh", "--check", extra_env=env).stdout.startswith(
+        "FAIL bucket test-project-milo-register-archive is not closed to the public")
+
+
+def test_the_preflight_reports_the_archive_as_a_gap_and_a_violation_as_blocked():
+    text = (Path(OPS).parents[1] / "scripts" / "deploy" / "production-preflight.sh").read_text()
+    block = text[text.index('ARCHIVE_CHECK="$('):text.index("# Gateway / frontend binding.")]
+    assert 'PASS\\ *) record_check PASS "storage:register-archive"' in block
+    assert 'FAIL\\ *) record_check BLOCKED "storage:register-archive"' in block
+    assert 'UNREADABLE\\ *) record_check WARN "storage:register-archive"' in block
+    assert '*) record_check WARN "storage:register-archive"' in block
+    # Placed with the capture identity's checks, and read-only.
+    assert text.index("iam:capture-cannot-read-provider-key") < text.index('ARCHIVE_CHECK="$(')
+    assert "--check" in block and "--apply" not in block.split("Remediation")[0]
+
+
+# =============================================================================
+# 2. retention
+# =============================================================================
+
+RETENTION_PSQL = """#!/usr/bin/env bash
+printf '%s\\n' "psql" >> "$OPS_TEST_CALLS"
+printf 'PRUNABLE cs1.a rows=5 estimated_bytes=1000\\nTOTAL snapshots=%s rows=5 estimated_bytes=1000\\nDIGEST %s\\n' \\
+  "${OPS_TEST_PRUNABLE:-1}" "$OPS_TEST_DIGEST"
+"""
+RETENTION_GCLOUD = """#!/usr/bin/env bash
+printf 'gcloud %s\\n' "$*" >> "$OPS_TEST_CALLS"
+case "$*" in
+  "auth list"*) echo owner@example.test ;;
+  "config get-value project"*) echo test-project ;;
+  "run jobs execute"*) echo milo-catalog-capture-abc12 ;;
+  "run jobs executions describe"*) printf 'Completed\\tTrue\\n' ;;
+  "logging read"*) echo "PRUNED snapshots=1 raw_records=5 candidates=3 (archive objects untouched)" ;;
+esac
+"""
+
+
+def retention_tree(tmp_path: Path) -> OpsTree:
+    tree = OpsTree(tmp_path)
+    tree.tool("psql", RETENTION_PSQL)
+    tree.tool("gcloud", RETENTION_GCLOUD)
+    return tree
+
+
+def test_the_dry_run_lists_read_only_and_names_the_digest(tmp_path):
+    tree = retention_tree(tmp_path)
+    result = tree.run("register-retention.sh", "--list", extra_env={"OPS_TEST_DIGEST": DIGEST})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "PRUNABLE cs1.a rows=5 estimated_bytes=1000" in result.stdout
+    assert f"digest={DIGEST}" in result.stdout
+    assert [c for c in tree.tool_calls() if not c.startswith("psql")] == [], "a dry run ran something else"
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_apply_with_another_digest_is_refused_before_the_job(tmp_path):
+    tree = retention_tree(tmp_path)
+    result = tree.run("register-retention.sh", "--apply", "--confirm", "PRUNE", "--digest", "e" * 64,
+                      extra_env={"OPS_TEST_DIGEST": DIGEST})
+    assert result.returncode == 1 and "CATALOG_PRUNE_DIGEST_MISMATCH" in result.stdout + result.stderr
+    assert not [c for c in tree.tool_calls() if "jobs execute" in c]
+
+
+def test_apply_prunes_through_the_capture_job_with_the_exact_digest(tmp_path):
+    tree = retention_tree(tmp_path)
+    result = tree.run("register-retention.sh", "--apply", "--confirm", "PRUNE", "--digest", DIGEST,
+                      extra_env={"OPS_TEST_DIGEST": DIGEST, "MILO_RETENTION_POLL_SECONDS": "0"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    (execute,) = [c for c in tree.tool_calls() if "jobs execute" in c]
+    assert "test-capture" in execute
+    assert f"--args=-m,backend.catalog.register.prune,--apply,--confirm,PRUNE,--digest,{DIGEST}" in execute
+    assert "SUMMARY|register-retention apply|PASS|snapshots=1 raw_records=5" in result.stdout
+    # Database rows only: no storage command is ever issued.
+    assert not [c for c in tree.tool_calls() if "storage" in c]
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_apply_needs_the_word_and_a_digest(tmp_path):
+    tree = retention_tree(tmp_path)
+    for args in (("--apply", "--confirm", "prune", "--digest", DIGEST), ("--apply", "--confirm", "PRUNE"),
+                 ("--list", "--digest", DIGEST)):
+        assert tree.run("register-retention.sh", *args, extra_env={"OPS_TEST_DIGEST": DIGEST}).returncode == 2
+    assert tree.tool_calls() == []
+
+
+def test_nothing_prunable_runs_no_job(tmp_path):
+    tree = retention_tree(tmp_path)
+    result = tree.run("register-retention.sh", "--apply", "--confirm", "PRUNE", "--digest", DIGEST,
+                      extra_env={"OPS_TEST_DIGEST": DIGEST, "OPS_TEST_PRUNABLE": "0"})
+    assert result.returncode == 0 and "nothing is prunable" in result.stdout
+    assert not [c for c in tree.tool_calls() if "jobs execute" in c]
+
+
+def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
+    doc = workflow("register-retention.yml")
+    inputs = triggers(doc)["workflow_dispatch"]["inputs"]
+    assert inputs["mode"]["default"] == "dry-run" and inputs["mode"]["options"] == ["dry-run", "apply"]
+    (job,) = doc["jobs"].values()
+    assert job["environment"] == "production"
+    first = steps(doc)[0]["run"]
+    assert '"${CONFIRM_INPUT}" != "PRUNE"' in first and "^[0-9a-f]{64}$" in first
+    last = steps(doc)[-1]
+    assert last["env"]["MILO_READONLY_DB_URL"] == "${{ secrets.MILO_READONLY_DB_URL }}"
+    assert "register-retention.sh --list" in last["run"] and "--apply --confirm" in last["run"]
+
+
+# =============================================================================
+# 3. the register-capture website stage
+# =============================================================================
+
+def test_the_register_stage_runs_the_canonical_tools_in_order(tmp_path):
+    tree = OpsTree(tmp_path)
+    tree.config.write_text(tree.config.read_text() + f"REGISTER_ARCHIVE_BUCKET={BUCKET}\n")
+    result = tree.run("website-stage.sh", "--stage", "register-capture", "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    plan = [line for line in result.stdout.splitlines() if line.startswith("DRY-RUN:")]
+    assert len(plan) == 2
+    assert "government-production-capture.sh" in plan[0] and "--ensure-job --enable-catalog-execution" in plan[0]
+    assert "website-execution-activate.sh" in plan[1] and "--apply-register-capture" in plan[1]
+    for marker in ("--apply-backend", "--apply-web-preparation", "--apply-plan-authoring",
+                   "MILO_ENABLE_RUN_CREATION=true", "GATEWAY_ALLOW_RUN_START_ROUTES"):
+        assert marker not in result.stdout
+    assert tree.tool_calls() == []
+    no_secret(result.stdout, result.stderr)
+
+
+def test_the_register_stage_needs_the_archive_bucket(tmp_path):
+    tree = OpsTree(tmp_path)
+    result = tree.run("website-stage.sh", "--stage", "register-capture", "--dry-run")
+    assert result.returncode == 2 and "REGISTER_ARCHIVE_BUCKET" in result.stdout + result.stderr
+
+
+def test_the_register_activation_gates_on_the_archive_and_reads_back():
+    text = (Path(OPS).parents[1] / "scripts" / "deploy" / "website-execution-activate.sh").read_text()
+    block = text[text.index('if [[ "$MODE" == "apply-register-capture" ]]'):text.index("# --apply-backend (Stage 2)")]
+    assert block.index("production-verify.sh") < block.index("setup-register-archive.sh")
+    assert block.index("setup-register-archive.sh") < block.index("ensure_job_binding")
+    assert block.index("ensure_job_binding") < block.index("gcloud run services update")
+    assert '"MILO_ENABLE_PAID_EXECUTION=${DISABLED}"' in block
+    assert "MILO_ENABLE_RUN_CREATION" not in block and "GATEWAY_ALLOW_RUN_START_ROUTES" not in block
+
+
+# =============================================================================
+# 4. REGISTER_COVERAGE in the gates
+# =============================================================================
+
+VERIFY_STUB = """#!/usr/bin/env bash
+echo "CODE_DEPLOYED=VERIFIED (stub)"
+echo "DATABASE_READY=VERIFIED (stub)"
+"""
+COVERAGE_PSQL = """#!/usr/bin/env bash
+printf '%s\\n' "psql $*" | sed 's/postgresql:[^ ]*/<url>/' >> "$OPS_TEST_CALLS"
+printf '{"register_version": "%s", "units_total": 10, "units_captured": 3, "rows_total": 1000, "rows_captured": 300, "unverified_snapshots": 0, "database_bytes": %s}\\n' "$(printf 'a%.0s' $(seq 64))" "$OPS_TEST_DB_BYTES"
+"""
+SERVICE_GCLOUD = """#!/usr/bin/env bash
+printf 'gcloud %s\\n' "$*" >> "$OPS_TEST_CALLS"
+case "$*" in
+  "run services describe"*) echo '{"spec":{"template":{"spec":{"containers":[{"env":[{"name":"MILO_DB_CAPACITY_BYTES","value":"500000000"}]}]}}}}' ;;
+esac
+"""
+
+
+def gates_tree(tmp_path: Path) -> OpsTree:
+    tree = OpsTree(tmp_path)
+    verify = tree.root / "scripts" / "deploy" / "production-verify.sh"
+    verify.write_text(VERIFY_STUB)
+    tree.tool("psql", COVERAGE_PSQL)
+    tree.tool("gcloud", SERVICE_GCLOUD)
+    return tree
+
+
+def test_register_coverage_is_informational_below_the_threshold(tmp_path):
+    tree = gates_tree(tmp_path)
+    result = tree.run("gates.sh", "--gate", "deployed", extra_env={"OPS_TEST_DB_BYTES": "120000000"})
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(l for l in result.stdout.splitlines() if l.startswith("REGISTER_COVERAGE="))
+    assert line.startswith("REGISTER_COVERAGE=INFO directory " + "a" * 64)
+    assert "units 3/10; rows 300/1000; database 120000000/400000000 bytes" in line
+    assert "unverified snapshots 0" in line
+    assert "SUMMARY|REGISTER_COVERAGE|INFO|directory" in result.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_register_coverage_fails_the_gate_above_the_threshold(tmp_path):
+    tree = gates_tree(tmp_path)
+    result = tree.run("gates.sh", "--gate", "deployed", extra_env={"OPS_TEST_DB_BYTES": "400000001"})
+    assert result.returncode == 1
+    assert "SUMMARY|REGISTER_COVERAGE|FAIL|" in result.stdout
+    assert "above the register capacity threshold" in result.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())

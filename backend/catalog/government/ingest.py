@@ -223,12 +223,20 @@ class GovernmentCatalogIngestor:
 
     def __init__(self, repository: Any, lease: WorkerLease, *, client: DataGovClient,
                  cancellation_checker: Callable[[], bool] | None = None,
-                 event_sink: Callable[[str, Mapping[str, Any]], None] | None = None) -> None:
+                 event_sink: Callable[[str, Mapping[str, Any]], None] | None = None,
+                 before_activation: Callable[[ResourceCapture, Mapping[str, Any]], None] | None = None
+                 ) -> None:
         self._repository = repository
         self._lease = lease
         self._client = client
         self._cancellation_checker = cancellation_checker
         self._event_sink = event_sink
+        #: PR-D1: called with the capture and the PENDING snapshot after every
+        #: row is written and before activation. It may refuse by raising,
+        #: which leaves the snapshot pending (inactive) -- the register capture
+        #: verifies the stored count and writes the archive here. None (every
+        #: other caller) changes nothing.
+        self._before_activation = before_activation
         #: This ingestion's per-phase measurements (`new_metrics`), reset by
         #: every `ingest_capture`.
         self._metrics: dict[str, Any] = new_metrics()
@@ -328,6 +336,9 @@ class GovernmentCatalogIngestor:
 
         records = self._write_records(capture, snapshot)
         candidates, rejected = self._write_candidates(normalization, records, snapshot)
+        if self._before_activation is not None:
+            self._check_cancelled()
+            self._before_activation(capture, snapshot)
         snapshot = self._activate(snapshot)
         return self._report(capture, snapshot, candidates=candidates, reused=False,
                             rejected=rejected, adopted_from=adopted_from)

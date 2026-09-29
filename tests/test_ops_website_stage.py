@@ -59,16 +59,16 @@ def assert_no_stage2(text: str) -> None:
 # 1. the workflows
 # =============================================================================
 
-def test_website_stage_workflow_offers_exactly_the_three_stages_and_validates_them():
+def test_website_stage_workflow_offers_exactly_the_four_stages_and_validates_them():
     doc = workflow("website-stage.yml")
     inputs = triggers(doc)["workflow_dispatch"]["inputs"]
     assert inputs["stage"]["type"] == "choice"
-    assert inputs["stage"]["options"] == ["both", "plan-authoring", "web-preparation"]
+    assert inputs["stage"]["options"] == ["both", "plan-authoring", "web-preparation", "register-capture"]
     assert inputs["dry_run"]["type"] == "boolean" and inputs["dry_run"]["default"] is False
     assert inputs["sha"]["required"] is False
     first = steps(doc)[0]
     assert first["env"]["STAGE_INPUT"] == "${{ inputs.stage }}"
-    assert "plan-authoring | web-preparation | both) ;;" in first["run"]
+    assert "plan-authoring | web-preparation | both | register-capture) ;;" in first["run"]
     assert "refs/heads/main" in first["run"] and "^[0-9a-f]{40}$" in first["run"]
     assert doc["concurrency"] == {"group": "milo-production-operations", "cancel-in-progress": False}
     (job,) = doc["jobs"].values()
@@ -146,7 +146,7 @@ def test_website_stage_refuses_an_unknown_stage(tmp_path, bad):
     tree = OpsTree(tmp_path)
     result = tree.run("website-stage.sh", "--stage", bad, "--dry-run")
     assert result.returncode == 2
-    assert "--stage must be plan-authoring, web-preparation, both or none" in result.stderr
+    assert "--stage must be plan-authoring, web-preparation, both, register-capture or none" in result.stderr
     assert tree.tool_calls() == []
     assert tree.run("website-stage.sh", "--dry-run").returncode == 2
 

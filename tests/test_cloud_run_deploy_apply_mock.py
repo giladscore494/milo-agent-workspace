@@ -76,6 +76,10 @@ EXECUTION_FLAGS = (
     # E': the website's Prepare route (API only): pinned false on both product
     # surfaces like every other Stage A execution flag.
     "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS",
+    # PR-D1: register capture (API) and the capture job's register switch:
+    # pinned false on both product surfaces like every other Stage A flag.
+    "MILO_ENABLE_REGISTER_CAPTURE",
+    "MILO_ENABLE_REGISTER_CAPTURE_JOB",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

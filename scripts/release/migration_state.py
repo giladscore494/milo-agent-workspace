@@ -96,6 +96,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20260927000100": ("table", "catalog_variant_coverage"),
     # E' web preparation requests.
     "20260928000100": ("table", "catalog_work_scope_preparation_requests"),
+    # PR-D1 register capture, capacity, retention and archive.
+    "20260929000100": ("table", "catalog_register_capture_units"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

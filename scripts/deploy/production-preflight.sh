@@ -269,6 +269,23 @@ if [[ -n "$CAPTURE_SA" ]]; then
   fi
 fi
 
+# PR-D1: the register archive bucket and the capture identity's create-only
+# grant on it (scripts/ops/setup-register-archive.sh --check, read-only).
+# Until the operator sets it up this is a GAP (WARN): register capture refuses
+# without it and the deploy does not depend on it. A bucket open to the public
+# or an application identity with a delete-capable role on it is BLOCKED.
+ARCHIVE_CHECK="$(bash "${REPO_ROOT}/scripts/ops/setup-register-archive.sh" --check \
+  --operator-config "$CONFIG_PATH" 2> /dev/null || printf 'UNREADABLE the check did not run')"
+case "$ARCHIVE_CHECK" in
+  PASS\ *) record_check PASS "storage:register-archive" "${ARCHIVE_CHECK#PASS }" ;;
+  FAIL\ *) record_check BLOCKED "storage:register-archive" \
+       "${ARCHIVE_CHECK#FAIL } Remediation: bash scripts/ops/setup-register-archive.sh --plan" ;;
+  UNREADABLE\ *) record_check WARN "storage:register-archive" \
+       "not verifiable with this identity (${ARCHIVE_CHECK#UNREADABLE }). Verify from Cloud Shell: bash scripts/ops/setup-register-archive.sh --check" ;;
+  *) record_check WARN "storage:register-archive" \
+       "${ARCHIVE_CHECK#* } Remediation: bash scripts/ops/setup-register-archive.sh --apply" ;;
+esac
+
 # Gateway / frontend binding. The Vercel gateway reaches the API through
 # workload identity federation, so the API URL and the impersonated identity
 # both have to be known before the website can talk to the backend at all.

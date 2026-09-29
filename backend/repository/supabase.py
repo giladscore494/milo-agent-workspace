@@ -242,6 +242,21 @@ class Repository(Protocol):
     def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]: ...
     def record_work_scope_preparation_trigger(self, request_id: Any, attempt: int, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]: ...
     def work_scope_preparation_state(self, work_scope_id: UUID, revision: int, digest: str) -> dict[str, Any] | None: ...
+    # PR-D1: register capture.
+    def record_register_directory(self, resource_id: str, fetched_at: str, units: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def latest_register_directory(self) -> dict[str, Any] | None: ...
+    def request_register_capture(self, register_version: str, tozars: list[str], requested_by: UUID, *, group_max_rows: int, capacity_limit_bytes: int, bytes_per_row: int, grace_seconds: int) -> dict[str, Any]: ...
+    def record_register_capture_trigger(self, group_id: Any, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]: ...
+    def register_capture_group(self, group_id: Any) -> dict[str, Any]: ...
+    def register_capture_groups(self, group_ids: list[str]) -> list[dict[str, Any]]: ...
+    def register_capture_units(self) -> list[dict[str, Any]]: ...
+    def record_register_unit_status(self, run_id: UUID, unit_id: str, status: str, failure_code: str | None, snapshot_id: str | None, api_total: int | None, captured_rows: int | None, count_verified: bool | None, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def record_register_snapshot_archive(self, run_id: UUID, snapshot_id: str, gcs_uri: str, byte_size: int, sha256: str, line_count: int, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def register_snapshot_archive(self, snapshot_id: str) -> dict[str, Any] | None: ...
+    def count_catalog_raw_records(self, snapshot_id: str) -> int: ...
+    def catalog_database_bytes(self) -> int: ...
+    def prunable_register_snapshots(self) -> list[dict[str, Any]]: ...
+    def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]: ...
     def acquire_catalog_variant_reservations(self, run_id: UUID, level: str, candidate_ids: list[str], *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def catalog_variant_reservations_settling(self, *, limit: int = 50) -> list[dict[str, Any]]: ...
 
@@ -2357,6 +2372,125 @@ class SupabaseRepository:
         if isinstance(data, list):
             data = data[0] if data else None
         return data
+
+    # ------------------------------------------------------------------
+    # PR-D1: register capture (migration 20260929000100). Every function is
+    # named literally at its call so the release inventory sees each one.
+    # ------------------------------------------------------------------
+    _REGISTER_REFUSALS = ("CATALOG_REGISTER_VERSION_STALE", "CATALOG_REGISTER_UNIT_UNKNOWN",
+                          "CATALOG_REGISTER_GROUP_TOO_LARGE", "CATALOG_REGISTER_REQUEST_INVALID",
+                          "CATALOG_REGISTER_TRIGGER_CONFLICT", "CATALOG_REGISTER_UNIT_NOT_THIS_RUN",
+                          "CATALOG_REGISTER_CAPTURE_UNVERIFIED", "CATALOG_CAPTURE_COUNT_MISMATCH",
+                          "CATALOG_ARCHIVE_CONFLICT", "CATALOG_REGISTER_DIRECTORY_INVALID",
+                          "CATALOG_PRUNE_DIGEST_MISMATCH", "CATALOG_PRUNE_REQUEST_INVALID")
+    _CAPACITY_REFUSAL = re.compile(r"CATALOG_CAPACITY_THRESHOLD_EXCEEDED: current=(\d+) projected=(\d+) limit=(\d+)")
+
+    def record_register_directory(self, resource_id: str, fetched_at: str, units: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._guarded_rpc("record_register_directory", {
+            "p_resource_id": str(resource_id), "p_fetched_at": str(fetched_at), "p_units": list(units)},
+            "register directory", refusals=self._REGISTER_REFUSALS)
+
+    def latest_register_directory(self) -> dict[str, Any] | None:
+        versions = self._many(self.client.table("catalog_register_directory_versions").select("*")
+                              .order("created_at", desc=True).order("id", desc=True).limit(1))
+        if not versions:
+            return None
+        version = versions[0]
+        units = self._many(self.client.table("catalog_register_directory_units")
+                           .select("tozar,expected_rows").eq("version_id", str(version["id"]))
+                           .order("tozar").limit(5000))
+        return {"version": version, "units": units}
+
+    def request_register_capture(self, register_version: str, tozars: list[str], requested_by: UUID, *, group_max_rows: int, capacity_limit_bytes: int, bytes_per_row: int, grace_seconds: int) -> dict[str, Any]:
+        try:
+            data = self.client.rpc("request_register_capture", {
+                "p_register_version": str(register_version), "p_tozars": [str(t) for t in tozars],
+                "p_requested_by": str(requested_by), "p_group_max_rows": int(group_max_rows),
+                "p_capacity_limit_bytes": int(capacity_limit_bytes), "p_bytes_per_row": int(bytes_per_row),
+                "p_grace_seconds": int(grace_seconds)}).execute().data
+        except Exception as exc:
+            text = str(exc)
+            capacity = self._CAPACITY_REFUSAL.search(text)
+            if capacity:
+                current, projected, limit = capacity.groups()
+                raise AppError("CATALOG_CAPACITY_THRESHOLD_EXCEEDED",
+                               f"current={current} projected={projected} limit={limit}", 409) from None
+            for marker in self._REGISTER_REFUSALS:
+                if marker in text:
+                    raise AppError(marker, "the database refused this register request", 409) from None
+            raise AppError("REPOSITORY_ERROR", "register capture request failed", 502) from None
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, dict) or data.get("decision") not in ("claimed", "existing"):
+            raise AppError("REPOSITORY_ERROR", "register capture request returned an unreadable row", 502)
+        return data
+
+    def record_register_capture_trigger(self, group_id: Any, *, run_id: Any, trigger_state: str, execution_name: str | None) -> dict[str, Any]:
+        return self._guarded_rpc("record_register_capture_trigger", {
+            "p_group_id": str(group_id), "p_run_id": None if run_id is None else str(run_id),
+            "p_trigger_state": str(trigger_state), "p_execution_name": execution_name},
+            "register capture trigger", refusals=self._REGISTER_REFUSALS)
+
+    def register_capture_group(self, group_id: Any) -> dict[str, Any]:
+        groups = self._many(self.client.table("catalog_register_capture_groups").select("*")
+                            .eq("id", str(group_id)).limit(1))
+        units = self._many(self.client.table("catalog_register_capture_units").select("*")
+                           .eq("group_id", str(group_id)).order("tozar").limit(1000))
+        return {"group": groups[0] if groups else None, "units": units}
+
+    def register_capture_groups(self, group_ids: list[str]) -> list[dict[str, Any]]:
+        if not group_ids:
+            return []
+        return self._many(self.client.table("catalog_register_capture_groups").select("*")
+                          .in_("id", [str(g) for g in group_ids][:1000]).limit(1000))
+
+    def register_capture_units(self) -> list[dict[str, Any]]:
+        return self._many(self.client.table("catalog_register_capture_units").select("*")
+                          .order("updated_at", desc=True).limit(10000))
+
+    def record_register_unit_status(self, run_id: UUID, unit_id: str, status: str, failure_code: str | None, snapshot_id: str | None, api_total: int | None, captured_rows: int | None, count_verified: bool | None, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        return self._guarded_rpc("record_register_unit_status", {
+            "p_run_id": str(run_id), "p_worker_id": worker_id, "p_attempt": int(attempt),
+            "p_lease_token": lease_token, "p_unit_id": str(unit_id), "p_status": str(status),
+            "p_failure_code": failure_code, "p_snapshot_id": snapshot_id, "p_api_total": api_total,
+            "p_captured_rows": captured_rows, "p_count_verified": count_verified},
+            "register capture unit", refusals=self._REGISTER_REFUSALS)
+
+    def record_register_snapshot_archive(self, run_id: UUID, snapshot_id: str, gcs_uri: str, byte_size: int, sha256: str, line_count: int, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        return self._guarded_rpc("record_register_snapshot_archive", {
+            "p_run_id": str(run_id), "p_worker_id": worker_id, "p_attempt": int(attempt),
+            "p_lease_token": lease_token, "p_snapshot_id": str(snapshot_id), "p_gcs_uri": str(gcs_uri),
+            "p_byte_size": int(byte_size), "p_sha256": str(sha256), "p_line_count": int(line_count)},
+            "register snapshot archive", refusals=self._REGISTER_REFUSALS)
+
+    def register_snapshot_archive(self, snapshot_id: str) -> dict[str, Any] | None:
+        rows = self._many(self.client.table("catalog_register_snapshot_archives").select("*")
+                          .eq("snapshot_id", str(snapshot_id)).limit(1))
+        return rows[0] if rows else None
+
+    def count_catalog_raw_records(self, snapshot_id: str) -> int:
+        answer = (self.client.table("catalog_raw_records").select("id", count=CountMethod.exact)
+                  .eq("snapshot_id", str(snapshot_id)).limit(1).execute())
+        if not isinstance(answer.count, int):
+            raise AppError("REPOSITORY_ERROR", "raw record count is unreadable", 502)
+        return int(answer.count)
+
+    def catalog_database_bytes(self) -> int:
+        data = self.client.rpc("catalog_register_database_bytes", {}).execute().data
+        if isinstance(data, list):
+            data = data[0] if data else None
+        if not isinstance(data, int) or isinstance(data, bool) or data < 0:
+            raise AppError("REPOSITORY_ERROR", "database size is unreadable", 502)
+        return data
+
+    def prunable_register_snapshots(self) -> list[dict[str, Any]]:
+        data = self.client.rpc("catalog_register_prunable_snapshots", {}).execute().data
+        return list(data or [])
+
+    def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]:
+        return self._guarded_rpc("prune_register_snapshots", {
+            "p_snapshot_keys": [str(k) for k in snapshot_keys], "p_digest": str(digest)},
+            "register prune", refusals=self._REGISTER_REFUSALS)
 
     def request_work_scope_preparation(self, work_scope_id: UUID, revision: int, digest: str, requested_by: UUID, *, grace_seconds: int) -> dict[str, Any]:
         """Claim (or be answered with) the ONE preparation request of a revision."""

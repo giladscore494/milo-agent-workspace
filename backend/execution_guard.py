@@ -62,6 +62,8 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_WORK_SCOPE_BATCHES", re.compile(rf"^/work-scopes/{_SEGMENT}/(pause|resume)/?$"), "work scope pause and resume"),
     # E': preparing ONE plan revision from the website executes the capture job.
     ("POST", "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS", re.compile(rf"^/work-scopes/{_SEGMENT}/preparations/?$"), "work scope preparation"),
+    # PR-D1: register capture and the directory refresh execute the capture job.
+    ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/(captures|directory)/?$"), "register capture"),
 )
 
 

@@ -378,6 +378,39 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_REGISTER_CAPTURE",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO — it lets a project member capture the Government register per "
+            "exact tozar from the website's Register page ($0, not a run)"),
+        when_to_enable=(
+            "After the release is deployed, the register archive bucket is set up "
+            "and the capture job is ensured on the release image "
+            "(website-execution-activate.sh --apply-register-capture)"),
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "GET /projects/{id}/register answers 404 and the Register page is not "
+            "shown; POST /projects/{id}/register/(captures|directory) is rejected "
+            "by the surface guard (403). Nothing is captured."),
+        stage=2,
+    ),
+    Gate(
+        name="MILO_ENABLE_REGISTER_CAPTURE_JOB",
+        surface=WORKER_RUNTIME,
+        current_default="false",
+        required_for_first_run="NO — only for a register capture or directory refresh",
+        when_to_enable=(
+            "Never on a service or a job definition. The API's register "
+            "invocation turns it on for ONE capture-job execution"),
+        requires_redeploy=UPDATE_JOB,
+        failure_behavior_when_off=(
+            "The capture entrypoint refuses the register modes "
+            "(CAPTURE_REGISTER_CAPTURE_DISABLED) before any transport or "
+            "repository exists."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_RUN_CANCELLATION",
         surface=API_RUNTIME,
         current_default="false",

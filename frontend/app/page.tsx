@@ -66,6 +66,7 @@ import { ComposerRoute, TaskComposer } from '@/components/conversation/TaskCompo
 import { InspectorTab, RunInspector } from '@/components/inspector/RunInspector';
 import { WorkflowProposalPanel } from '@/components/proposals/WorkflowProposalPanel';
 import { MappingPlanPanel } from '@/components/scope/MappingPlanPanel';
+import { RegisterPanel } from '@/components/register/RegisterPanel';
 import { FinalResultPanel } from '@/components/result/FinalResultPanel';
 import { RunExportControl } from '@/components/result/RunExportControl';
 import { VehicleCatalogResultPanel } from '@/components/result/VehicleCatalogResultPanel';
@@ -1522,6 +1523,10 @@ export default function WorkspacePage() {
           onSelect={selectHistoricalRun}
           onRetry={() => { if (activeConversation) loadRunHistory(activeConversation.id, scope.current, false); }}
         />
+        {/* PR-D1 — the Register page. It renders only while the server has
+            register capture on (its read answers 404 otherwise), independently
+            of `executionUi`: capture is $0 and is not a run. */}
+        <RegisterPanel projectId={selectedProject?.id} conversationId={activeConversation?.id} />
         {/* CODE-3 — durable catalog state, not run state. It is shown for any
             selected project regardless of `executionUi`: the execution UI flag
             hides EXECUTION controls, and there are none here. Hiding a

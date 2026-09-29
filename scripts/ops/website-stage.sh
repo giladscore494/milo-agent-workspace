@@ -15,6 +15,14 @@
 #                    both before it starts anything
 #                    (website-execution-activate.sh --apply-web-preparation)
 #   both             the two above, in that order
+#   register-capture PR-D1, the Register page: the capture job on the release
+#                    image (government-production-capture.sh --ensure-job
+#                    --enable-catalog-execution, which also sets the archive
+#                    bucket on the job), then MILO_ENABLE_REGISTER_CAPTURE on
+#                    the API with the same job bindings as E', read back
+#                    (website-execution-activate.sh --apply-register-capture).
+#                    Refused until scripts/ops/setup-register-archive.sh has
+#                    run. Not part of `both`: it is its own decision.
 #   none             nothing
 #
 # Every step is the canonical tool, unchanged, behind its own gate
@@ -34,12 +42,12 @@ source "${SCRIPT_DIR}/common.sh"
 STAGE="" STEP_PREFIX="" HEADER=1
 usage() {
   cat << 'EOF'
-Usage: website-stage.sh --stage plan-authoring|web-preparation|both|none [--dry-run]
+Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|none [--dry-run]
                         [--operator-config <path>] [--step-prefix <n>] [--no-header]
 
-Turns the website's plan authoring (Stage P) and/or its Prepare button (E')
-on through the canonical activation tools. Never Stage 2. --dry-run calls
-nothing.
+Turns the website's plan authoring (Stage P) and/or its Prepare button (E'),
+or its Register page (register-capture), on through the canonical activation
+tools. Never Stage 2. --dry-run calls nothing.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -54,8 +62,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$STAGE" in
-  plan-authoring | web-preparation | both | none) ;;
-  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both or none\n' >&2; usage >&2; exit 2 ;;
+  plan-authoring | web-preparation | both | register-capture | none) ;;
+  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture or none\n' >&2; usage >&2; exit 2 ;;
 esac
 [[ -z "$STEP_PREFIX" || "$STEP_PREFIX" =~ ^[0-9]{1,2}$ ]] \
   || { printf 'FAIL: --step-prefix must be a step number\n' >&2; exit 2; }
@@ -67,7 +75,7 @@ if [[ "$STAGE" != "none" ]]; then
   milo_require_op SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
     PRODUCTION_ORIGIN MILO_WORKER_AUDIENCE || exit 2
 fi
-if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" ]]; then
+if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "register-capture" ]]; then
   milo_require_op CLOUD_RUN_CAPTURE_JOB API_SERVICE_ACCOUNT ARTIFACT_REGISTRY_REPOSITORY \
     SUPABASE_PROJECT_REF SECRET_SUPABASE_URL SECRET_SUPABASE_SERVICE_KEY || exit 2
 fi
@@ -114,6 +122,17 @@ if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" ]]; then
     "E' (the Prepare button): the API identity reads the capture and worker jobs (${MILO_API_JOB_READ_ROLE}, read back); MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API; paid execution and preparation read back OFF" \
     "E' was not applied (above); the Prepare button stays off" \
     "${activate[@]}" --apply-web-preparation
+fi
+if [[ "$STAGE" == "register-capture" ]]; then
+  milo_require_op REGISTER_ARCHIVE_BUCKET || exit 2
+  run_step "$(step_name 2 b capture-job)" \
+    "the capture job on the release image ${release:0:12}, with the register archive bucket" \
+    "the capture job was not ensured (above); the Register page stays off" \
+    "${capture[@]}" --ensure-job --enable-catalog-execution
+  run_step "$(step_name 3 c register-capture)" \
+    "PR-D1 (the Register page): the register archive read back; the API identity runs and reads the capture job; MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
+    "register capture was not applied (above); the Register page stays off" \
+    "${activate[@]}" --apply-register-capture
 fi
 
 # Inside a deploy (--no-header) the deploy writes the closing note.

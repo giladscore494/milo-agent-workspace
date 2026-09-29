@@ -22,6 +22,12 @@ export class ApiError extends Error {
     public status: number,
     public code: string,
     message: string,
+    /**
+     * PR-D1: the capacity numbers of a CATALOG_CAPACITY_THRESHOLD_EXCEEDED
+     * refusal (`error.capacity`), unparsed. Only `lib/register.ts` reads it,
+     * through its own validator; nothing renders it raw.
+     */
+    public details?: unknown,
   ) {
     super(message);
   }
@@ -52,14 +58,16 @@ async function request<T>(
   if (!response.ok) {
     let code = `HTTP_${response.status}`;
     let message = `Request failed with status ${response.status}.`;
+    let details: unknown;
     try {
       const body = await response.json();
       code = body?.error?.code ?? code;
       message = body?.error?.message ?? body?.error ?? message;
+      details = body?.error?.capacity;
     } catch {
       // Non-JSON error bodies are never surfaced raw to the UI.
     }
-    throw new ApiError(response.status, code, String(message));
+    throw new ApiError(response.status, code, String(message), details);
   }
 
   return parse(await response.text()) as T;
@@ -278,6 +286,28 @@ export const api = {
     request<unknown>(`/work-scopes/${workScopeId}/preparations`, {
       method: 'POST',
       body: JSON.stringify({ expected_revision: head.revision, expected_digest: head.digest }),
+    }),
+};
+
+/**
+ * PR-D1: the Register page. The read answers 404 while register capture is
+ * off on the server (the page then does not exist); the two writes execute
+ * the capture job and answer 202 when one started, 200 when an existing
+ * request or snapshot answers instead.
+ */
+export const registerApi = {
+  register: (projectId: string) => request<unknown>(`/projects/${projectId}/register`),
+
+  requestCapture: (projectId: string, registerVersion: string, tozars: string[], conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/captures`, {
+      method: 'POST',
+      body: JSON.stringify({ register_version: registerVersion, tozars, conversation_id: conversationId }),
+    }),
+
+  requestDirectory: (projectId: string, conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/directory`, {
+      method: 'POST',
+      body: JSON.stringify({ conversation_id: conversationId }),
     }),
 };
 

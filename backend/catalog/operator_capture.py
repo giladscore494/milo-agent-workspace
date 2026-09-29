@@ -201,6 +201,9 @@ from backend.run_identity import (
 )
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
+from backend.catalog.register.capture import (REGISTER_CAPTURE_REASONS, RegisterCaptureError,
+                                              capture_group as register_capture_group,
+                                              refresh_directory as register_refresh_directory)
 
 #: How this entrypoint names itself in its own report and in documentation.
 CAPTURE_ENTRYPOINT = "catalog.government.capture"
@@ -280,6 +283,14 @@ EXIT_REFUSED = 2
 #: it for ONE execution (`government-production-capture.sh
 #: --prepare-work-scope`), so preparing is a recorded decision, never a default.
 WORK_SCOPE_PREPARATION_FLAG = "MILO_ENABLE_WORK_SCOPE_PREPARATION"
+#: PR-D1: the per-execution switch of the register modes (set only by the
+#: API's invocation, backend/capture_invocation.py REGISTER_SWITCH).
+REGISTER_CAPTURE_JOB_FLAG = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
+#: The register modes' arguments: one of the two, never both.
+REGISTER_ARGUMENTS: tuple[tuple[str, str], ...] = (
+    ("register_group_id", "--register-group-id"),
+    ("register_directory", "--register-directory"),
+)
 #: The three arguments of the scoped mode. All three or none.
 WORK_SCOPE_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("work_scope_id", "--work-scope-id"),
@@ -386,6 +397,11 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "scoped preparation needs a plan id, a whole revision number and its digest, together",
     "CAPTURE_WORK_SCOPE_PREPARATION_DISABLED":
         "scoped work-scope preparation is not enabled for this process",
+    # PR-D1: the register modes (directory refresh, group capture).
+    "CAPTURE_REGISTER_ARGUMENTS_INVALID":
+        "register capture needs exactly one of a group id (a UUID) or a directory refresh",
+    "CAPTURE_REGISTER_CAPTURE_DISABLED":
+        "register capture is not enabled for this execution",
 }
 
 
@@ -406,7 +422,8 @@ def safe_message(reason_code: str) -> str:
     """
     for vocabulary in (CAPTURE_REASONS, GOVERNMENT_SOURCE_REASONS,
                        GOVERNMENT_INGESTION_REASONS, WORK_SCOPE_PREPARATION_REASONS,
-                       WORK_SCOPE_REPOSITORY_REASONS, CAPTURE_SCOPE_REASONS):
+                       WORK_SCOPE_REPOSITORY_REASONS, CAPTURE_SCOPE_REASONS,
+                       REGISTER_CAPTURE_REASONS):
         if reason_code in vocabulary:
             return vocabulary[reason_code]
     return CAPTURE_REASONS["CAPTURE_UNEXPECTED_FAILURE"]
@@ -527,6 +544,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--execute only: the plan revision to prepare; must be its head")
     parser.add_argument("--work-scope-digest", default=None,
                         help="--execute only: that revision's digest; a stale one refuses")
+    parser.add_argument("--register-group-id", default=None,
+                        help="--execute only: capture this register capture group (PR-D1)")
+    parser.add_argument("--register-directory", action="store_true", default=None,
+                        help="--execute only: refresh the register directory (PR-D1)")
     parser.add_argument("--report-path", default=None,
                         help="optional path for the sanitized report; the only file written")
     return parser
@@ -613,7 +634,7 @@ CAPTURE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("page_limit", "--page-limit"),
     ("max_pages", "--max-pages"),
     ("max_records", "--max-records"),
-) + WORK_SCOPE_ARGUMENTS
+) + WORK_SCOPE_ARGUMENTS + REGISTER_ARGUMENTS
 PREPARE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("conversation_id", "--conversation-id"),
     ("requested_by", "--requested-by"),
@@ -692,7 +713,30 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
             return "CAPTURE_WORK_SCOPE_ARGUMENTS_INVALID"
         if (env.get(WORK_SCOPE_PREPARATION_FLAG) or "").strip().lower() not in TRUE_VALUES:
             return "CAPTURE_WORK_SCOPE_PREPARATION_DISABLED"
+    if _supplied(args, REGISTER_ARGUMENTS):
+        # One mode per execution: a register mode beside a plan is a
+        # contradiction, and so are both register modes at once.
+        if _supplied(args, WORK_SCOPE_ARGUMENTS):
+            return "CAPTURE_MODE_CONTRADICTORY"
+        if _register_request(args) is None:
+            return "CAPTURE_REGISTER_ARGUMENTS_INVALID"
+        if (env.get(REGISTER_CAPTURE_JOB_FLAG) or "").strip().lower() not in TRUE_VALUES:
+            return "CAPTURE_REGISTER_CAPTURE_DISABLED"
     return ""
+
+
+def _register_request(args: argparse.Namespace) -> tuple[str, str] | None:
+    """("group", id) or ("directory", "") -- or None when malformed. Pure."""
+    group = getattr(args, "register_group_id", None)
+    directory = getattr(args, "register_directory", None)
+    if group is not None and directory is not None:
+        return None
+    if directory is not None:
+        return ("directory", "") if directory is True else None
+    try:
+        return ("group", str(UUID(str(group))))
+    except (TypeError, ValueError):
+        return None
 
 
 def _work_scope_request(args: argparse.Namespace) -> tuple[UUID, int, str] | None:
@@ -1165,6 +1209,9 @@ def _classify(failure: BaseException) -> str:
     if isinstance(failure, CaptureScopeError):
         if failure.reason_code in CAPTURE_SCOPE_REASONS:
             return failure.reason_code
+    if isinstance(failure, RegisterCaptureError):
+        if failure.reason_code in REGISTER_CAPTURE_REASONS:
+            return failure.reason_code
     if isinstance(failure, AppError):
         # The preparation's own refusals are static codes the repository layer
         # already mapped.
@@ -1436,6 +1483,17 @@ def _preparation_document(run_id: UUID, *, already_prepared: bool) -> dict[str, 
     }
 
 
+def _open_archive_writer(env: Mapping[str, str]) -> Any:
+    """The register archive writer, or None when no bucket is configured
+    (every unit then fails with CATALOG_ARCHIVE_NOT_CONFIGURED -- never an
+    unarchived activation)."""
+    from backend.catalog.register import config as register_config
+    from backend.catalog.register.archive import GcsArchiveWriter
+
+    bucket = register_config.load(env).archive_bucket
+    return GcsArchiveWriter(bucket) if bucket else None
+
+
 def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dict[str, Any]]:
     """The authorized path. Every prerequisite has already passed."""
     # Already validated by `_refusal`, which every caller evaluates first.
@@ -1517,13 +1575,26 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
 
     # Already validated by `_refusal`: None for the whole-resource capture.
     scoped = _work_scope_request(args)
+    register = _register_request(args) if _supplied(args, REGISTER_ARGUMENTS) else None
     preparation: WorkScopePreparation | None = None
+    register_document: dict[str, Any] | None = None
     supervisor.start()
     try:
         client = DataGovClient(_open_transport(), page_limit=CAPTURE_PAGE_LIMIT,
                                max_pages=CAPTURE_MAX_PAGES, max_records=CAPTURE_MAX_RECORDS,
                                cancellation_checker=supervisor.should_stop)
-        if scoped is not None:
+        if register is not None and register[0] == "directory":
+            # PR-D1: the register directory (metadata reads only).
+            register_document = {"directory": register_refresh_directory(
+                repository, client=client, env=env)}
+        elif register is not None:
+            # PR-D1: one register capture group, each unit its own snapshot.
+            register_document = {"group": register_capture_group(
+                repository, lease, client=client, group_id=register[1],
+                archive_writer=_open_archive_writer(env),
+                cancellation_checker=supervisor.should_stop,
+                event_sink=record_event).as_document()}
+        elif scoped is not None:
             # Scoped catalog PR2: prepare ONE exact plan revision. Each unit is
             # a scoped capture of the same pinned resource under the same
             # client, lease and bounds; `prepare_work_scope` never widens any.
@@ -1551,6 +1622,9 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_FAILED, _envelope("failed", reason)
     supervisor.stop()
 
+    if register_document is not None:
+        _finalize(repository, lease, document=register_document, reason_code="", cancelled=False)
+        return EXIT_OK, _envelope("succeeded", "", register=register_document)
     if preparation is not None:
         prepared = work_scope_document(preparation)
         _finalize(repository, lease, document=prepared, reason_code="", cancelled=False)
