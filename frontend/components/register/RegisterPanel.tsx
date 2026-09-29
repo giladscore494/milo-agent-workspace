@@ -1,6 +1,6 @@
 'use client';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, registerApi } from '@/lib/api';
+import { api } from '@/lib/api';
 import {
   REGISTER_CAPTURE_FALLBACK,
   REGISTER_DIRECTORY_FALLBACK,
@@ -28,6 +28,14 @@ export type RegisterClient = {
   requestDirectory: (projectId: string, conversationId: string) => Promise<unknown>;
 };
 
+/** The workspace's own API client, read at call time. */
+const defaultClient: RegisterClient = {
+  register: (projectId) => api.register(projectId),
+  requestCapture: (projectId, version, tozars, conversationId) =>
+    api.requestRegisterCapture(projectId, version, tozars, conversationId),
+  requestDirectory: (projectId, conversationId) => api.requestRegisterDirectory(projectId, conversationId),
+};
+
 export type RegisterPanelProps = {
   /** The selected project; nothing is read without one. */
   projectId?: string;
@@ -39,8 +47,7 @@ export type RegisterPanelProps = {
 type Loaded =
   | { kind: 'idle' }
   | { kind: 'hidden' }
-  | { kind: 'error'; message: string }
-  | { kind: 'ready'; view: RegisterView };
+  | { kind: 'ready'; view: RegisterView; message?: string };
 
 /**
  * PR-D1 — the Register page: the Government register's directory (every
@@ -54,7 +61,7 @@ type Loaded =
  * larger than the cap is captured alone. Every state shown comes from the
  * server's durable rows, read again after every action.
  */
-export function RegisterPanel({ projectId, conversationId, client = registerApi }: RegisterPanelProps) {
+export function RegisterPanel({ projectId, conversationId, client = defaultClient }: RegisterPanelProps) {
   const [loaded, setLoaded] = useState<Loaded>({ kind: 'idle' });
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
@@ -68,20 +75,24 @@ export function RegisterPanel({ projectId, conversationId, client = registerApi 
 
   const load = useCallback(async (project: string) => {
     const mine = ++generation.current;
+    let view: RegisterView | undefined;
+    let failure: unknown;
     try {
-      const view = parseRegister(await client.register(project));
-      if (mine !== generation.current) return;
-      setLoaded(view === undefined ? { kind: 'error', message: REGISTER_READ_FALLBACK } : { kind: 'ready', view });
+      view = parseRegister(await client.register(project));
     } catch (error) {
-      if (mine !== generation.current) return;
-      // 404: register capture is off on this server (or the server predates
-      // it), so the page does not exist.
-      if (error instanceof ApiError && error.status === 404) {
-        setLoaded({ kind: 'hidden' });
-      } else {
-        setLoaded({ kind: 'error', message: safeErrorText(error, REGISTER_READ_FALLBACK) });
-      }
+      failure = error;
     }
+    if (mine !== generation.current) return;
+    setLoaded((previous) => {
+      if (view !== undefined) return { kind: 'ready', view };
+      // The page exists only once the server has answered it: a first read
+      // that fails -- 404 while register capture is off, a server that
+      // predates it, or any other failure -- shows nothing at all.
+      if (previous.kind !== 'ready') return { kind: 'hidden' };
+      // A later read that fails keeps the last answer and says so.
+      return { ...previous, message: failure === undefined ? REGISTER_READ_FALLBACK
+        : safeErrorText(failure, REGISTER_READ_FALLBACK) };
+    });
   }, [client]);
 
   useEffect(() => {
@@ -96,7 +107,7 @@ export function RegisterPanel({ projectId, conversationId, client = registerApi 
 
   if (!projectId || loaded.kind === 'hidden' || loaded.kind === 'idle') return null;
 
-  const view = loaded.kind === 'ready' ? loaded.view : undefined;
+  const view = loaded.view;
   const version = view?.directory?.registerVersion;
   const selectedUnits = view ? view.units.filter((item) => selected.has(item.tozar)) : [];
   const canAct = view !== undefined && view.canCapture && conversationId !== undefined && !busy;
@@ -160,7 +171,7 @@ export function RegisterPanel({ projectId, conversationId, client = registerApi 
       <div id="register-body">
         {!open ? null : (
           <>
-            {loaded.kind === 'error' && <p className="alert" role="alert">{safeText(loaded.message)}</p>}
+            {loaded.message && <p className="alert" role="alert">{safeText(loaded.message)}</p>}
             {actionError && <p className="alert" role="alert">{safeText(actionError)}</p>}
             {refusedCapacity && (
               <p className="note" aria-label="Capacity refusal">
@@ -170,7 +181,7 @@ export function RegisterPanel({ projectId, conversationId, client = registerApi 
               </p>
             )}
             {notice && <p className="muted" role="status">{notice}</p>}
-            {view && (
+            {(
               <RegisterBody
                 view={view}
                 selected={selected}

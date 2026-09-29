@@ -139,6 +139,26 @@ export const api = {
   exportRun: (id: string) => request<unknown>(`/runs/${id}/export`),
 
   /**
+   * PR-D1: the Register page. The read answers 404 while register capture is
+   * off on the server (the page then does not exist); the two writes execute
+   * the capture job and answer 202 when one started, 200 when an existing
+   * request or snapshot answers instead.
+   */
+  register: (projectId: string) => request<unknown>(`/projects/${projectId}/register`),
+
+  requestRegisterCapture: (projectId: string, registerVersion: string, tozars: string[], conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/captures`, {
+      method: 'POST',
+      body: JSON.stringify({ register_version: registerVersion, tozars, conversation_id: conversationId }),
+    }),
+
+  requestRegisterDirectory: (projectId: string, conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/directory`, {
+      method: 'POST',
+      body: JSON.stringify({ conversation_id: conversationId }),
+    }),
+
+  /**
    * The conversation's durable run history, newest first and bounded by the
    * server. It is what lets a completed result outlive session storage: after
    * a browser restart the workspace reopens the latest run from here.
@@ -286,28 +306,6 @@ export const api = {
     request<unknown>(`/work-scopes/${workScopeId}/preparations`, {
       method: 'POST',
       body: JSON.stringify({ expected_revision: head.revision, expected_digest: head.digest }),
-    }),
-};
-
-/**
- * PR-D1: the Register page. The read answers 404 while register capture is
- * off on the server (the page then does not exist); the two writes execute
- * the capture job and answer 202 when one started, 200 when an existing
- * request or snapshot answers instead.
- */
-export const registerApi = {
-  register: (projectId: string) => request<unknown>(`/projects/${projectId}/register`),
-
-  requestCapture: (projectId: string, registerVersion: string, tozars: string[], conversationId: string) =>
-    request<unknown>(`/projects/${projectId}/register/captures`, {
-      method: 'POST',
-      body: JSON.stringify({ register_version: registerVersion, tozars, conversation_id: conversationId }),
-    }),
-
-  requestDirectory: (projectId: string, conversationId: string) =>
-    request<unknown>(`/projects/${projectId}/register/directory`, {
-      method: 'POST',
-      body: JSON.stringify({ conversation_id: conversationId }),
     }),
 };
 

@@ -240,10 +240,32 @@ describe('RegisterPanel', () => {
     expect(api.requestDirectory).toHaveBeenCalledWith(PROJECT, CONVERSATION);
   });
 
-  it('renders an unreadable page as an error, never partially', async () => {
-    await openPanel(client({ available: true, units: 'nope' }));
+  it('shows nothing when the first read is unreadable or fails, never a partial page', async () => {
+    for (const api of [client({ available: true, units: 'nope' }),
+      client(undefined, { register: vi.fn(async () => { throw new ApiError(502, 'REPOSITORY_ERROR', 'x'); }) })]) {
+      const { container, unmount } = render(<RegisterPanel projectId={PROJECT} conversationId={CONVERSATION} client={api} />);
+      await waitFor(() => expect(api.register).toHaveBeenCalled());
+      expect(container.innerHTML).toBe('');
+      unmount();
+    }
+  });
+
+  it('keeps the last page and says so when a later read fails', async () => {
+    let reads = 0;
+    const api = client(undefined, {
+      register: vi.fn(async () => {
+        reads += 1;
+        if (reads === 1) return registerBody();
+        return { available: true, units: 'nope' };
+      }),
+    });
+    await openPanel(api);
+    await screen.findByRole('table');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    });
     expect((await screen.findByRole('alert')).textContent).toContain('The register could not be read.');
-    expect(screen.queryByRole('table')).toBeNull();
+    expect(screen.getByRole('table')).toBeTruthy();
   });
 });
 
