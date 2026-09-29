@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import yaml
@@ -411,6 +412,10 @@ def gates_tree(tmp_path: Path) -> OpsTree:
     verify.write_text(VERIFY_STUB)
     tree.tool("psql", COVERAGE_PSQL)
     tree.tool("gcloud", SERVICE_GCLOUD)
+    # The gates workflow runs setup-python and installs backend/requirements.txt
+    # first; the tree's PATH (the stubs, then /usr/bin) would otherwise find a
+    # bare system python3 without the backend's dependencies.
+    tree.tool("python3", f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n')
     return tree
 
 
