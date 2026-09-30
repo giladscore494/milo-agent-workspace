@@ -3690,8 +3690,8 @@ CATALOG_REGISTER_TABLES = ("catalog_register_directory_versions", "catalog_regis
                            "catalog_register_snapshot_archives", "catalog_register_archive_lines")
 #: PR-L1 (20260930000100): catalog variants -- two tables and one view.
 CATALOG_VARIANT_TABLES = ("catalog_variant_builds", "catalog_variants", "catalog_variants_current")
-#: PR-L2 (20261002000100): payload compaction -- one table.
-CATALOG_COMPACTION_TABLES = ("catalog_register_snapshot_compactions",)
+# PR-L2: the compaction record, and the view every candidate reader reads.
+CATALOG_COMPACTION_TABLES = ("catalog_register_snapshot_compactions", "catalog_candidate_variants_resolved")
 CATALOG_COVERAGE_RPCS = ("catalog_variant_coverage_for_batch",
                          "record_catalog_variant_coverage_guarded",
                          "rebuild_catalog_variant_coverage", "catalog_variant_coverage_runs",

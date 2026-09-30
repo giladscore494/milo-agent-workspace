@@ -351,6 +351,7 @@ def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
     doc = workflow("register-retention.yml")
     inputs = triggers(doc)["workflow_dispatch"]["inputs"]
     assert inputs["mode"]["default"] == "dry-run" and inputs["mode"]["options"] == ["dry-run", "apply"]
+    assert inputs["operation"]["default"] == "prune" and inputs["operation"]["options"] == ["prune", "vacuum-full"]
     (job,) = doc["jobs"].values()
     assert job["environment"] == "production"
     first = steps(doc)[0]["run"]
@@ -358,6 +359,74 @@ def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
     last = steps(doc)[-1]
     assert last["env"]["MILO_READONLY_DB_URL"] == "${{ secrets.MILO_READONLY_DB_URL }}"
     assert "register-retention.sh --list" in last["run"] and "--apply --confirm" in last["run"]
+    assert "register-vacuum.sh --sizes" in last["run"] and 'register-vacuum.sh --apply --confirm "${CONFIRM_INPUT}"' in last["run"]
+    assert '"${CONFIRM_INPUT}" != "VACUUM"' in first
+
+
+# =============================================================================
+# 2a. space reclamation (PR-L2): VACUUM (FULL, ANALYZE) of the compacted tables
+# =============================================================================
+
+VACUUM_PSQL = """#!/usr/bin/env bash
+printf 'psql%s %s\\n' "${PGOPTIONS:+ [PGOPTIONS=$PGOPTIONS]}" "$*" | sed 's/postgresql:[^ ]*/<url>/' >> "$OPS_TEST_CALLS"
+case "$*" in
+  *"vacuum (full"*) exit "${OPS_TEST_VACUUM_STATUS:-0}" ;;
+esac
+printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=2 heap=1 toast=8192\\n' \\
+  "${OPS_TEST_RAW_BYTES:-62169088}"
+printf 'MAINTAIN catalog_raw_records=%s\\nMAINTAIN catalog_candidate_variants=PASS\\n' "${OPS_TEST_MAINTAIN:-PASS}"
+printf 'DATABASE bytes=%s\\nLIVE runs=%s register_captures=%s\\n' "${OPS_TEST_DB_BYTES:-144542867}" \\
+  "${OPS_TEST_LIVE_RUNS:-0}" "${OPS_TEST_LIVE_CAPTURES:-0}"
+"""
+
+
+def vacuum_tree(tmp_path: Path) -> OpsTree:
+    tree = OpsTree(tmp_path)
+    tree.tool("psql", VACUUM_PSQL)
+    return tree
+
+
+def test_the_vacuum_dry_run_reads_sizes_only(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    result = tree.run("register-vacuum.sh", "--sizes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SIZE catalog_raw_records total=62169088" in result.stdout
+    assert "SUMMARY|register-vacuum sizes|PASS|pg_database_size 144542867 bytes; live runs 0" in result.stdout
+    for table in ("catalog_raw_records", "catalog_candidate_variants"):
+        assert f"SUMMARY|register-vacuum maintain {table}|PASS|" in result.stdout
+    assert "has_table_privilege(current_user, c.oid, 'MAINTAIN')" in (OPS / "register-vacuum.sh").read_text()
+    assert not [c for c in tree.tool_calls() if "vacuum" in c]
+    # A server without the grant (PostgreSQL 16, or not yet migrated) reads FAIL; --sizes still answers.
+    denied = tree.run("register-vacuum.sh", "--sizes", extra_env={"OPS_TEST_MAINTAIN": "FAIL"})
+    assert denied.returncode == 0 and "SUMMARY|register-vacuum maintain catalog_raw_records|FAIL|" in denied.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_the_vacuum_needs_its_word_and_quiet(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    for args in (("--apply",), ("--apply", "--confirm", "vacuum"), ("--sizes", "--confirm", "VACUUM")):
+        assert tree.run("register-vacuum.sh", *args).returncode == 2
+    assert tree.tool_calls() == []
+    for live in ({"OPS_TEST_LIVE_RUNS": "1"}, {"OPS_TEST_LIVE_CAPTURES": "2"}):
+        result = tree.run("register-vacuum.sh", "--apply", "--confirm", "VACUUM", extra_env=live)
+        assert result.returncode == 1 and "CATALOG_VACUUM_BLOCKED" in result.stdout + result.stderr
+    result = tree.run("register-vacuum.sh", "--apply", "--confirm", "VACUUM", extra_env={"OPS_TEST_MAINTAIN": "FAIL"})
+    assert result.returncode == 1 and "CATALOG_VACUUM_NOT_PERMITTED" in result.stderr
+    assert not [c for c in tree.tool_calls() if "vacuum" in c]
+
+
+def test_the_vacuum_rewrites_each_table_with_a_lock_timeout_and_reports_the_size(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    result = tree.run("register-vacuum.sh", "--apply", "--confirm", "VACUUM")
+    assert result.returncode == 0, result.stdout + result.stderr
+    rewrites = [c for c in tree.tool_calls() if "vacuum" in c]
+    assert [c.split("public.")[-1] for c in rewrites] == ["catalog_raw_records", "catalog_candidate_variants"]
+    assert all("[PGOPTIONS=-c lock_timeout=5s]" in c and "set lock_timeout = '5s'" in c
+               and "vacuum (full, analyze) public." in c for c in rewrites)
+    assert "SUMMARY|register-vacuum apply|PASS|pg_database_size 144542867 -> 144542867 bytes" in result.stdout
+    failed = tree.run("register-vacuum.sh", "--apply", "--confirm", "VACUUM", extra_env={"OPS_TEST_VACUUM_STATUS": "1"})
+    assert failed.returncode == 1 and "did not complete" in failed.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
 
 
 # =============================================================================

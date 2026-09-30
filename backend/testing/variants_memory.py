@@ -163,7 +163,15 @@ class VariantsMemoryMixin:
 
     # -- PR-L2: payload compaction (20261002000100) ----------------------------------------
     def _compactions(self) -> dict[str, dict[str, Any]]:
+        """snapshot id -> its ACTIVE compaction ("variants" readers)."""
         return self._variants_state().setdefault("compactions", {})
+
+    def _skeletons(self) -> dict[str, dict[str, Any]]:
+        """snapshot id -> its SUPERSEDED compaction ("archive" readers)."""
+        return self._variants_state().setdefault("skeletons", {})
+
+    def register_snapshot_archived(self, snapshot_id: str) -> bool:
+        return str(snapshot_id) in self._skeletons()
 
     def _compacted_variant(self, record: dict[str, Any]) -> dict[str, Any] | None:
         done = self._compactions().get(str(record["snapshot_id"]))
@@ -192,9 +200,53 @@ class VariantsMemoryMixin:
                 "content_sha256": variant["content_sha256"], "fields": fields,
                 "parse_issue_fields": sorted({i["field"] for i in variant.get("parse_issues") or []})}
 
+    def _tozar_snapshots(self, tozar: Any) -> list[dict[str, Any]]:
+        """The tozar's activated snapshots, rank 1 first (activated_at desc, then id)."""
+        same = [s for s in self.catalog_snapshots.values()
+                if s.get("source_family") == "government" and s.get("activated_at")
+                and (((s.get("retrieval_metadata") or {}).get("capture_scope") or {}).get("filters") or {})
+                .get("tozar") == tozar]
+        same.sort(key=lambda s: str(s["id"]))
+        same.sort(key=lambda s: str(s["activated_at"]), reverse=True)
+        return same
+
+    def _referenced_candidates(self) -> set[str]:
+        return ({str(i.get("candidate_id")) for i in self.work_scope_queue_items}
+                | {str(link.get("candidate_id")) for link in self.catalog_evidence_links.values()}
+                | {str(p.get("candidate_id")) for p in self.catalog_canonical_field_provenance}
+                | {str(v.get("promoted_from_candidate_id")) for v in self.catalog_model_variants}
+                | {str(r.get("candidate_id")) for r in self.catalog_variant_reservations.values()})
+
+    def catalog_register_superseded_snapshots(self, snapshot_key: str) -> list[dict[str, Any]]:
+        snapshot = next((s for s in self.catalog_snapshots.values() if s.get("snapshot_key") == snapshot_key), None)
+        tozar = (((snapshot or {}).get("retrieval_metadata") or {}).get("capture_scope") or {}).get("filters", {})
+        if snapshot is None or not isinstance(tozar, dict) or "tozar" not in tozar:
+            return []
+        return [{"id": s["id"], "snapshot_key": s["snapshot_key"], "retrieval_metadata": s.get("retrieval_metadata")}
+                for s in self._tozar_snapshots(tozar["tozar"])
+                if s["id"] != snapshot["id"] and str(s["id"]) not in self._skeletons()]
+
+    def catalog_register_snapshot_archivable(self, snapshot_id: str) -> int:
+        snapshot = self._snapshot_by_id(snapshot_id)
+        records = [r for r in self.catalog_raw_records.values() if str(r["snapshot_id"]) == str(snapshot_id)]
+        indexes = sorted(int((r.get("source_locator") or {}).get("capture_index", -1)) for r in records)
+        if snapshot is None or not snapshot.get("activated_at") or indexes != list(range(len(records))) \
+                or int(snapshot.get("declared_record_count") or -1) != len(records):
+            raise AppError("CATALOG_CAPTURE_COUNT_MISMATCH", "the stored rows are not an archive's lines", 409)
+        return len(records)
+
+    def catalog_raw_record_lines_mismatched(self, snapshot_id: str, first_index: int, lines: list[str]) -> int:
+        by_index = {int((r.get("source_locator") or {}).get("capture_index", -1)): r
+                    for r in self.catalog_raw_records.values() if str(r["snapshot_id"]) == str(snapshot_id)}
+        return sum(1 for offset, line in enumerate(lines)
+                   if (row := by_index.get(first_index + offset)) is None or row.get("payload") is None
+                   or not self.catalog_raw_record_payload_matches(str(row["id"]), line))
+
     def compact_register_snapshot(self, snapshot_key: str, apply: bool) -> dict[str, Any]:
-        """Mirror of `compact_register_snapshot`; its losslessness check is the
-        Python readers' own: the typed reading answers exactly as the payload."""
+        """Mirror of `compact_register_snapshot` (the candidates' identity stays:
+        the in-memory readers read the candidate rows themselves); its
+        losslessness check is the Python readers' own: the typed reading
+        answers exactly as the payload."""
         with self.lock:
             snapshot = next((s for s in self.catalog_snapshots.values()
                              if s.get("snapshot_key") == snapshot_key and s.get("source_family") == "government"), None)
@@ -202,12 +254,15 @@ class VariantsMemoryMixin:
             if snapshot is None:
                 return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_UNKNOWN"}
             sid = str(snapshot["id"])
-            done = self._compactions().get(sid)
-            if done is not None:
-                return {"status": "unchanged", "snapshot_key": snapshot_key, **done}
+            if sid in self._skeletons():
+                return {"status": "unchanged", "snapshot_key": snapshot_key, **self._skeletons()[sid]}
             filters = ((snapshot.get("retrieval_metadata") or {}).get("capture_scope") or {}).get("filters")
             if not snapshot.get("activated_at") or not isinstance(filters, dict) or set(filters) != {"tozar"}:
                 return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE"}
+            active = self._tozar_snapshots(filters["tozar"])[0]
+            done = self._compactions().get(sid)
+            if done is not None and active["id"] == snapshot["id"]:
+                return {"status": "unchanged", "snapshot_key": snapshot_key, **done}
             records = [r for r in self.catalog_raw_records.values() if str(r["snapshot_id"]) == sid]
             units = sorted((u for u in self._register_state()["units"].values() if str(u.get("snapshot_id")) == sid),
                            key=lambda u: (str(u.get("updated_at")), str(u.get("id"))))
@@ -215,6 +270,8 @@ class VariantsMemoryMixin:
                     int(snapshot.get("stored_record_count") or 0) != int(snapshot.get("declared_record_count") or -1) \
                     or int(snapshot.get("stored_record_count") or 0) != len(records):
                 return {**refused, "code": "CATALOG_COMPACTION_COUNT_UNVERIFIED"}
+            if active["id"] != snapshot["id"]:
+                return self._compact_superseded(snapshot, active, records, units, apply)
             build = self._variants_state()["builds"].get((sid, mapper.MAPPER_VERSION))
             rows = self._variants_state()["rows"]
             variants = {r["upstream_record_id"]: rows.get((sid, r["upstream_record_id"], mapper.MAPPER_VERSION))
@@ -240,6 +297,51 @@ class VariantsMemoryMixin:
                 if unit.get("status") == "captured":
                     unit.update(measured_bytes=done["bytes_after"], measurement_method="memory:json_length+variants")
             return {"status": "compacted", "snapshot_key": snapshot_key, "payloads_removed": len(records), **done}
+
+    def _compact_superseded(self, snapshot: dict[str, Any], active: dict[str, Any], records: list[dict[str, Any]],
+                            units: list[dict[str, Any]], apply: bool) -> dict[str, Any]:
+        """The superseded mode: referenced rows kept as skeletons, the rest and
+        every variant dropped, the archive the record (the SQL's in-use checks
+        mirrored for what this repository models: open reservations)."""
+        sid, key = str(snapshot["id"]), snapshot["snapshot_key"]
+        refused = {"status": "refused", "snapshot_key": key, "mode": "superseded"}
+        build = self._variants_state()["builds"].get((str(active["id"]), mapper.MAPPER_VERSION))
+        if not build or not build.get("completed_at"):
+            return {**refused, "code": "CATALOG_COMPACTION_BUILD_INCOMPLETE"}
+        candidates = [c for c in self.catalog_candidates.values() if str(c["snapshot_id"]) == sid]
+        mine = {str(c["id"]) for c in candidates}
+        if any(str(r.get("candidate_id")) in mine for r in self.catalog_variant_reservations.values()):
+            return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_IN_USE"}
+        referenced = self._referenced_candidates()
+        kept_records = {str(c["raw_record_id"]) for c in candidates if str(c["id"]) in referenced}
+        archive = self._register_state()["archives"].get(sid)
+        if archive is None or int(archive["line_count"]) != len(records):
+            return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_MISSING"}
+        before = self._snapshot_bytes(sid)
+        if not apply:
+            return {"status": "ready", "snapshot_key": key, "mode": "superseded", "raw_rows": len(records),
+                    "kept_rows": len(kept_records), "bytes_before": before}
+        variants = self._variants_state()
+        for row_key in [k for k in variants["rows"] if k[0] == sid]:
+            del variants["rows"][row_key]
+        for build_key in [k for k in variants["builds"] if k[0] == sid]:
+            del variants["builds"][build_key]
+        for cand_key in [k for k, c in self.catalog_candidates.items()
+                         if str(c["snapshot_id"]) == sid and str(c["id"]) not in referenced]:
+            del self.catalog_candidates[cand_key]
+        for rec_key in [k for k, r in self.catalog_raw_records.items()
+                        if str(r["snapshot_id"]) == sid and str(r["id"]) not in kept_records]:
+            del self.catalog_raw_records[rec_key]
+        for record in self.catalog_raw_records.values():
+            if str(record["snapshot_id"]) == sid:
+                record["payload"] = None
+        done = {"mode": "superseded", "raw_rows": len(records), "kept_rows": len(kept_records),
+                "bytes_before": before, "bytes_after": self._snapshot_bytes(sid)}
+        self._skeletons()[sid] = done
+        for unit in units:
+            if unit.get("status") == "captured":
+                unit.update(measured_bytes=done["bytes_after"], measurement_method="memory:json_length+variants")
+        return {"status": "compacted", "snapshot_key": key, **done}
 
     def _reads_as_payload(self, payload: dict[str, Any] | None, variant: dict[str, Any]) -> bool:
         if payload is None:

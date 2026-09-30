@@ -197,7 +197,7 @@ def test_the_original_record_comes_from_the_archive_and_is_checked(capsys):
     with pytest.raises(compaction.CompactionError) as mismatch:
         compaction.source_record(repo, writer, snapshot["id"], "37425")
     assert mismatch.value.code == "CATALOG_ARCHIVE_LINE_MISMATCH"
-    with pytest.raises(compaction.CompactionError):
+    with pytest.raises(compaction.CompactionError, match="CATALOG_ARCHIVE_UNREADABLE"):
         compaction.source_record(repo, FakeReader(), snapshot["id"], "37425")
 
 
@@ -233,6 +233,62 @@ def test_a_prepare_snapshot_gets_its_archive_from_its_stored_rows_then_is_compac
     assert compaction.source_record(repo, writer, snapshot["id"], "90002")["ramat_gimur"] == ""
 
 
+def test_nothing_is_written_before_the_database_checks_every_line():
+    """The archive of stored rows is uploaded only once the database says the
+    rows are exactly an archive's lines AND every line is its row."""
+    repo, snapshot, _writer = uncompacted()
+    writer = FakeReader()
+
+    repo.register_snapshot_archive = lambda _sid: None
+    original = repo.catalog_register_snapshot_archivable
+    repo.catalog_register_snapshot_archivable = lambda _sid: (_ for _ in ()).throw(RuntimeError("count"))
+    with pytest.raises(compaction.CompactionError) as failed:
+        compaction.archive_from_database(repo, snapshot, writer)
+    assert failed.value.code == "CATALOG_ARCHIVE_WRITE_FAILED" and writer.objects == {}
+    repo.catalog_register_snapshot_archivable = original
+    repo.catalog_raw_record_lines_mismatched = lambda _sid, first, lines: 1 if first == 0 else 0
+    with pytest.raises(compaction.CompactionError) as failed:
+        compaction.archive_from_database(repo, snapshot, writer)
+    assert failed.value.code == "CATALOG_ARCHIVE_LINE_MISMATCH" and writer.objects == {}
+
+
+def test_the_capture_job_keeps_a_superseded_capture_as_its_referenced_rows(capsys):
+    """After the tozar's new snapshot is compacted, the capture job compacts the
+    older one SUPERSEDED: nothing references it, so no row stays; it is never
+    browsed again, and its archive answers for every record."""
+    records = rows_with_shapes()
+    writer = FakeReader()
+    repo, w, _v, report, _wr = captured_world(records, writer=writer)
+    old = snapshot_by_key(repo, report.units[0].snapshot_key)
+    code, doc = entrypoint.prepare_capture_run(repo, conversation_id=UUID(w["conversation"]), requested_by=USER,
+                                               idempotency_key="k2", env=capture_env(MILO_RELEASE_SHA=RELEASE_SHA))
+    assert code == entrypoint.EXIT_OK, doc
+    lease = claimed_lease(repo, doc["preparation"]["run_id"])
+    changed = [dict(r, koah_sus=(r.get("koah_sus") or 0) + 1) for r in records]
+    prepared = GovernmentCatalogIngestor(repo, lease, client=scoped_client(changed)).ingest_resource(
+        src.WLTP_RESOURCE_ID, capture_scope=CaptureScope.for_register_marque(TOYOTA))
+    new = snapshot_by_key(repo, prepared.snapshot_key)
+    assert mapper.build_snapshot_variants(repo, new["id"])["status"] == "built"
+    assert repo.catalog_register_superseded_snapshots(new["snapshot_key"])[0]["snapshot_key"] == old["snapshot_key"]
+    assert compaction.main(["--snapshot-key", new["snapshot_key"], "--apply"], repository=repo,
+                           archive_client=writer) == 0
+    capsys.readouterr()
+    done = compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer)
+    assert done == {"status": "unchanged",
+                    "superseded": [{"snapshot_key": old["snapshot_key"], "status": "compacted"}]}
+    assert repo.register_snapshot_archived(old["id"])
+    assert not [r for r in repo.catalog_raw_records.values() if str(r["snapshot_id"]) == str(old["id"])]
+    with pytest.raises(Exception, match="could not be answered") as refused:
+        GovernmentCatalogQuery(repo, snapshot_key=old["snapshot_key"]).list_variants(limit=5)
+    assert getattr(refused.value.__context__, "code", None) == "CATALOG_SNAPSHOT_ARCHIVED"
+    assert compaction.source_record(repo, writer, old["id"], "90002") == \
+        next(r for r in records if r["_id"] == 90002)
+    assert readers(repo, new)["37425"][0] == 1
+    # Again: nothing left to do.
+    assert compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer) == \
+        {"status": "unchanged"}
+
+
 def test_the_archive_client_reads_an_object_back():
     class Response:
         status_code, content = 200, b"gz"
@@ -244,5 +300,59 @@ def test_the_archive_client_reads_an_object_back():
 
     assert arc.GcsArchiveWriter(BUCKET, session_factory=Session).get("register/x") == b"gz"
     Response.status_code = 404
-    with pytest.raises(arc.ArchiveWriteError):
+    with pytest.raises(arc.ArchiveWriteError, match="HTTP 404"):
         arc.GcsArchiveWriter(BUCKET, session_factory=Session).get("register/x")
+
+
+def test_a_mapper_bump_is_refused_while_compaction_has_no_rebuild_from_the_archive():
+    """S2: a compacted snapshot is read through its compaction's mapper version.
+    Until a rebuild-from-archive exists, no migration after PR-L2 may redefine
+    the variant mapper version (the release would hide every compacted tozar),
+    and the Python mapper is the database's; the deployed gate refuses a
+    database whose live compactions name another mapper
+    (CATALOG_COMPACTION_MAPPER, production-verify.sh)."""
+    import re
+    from pathlib import Path
+
+    migrations = sorted((Path(__file__).resolve().parents[1] / "supabase" / "migrations").glob("*.sql"))
+    defining = [m for m in migrations
+                if "create or replace function public.catalog_variant_mapper_version()" in m.read_text()]
+    assert all(m.name < "20261002000100" for m in defining), \
+        "a mapper-version bump after PR-L2 needs rebuild-from-archive first (compacted snapshots have no payload)"
+    latest = defining[-1].read_text()
+    body = latest[latest.index("create or replace function public.catalog_variant_mapper_version()"):]
+    assert re.search(r"'([^']+)'", body).group(1) == mapper.MAPPER_VERSION
+    verify = (Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "production-verify.sh").read_text()
+    assert "catalog_register_compaction_mapper_mismatches()" in verify and \
+        'fact DATABASE_READY NO "CATALOG_COMPACTION_MAPPER' in verify
+
+
+def test_the_release_read_only_role_gains_maintain_on_the_two_compacted_tables_and_nothing_else():
+    """The VACUUM path's only new power: this migration grants the read-only roles exactly these
+    reads, and MAINTAIN (release role only, PostgreSQL 17) on exactly the two compacted tables;
+    never a write privilege (the PostgreSQL test reads back that none exists anywhere)."""
+    import re
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parents[1] / "supabase" / "migrations"
+            / "20261002000100_catalog_register_compaction.sql").read_text()
+    sql = re.sub(r"--[^\n]*", "", text)
+    granted = sorted(" ".join(g.split()) for g in re.findall(r"format\('(grant [^']*) to %I',\s*ro\.rolname\)", sql))
+    assert granted == [
+        "grant execute on function public.catalog_register_compaction_mapper_mismatches()",
+        "grant execute on function public.catalog_register_maintenance_blockers()",
+        "grant execute on function public.catalog_variant_candidate_reading(public.catalog_variants)",
+        "grant maintain on table public.catalog_raw_records, public.catalog_candidate_variants",
+        "grant select on table public.catalog_candidate_variants_resolved",
+        "grant select on table public.catalog_register_snapshot_compactions",
+    ]
+    # Every grant to a role the loop names goes through that list: no other grant names ro.
+    assert len(re.findall(r"\bto %I',\s*ro\.rolname", sql)) == len(granted)
+    # MAINTAIN only for the release read-only role, only where the privilege exists.
+    guard = "if ro.rolname like 'milo\\_release\\_readonly\\_%' and current_setting('server_version_num')::integer >= 170000 then"
+    assert sql.index(guard) < sql.index("grant maintain") and sql.count("grant maintain") == 1
+    # No write privilege is granted to anyone but service_role, and no role is granted ALL.
+    for grant in re.findall(r"\bgrant\s+([a-z, ]+?)\s+on\s+(?:table|all tables)[^;']*?\bto\s+([a-z_%I]+)", sql, re.I):
+        privileges, grantee = grant
+        if re.search(r"\b(insert|update|delete|truncate|all)\b", privileges, re.I):
+            assert grantee == "service_role", grant

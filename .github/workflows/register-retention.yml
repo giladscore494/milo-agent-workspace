@@ -8,12 +8,26 @@ name: Register retention
 # Always kept: per tozar the active snapshot and the one before it, and every
 # snapshot referenced by evidence, claims, runs, work-scope revisions or the
 # coverage ledger. Database rows only: no archive object is ever deleted.
+# PR-L2, operation=vacuum-full (scripts/ops/register-vacuum.sh): mode=dry-run
+# prints the sizes of catalog_raw_records and catalog_candidate_variants,
+# pg_database_size and what is live; mode=apply with confirm=VACUUM refuses
+# while any run or register capture is live, then VACUUM (FULL, ANALYZE) each
+# table (ACCESS EXCLUSIVE while it rewrites it; at most 5 s waiting for the
+# lock) as the release read-only role, and prints the sizes after.
 # Runs in the `production` environment, whose required reviewers approve each
 # dispatch before it starts.
 
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: "prune (snapshot retention) or vacuum-full (rewrite the two compacted tables)"
+        required: true
+        default: prune
+        type: choice
+        options:
+          - prune
+          - vacuum-full
       mode:
         description: "dry-run lists and changes nothing; apply prunes exactly the dry-run's list"
         required: true
@@ -23,12 +37,12 @@ on:
           - dry-run
           - apply
       confirm:
-        description: "apply only: type PRUNE"
+        description: "apply only: type PRUNE (operation prune) or VACUUM (operation vacuum-full)"
         required: false
         default: ""
         type: string
       digest:
-        description: "apply only: the 64-character DIGEST the dry-run printed"
+        description: "prune apply only: the 64-character DIGEST the dry-run printed"
         required: false
         default: ""
         type: string
@@ -50,6 +64,7 @@ jobs:
     steps:
       - name: Refuse anything but main, an unconfirmed apply and a malformed digest
         env:
+          OPERATION_INPUT: ${{ inputs.operation }}
           MODE_INPUT: ${{ inputs.mode }}
           CONFIRM_INPUT: ${{ inputs.confirm }}
           DIGEST_INPUT: ${{ inputs.digest }}
@@ -59,6 +74,10 @@ jobs:
             echo "Dispatch this workflow from main only."
             exit 1
           fi
+          case "${OPERATION_INPUT}" in
+            prune | vacuum-full) ;;
+            *) echo "operation must be prune or vacuum-full."; exit 1 ;;
+          esac
           case "${MODE_INPUT}" in
             dry-run)
               if [[ -n "${CONFIRM_INPUT}" || -n "${DIGEST_INPUT}" ]]; then
@@ -66,13 +85,20 @@ jobs:
                 exit 1
               fi ;;
             apply)
-              if [[ "${CONFIRM_INPUT}" != "PRUNE" ]]; then
-                echo "mode=apply needs confirm=PRUNE exactly."
-                exit 1
-              fi
-              if [[ ! "${DIGEST_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
-                echo "mode=apply needs the 64-character lowercase digest the dry-run printed."
-                exit 1
+              if [[ "${OPERATION_INPUT}" == "vacuum-full" ]]; then
+                if [[ "${CONFIRM_INPUT}" != "VACUUM" || -n "${DIGEST_INPUT}" ]]; then
+                  echo "operation=vacuum-full mode=apply needs confirm=VACUUM exactly and no digest."
+                  exit 1
+                fi
+              else
+                if [[ "${CONFIRM_INPUT}" != "PRUNE" ]]; then
+                  echo "mode=apply needs confirm=PRUNE exactly."
+                  exit 1
+                fi
+                if [[ ! "${DIGEST_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
+                  echo "mode=apply needs the 64-character lowercase digest the dry-run printed."
+                  exit 1
+                fi
               fi ;;
             *) echo "mode must be dry-run or apply."; exit 1 ;;
           esac
@@ -121,13 +147,20 @@ jobs:
 
       - name: Register retention
         env:
+          OPERATION_INPUT: ${{ inputs.operation }}
           MODE_INPUT: ${{ inputs.mode }}
           CONFIRM_INPUT: ${{ inputs.confirm }}
           DIGEST_INPUT: ${{ inputs.digest }}
           MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
         run: |
           set -euo pipefail
-          if [[ "${MODE_INPUT}" == "apply" ]]; then
+          if [[ "${OPERATION_INPUT}" == "vacuum-full" ]]; then
+            if [[ "${MODE_INPUT}" == "apply" ]]; then
+              bash scripts/ops/register-vacuum.sh --apply --confirm "${CONFIRM_INPUT}"
+            else
+              bash scripts/ops/register-vacuum.sh --sizes
+            fi
+          elif [[ "${MODE_INPUT}" == "apply" ]]; then
             bash scripts/ops/register-retention.sh --apply --confirm "${CONFIRM_INPUT}" --digest "${DIGEST_INPUT}"
           else
             bash scripts/ops/register-retention.sh --list

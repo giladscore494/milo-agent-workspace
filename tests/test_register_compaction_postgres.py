@@ -43,8 +43,8 @@ from tests.test_catalog_variants_postgres import (RELEASE_RO, RO_ROLE, _build, _
 from tests.test_migrations_postgres import (BASELINE, MIGRATIONS, SEED_LEGACY_ROWS, SUPABASE_AUTH_SHIM,
                                             WSP_TOYOTA, EphemeralPostgres, _catalog_candidate_json,
                                             _catalog_record_json, _catalog_snapshot_json, _require_pg_bin,
-                                            _rpc_as_service, _ws_create, _ws_scope, _ws_world,
-                                            _wsp_capture_run, _wsp_metadata, _wsp_prepare, _wsp_units)
+                                            _rpc_as_service, _ws_create, _ws_scope, _ws_world, _wsb_finish,
+                                            _wsb_start, _wsp_capture_run, _wsp_metadata, _wsp_prepare, _wsp_units)
 
 COMPACTION_PG_PORT = "54996"
 #: By name, never by position.
@@ -86,6 +86,7 @@ def golden_rows() -> list[dict[str, Any]]:
              delek_nm="לא ידוע קוד"),                                                  # 264 production rows
         dict(copy.deepcopy(base), _id=90004, degem_cd=990004, kinuy_mishari="11111",
              degem_nm="11111111"),                                                     # placeholder
+        dict(copy.deepcopy(base), _id=90005, degem_cd=990005, ramat_gimur=7),         # unparseable (a number)
     ]
     return rows + extra
 
@@ -244,6 +245,41 @@ def readers(db, snapshot: dict) -> dict[str, Any]:
     return answers
 
 
+def _coverage(db, snapshot: dict) -> dict:
+    """The three coverage readers over the snapshot's first batch of a fresh
+    plan: the batch read, the paid-work claim (a real claimed run) and the
+    finalize path's ledger write. Everything they wrote is removed after, so
+    the ledger and the claims are exactly as before for the next call."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(max_items=25, batch_size=10, model_year_from=2018)
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    _run, args = _wsp_capture_run(db, conversation)
+    prepared = _wsp_prepare(db, args, plan, 1, scope.digest(), _wsp_units(snapshot["id"]))
+    batch = prepared["batches"][0]["id"]
+    read = json.loads(_rpc_as_service(db, f"select public.catalog_variant_coverage_for_batch('{batch}', 'register')"))
+    world = {"plan": plan, "digest": scope.digest(), "user": user}
+    run = _wsb_start(db, world, batch, key=f"cmp-{uuid.uuid4().hex[:12]}")["run"]["id"]
+    attempt, token = db.psql(f"select attempt, lease_token from public.claim_run_lease('{run}', 'w-cmp', 300)").split("|")
+    items = [item["candidate_id"] for item in read["items"]]
+    claimed = json.loads(_rpc_as_service(db, "select public.acquire_catalog_variant_reservations_guarded("
+                                             f"'{run}', 'w-cmp', {attempt}, '{token}', 'register', "
+                                             f"$c${json.dumps(items)}$c$::jsonb)"))
+    _wsb_finish(db, run, "partial_success")
+    entries = [{"candidate_id": c, "status": "enriched" if n % 2 else "failed"} for n, c in enumerate(items)]
+    written = json.loads(_rpc_as_service(db, f"select public.rebuild_catalog_variant_coverage('{run}', 'register', "
+                                             f"$e${json.dumps(entries)}$e$::jsonb)"))
+    ledger = db.psql("select string_agg(variant_identity_key || '|' || status || '|' || content_sha256 || '|' || "
+                     "snapshot_key || '|' || coalesce(reason_code, '~'), ',' order by variant_identity_key) "
+                     f"from public.catalog_variant_coverage where last_run_id = '{run}'")
+    db.psql(f"delete from public.catalog_variant_reservations where run_id = '{run}'; "
+            f"delete from public.catalog_variant_coverage where last_run_id = '{run}'")
+    strip = ("owner_run_id", "batch_id", "run_id", "last_run_id")
+    return {"read": [{k: v for k, v in item.items() if k not in strip} for item in read["items"]],
+            "read_include": read["include_unresolved"],
+            "claimed": [{k: v for k, v in item.items() if k not in strip} for item in claimed["items"]],
+            "written": {k: v for k, v in written.items() if k not in strip}, "ledger": ledger}
+
+
 def _queue(db, snapshot: dict) -> dict:
     """Prepare's queue build over the snapshot, on a fresh plan (a prepared
     revision answers its stored queue, so each call is a new plan)."""
@@ -276,17 +312,26 @@ def golden(cdb):
              "snapshot_key, content_sha256, vocabulary_version) select v.variant_identity_key, 'register', "
              f"'enriched', '{world['run_id']}', v.snapshot_key, v.content_sha256, public.catalog_vocabulary_version() "
              f"from public.catalog_variants v where v.snapshot_id = '{snapshot['id']}' and v.upstream_record_id = '37425'")
-    before = {"readers": readers(cdb, snapshot), "queue": _queue(cdb, snapshot)}
+    identity = _identity(cdb, snapshot)
+    before = {"readers": readers(cdb, snapshot), "queue": _queue(cdb, snapshot), "coverage": _coverage(cdb, snapshot)}
     counts = _counts(cdb, snapshot)
     dry = _compact(cdb, snapshot["key"], apply=False)
-    assert dry["status"] == "ready" and dry["raw_rows"] == 20
+    assert dry["status"] == "ready" and dry["raw_rows"] == 21 and dry["mode"] == "active"
     assert _scalar(cdb, f"select count(*) from public.catalog_raw_records where snapshot_id='{snapshot['id']}' "
                         "and payload is null") == 0
     done = _compact(cdb, snapshot["key"])
-    assert done["status"] == "compacted" and done["payloads_removed"] == 20
-    after = {"readers": readers(cdb, snapshot), "queue": _queue(cdb, snapshot)}
+    assert done["status"] == "compacted" and done["payloads_removed"] == 21
+    after = {"readers": readers(cdb, snapshot), "queue": _queue(cdb, snapshot), "coverage": _coverage(cdb, snapshot)}
     return {"snapshot": snapshot, "world": world, "before": before, "after": after, "counts": counts,
-            "done": done}
+            "done": done, "identity": identity}
+
+
+def _identity(db, snapshot: dict, relation: str = "catalog_candidate_variants") -> str:
+    """Every candidate's identity columns, as `relation` answers them."""
+    return db.psql("select string_agg(concat_ws('|', c.id, c.manufacturer, c.commercial_model, c.model_year_start, "
+                   "c.model_year_end, c.official_model_code, c.trim, c.identity_dimensions::text, c.status, "
+                   f"c.candidate_key), ',' order by c.id) from public.{relation} c "
+                   f"where c.snapshot_id = '{snapshot['id']}'")
 
 
 def _counts(db, snapshot: dict) -> dict[str, int]:
@@ -307,6 +352,7 @@ def test_every_reader_answers_identically_after_compaction(golden):
     for name in before:
         assert after[name] == before[name], name
     assert golden["after"]["queue"] == golden["before"]["queue"]
+    assert golden["after"]["coverage"] == golden["before"]["coverage"]
 
 
 def test_the_golden_covers_the_shapes_that_matter(golden):
@@ -320,6 +366,12 @@ def test_the_golden_covers_the_shapes_that_matter(golden):
         assert "ramat_gimur" in resolved["unstated"] and "ramat_gimur" not in resolved["projection"]
     null_fuel = answers["resolve:90003"]
     assert "delek_cd" in null_fuel["unstated"] and "delek_cd" not in null_fuel["projection"]
+    # An unparseable value stays STATED: REGISTER_FIELD_ABSENT is a hard gap for it.
+    unparseable = answers["resolve:90005"]
+    assert "ramat_gimur" not in unparseable["unstated"] and "ramat_gimur" not in unparseable["projection"]
+    coverage = golden["after"]["coverage"]
+    assert coverage["read"] and coverage["claimed"] and coverage["written"]["written"] > 0 and coverage["ledger"]
+    assert {item["decision"] for item in coverage["claimed"]} == {"reserved"}
     stated = answers["resolve:37425"]
     assert stated["match_count"] == 1 and stated["projection"]["tozeret_cd"] == "413"
     assert stated["projection"]["shnat_yitzur"] == golden["snapshot"]["rows"][8]["shnat_yitzur"]
@@ -334,12 +386,14 @@ def test_every_row_key_and_link_stays_and_the_triggers_are_back(golden, cdb):
     snapshot = golden["snapshot"]
     assert _counts(cdb, snapshot) == golden["counts"]
     assert _scalar(cdb, f"select count(*) from public.catalog_raw_records where snapshot_id='{snapshot['id']}' "
-                        "and payload is null") == 20
+                        "and payload is null") == 21
     # Queue items (both plans) still name the candidates of the snapshot.
     assert _scalar(cdb, "select count(*) from public.catalog_work_scope_queue_items i "
                         "join public.catalog_candidate_variants c on c.id = i.candidate_id "
                         f"where c.snapshot_id = '{snapshot['id']}'") > 0
-    for trigger in ("catalog_raw_records_append_only", "catalog_raw_records_payload_required"):
+    for trigger in ("catalog_raw_records_append_only", "catalog_raw_records_payload_required",
+                    "catalog_candidate_variants_identity_immutable", "catalog_candidate_variants_identity_required",
+                    "catalog_variants_compacted_guard"):
         assert cdb.psql(f"select tgenabled from pg_trigger where tgname = '{trigger}'") == "O"
     with pytest.raises(AssertionError, match="append-only|CATALOG_SOURCE"):
         cdb.psql(f"update public.catalog_raw_records set payload = '{{}}' where snapshot_id = '{snapshot['id']}'")
@@ -347,9 +401,26 @@ def test_every_row_key_and_link_stays_and_the_triggers_are_back(golden, cdb):
         cdb.psql("insert into public.catalog_raw_records (snapshot_id, resource_id, upstream_record_id, payload, "
                  f"payload_sha256, record_key) values ('{snapshot['id']}', '{RESOURCE}', 'x', null, '{'a' * 64}', "
                  f"'cr1.{'b' * 32}')")
+    # Candidates keep their keys; the view reads every identity exactly as stored before.
+    assert _scalar(cdb, "select count(*) from public.catalog_candidate_variants "
+                        f"where snapshot_id = '{snapshot['id']}' and (manufacturer is not null or "
+                        "commercial_model is not null or model_year_start is not null or trim is not null "
+                        "or official_model_code is not null or identity_dimensions <> '{}')") == 0
+    assert _identity(cdb, snapshot, "catalog_candidate_variants_resolved") == golden["identity"]
+    for index in ("catalog_candidate_variants_natural_uidx", "catalog_candidate_variants_snapshot_identity_idx"):
+        assert cdb.psql(f"select indexdef from pg_indexes where indexname = '{index}'").endswith(
+            "WHERE (manufacturer IS NOT NULL)")
+    with pytest.raises(AssertionError, match="CATALOG_CANDIDATE_IDENTITY_REQUIRED"):
+        cdb.psql("insert into public.catalog_candidate_variants (snapshot_id, raw_record_id, commercial_model, "
+                 f"candidate_key) select snapshot_id, raw_record_id, 'x', 'cc1.{'c' * 32}' "
+                 f"from public.catalog_candidate_variants where snapshot_id = '{snapshot['id']}' limit 1")
+    with pytest.raises(AssertionError, match="catalog candidate identity"):
+        cdb.psql("update public.catalog_candidate_variants set manufacturer = 'x' "
+                 f"where snapshot_id = '{snapshot['id']}'")
     row = json.loads(cdb.psql("select to_jsonb(c) from public.catalog_register_snapshot_compactions c "
                               f"where snapshot_id = '{snapshot['id']}'"))
-    assert row["mapper_version"] == mapper.MAPPER_VERSION and row["raw_rows"] == 20
+    assert (row["readers"], row["kept_rows"]) == ("variants", 21)
+    assert row["mapper_version"] == mapper.MAPPER_VERSION and row["raw_rows"] == 21
     assert row["bytes_after"] < row["bytes_before"]
     for change in ("update public.catalog_register_snapshot_compactions set raw_rows = 1",
                    "delete from public.catalog_register_snapshot_compactions"):
@@ -360,9 +431,15 @@ def test_every_row_key_and_link_stays_and_the_triggers_are_back(golden, cdb):
 def test_a_second_compaction_is_unchanged_and_a_rebuild_is_refused(golden, cdb):
     snapshot = golden["snapshot"]
     assert _compact(cdb, snapshot["key"])["status"] == "unchanged"
-    # A new mapper version cannot be built from the database (no payload).
-    with pytest.raises(AssertionError):
+    # A new mapper version cannot be built from the database (no payload), and
+    # the database refuses any variant row for a compacted snapshot.
+    with pytest.raises(AssertionError, match="CATALOG_VARIANT_MAPPER_MISMATCH"):
         _build(cdb, snapshot, version="gov.wltp.variant-mapper.9")
+    with pytest.raises(AssertionError, match="CATALOG_VARIANT_SNAPSHOT_COMPACTED"):
+        cdb.psql("insert into public.catalog_variants (snapshot_id, snapshot_key, upstream_record_id, content_sha256, "
+                 "mapper_version, vehicle_segment) select snapshot_id, snapshot_key, upstream_record_id, content_sha256, "
+                 f"mapper_version, vehicle_segment from public.catalog_variants where snapshot_id = '{snapshot['id']}' "
+                 "limit 1")
 
 
 def test_an_archive_line_is_checked_against_the_row_by_the_database(golden, cdb):
@@ -451,10 +528,22 @@ def test_every_missing_precondition_is_refused_and_writes_nothing(cdb):
     _build(cdb, typed)
     answer = _compact(cdb, typed["key"])
     assert (answer["code"], answer["mismatched_rows"]) == ("CATALOG_COMPACTION_TYPED_MISMATCH", 1)
+    # A candidate whose identity is not its variant's (a trim the variant does not state).
+    drifted = _snapshot(cdb, _world(cdb), [dict(r, _id=r["_id"] + 5000) for r in rows], "drifted", marque="סחיפה")
+    _build(cdb, drifted)
+    cdb.psql("alter table public.catalog_candidate_variants disable trigger catalog_candidate_variants_identity_immutable; "
+             "update public.catalog_candidate_variants set trim = 'DRIFT' "
+             f"where id = (select id from public.catalog_candidate_variants where snapshot_id = '{drifted['id']}' "
+             "order by id limit 1); "
+             "alter table public.catalog_candidate_variants enable trigger catalog_candidate_variants_identity_immutable")
+    answer = _compact(cdb, drifted["key"])
+    assert (answer["code"], answer["mismatched_rows"]) == ("CATALOG_COMPACTION_TYPED_MISMATCH", 1)
     # Nothing was written by any refusal (nor by the dry-run above).
     assert _scalar(cdb, "select count(*) from public.catalog_raw_records r "
                         f"where r.snapshot_id in ('{unbuilt['id']}', '{bare['id']}', '{unverified['id']}', "
-                        f"'{typed['id']}', '{unscoped['id']}') and r.payload is null") == 0
+                        f"'{typed['id']}', '{unscoped['id']}', '{drifted['id']}') and r.payload is null") == 0
+    assert _scalar(cdb, "select count(*) from public.catalog_candidate_variants c "
+                        f"where c.snapshot_id in ('{typed['id']}', '{drifted['id']}') and c.manufacturer is null") == 0
     assert _scalar(cdb, "select count(*) from public.catalog_register_snapshot_compactions c "
                         f"where c.snapshot_id in ('{unbuilt['id']}', '{bare['id']}', '{unverified['id']}', "
                         f"'{typed['id']}')") == 0
@@ -480,6 +569,146 @@ def test_a_prepare_snapshot_is_archived_from_its_stored_rows_then_compacted(cdb)
     assert _compact(cdb, snapshot["key"])["status"] == "compacted"
 
 
+# -- 3b. a superseded snapshot keeps only its referenced rows ---------------------------
+
+class ArchiveReader:
+    """The archive bucket, in memory: one object per name."""
+
+    bucket = "milo-test-archive"
+
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        self.objects = objects
+
+    def get(self, name: str) -> bytes:
+        return self.objects[name]
+
+
+class ArchiveRepository(PsqlRepository):
+    """What `compaction.source_record` reads, over psql."""
+
+    def register_snapshot_archive(self, snapshot_id):
+        return self._one(f"select to_jsonb(a) from public.catalog_register_snapshot_archives a "
+                         f"where a.snapshot_id = '{snapshot_id}'")
+
+    def register_snapshot_archived(self, snapshot_id) -> bool:
+        return self.db.psql("select count(*) from public.catalog_register_snapshot_compactions "
+                            f"where snapshot_id = '{snapshot_id}' and readers = 'archive'") == "1"
+
+    def catalog_raw_record_payload_matches(self, raw_record_id, line) -> bool:
+        return self.db.psql(f"select public.catalog_raw_record_payload_matches('{raw_record_id}', "
+                            f"$l${line}$l$)") == "t"
+
+
+def _plan_on(db, snapshot: dict, marque: str) -> dict:
+    """A prepared plan over the snapshot (its unit is the snapshot's tozar):
+    its queue names candidates of it."""
+    user, _project, conversation = _ws_world(db)
+    scope = _ws_scope(max_items=10, batch_size=5, model_year_from=2018)
+    plan = _ws_create(db, conversation, user, scope)["work_scope"]["id"]
+    capture_run, args = _wsp_capture_run(db, conversation)
+    units = [dict(unit, register_marque=marque) if unit["snapshot_id"] else unit for unit in _wsp_units(snapshot["id"])]
+    prepared = _wsp_prepare(db, args, plan, 1, scope.digest(), units)
+    return {"plan": plan, "digest": scope.digest(), "user": user, "capture_run": capture_run,
+            "batches": [batch["id"] for batch in prepared["batches"]]}
+
+
+def _settle_capture_runs(db) -> None:
+    """End every capture-job run earlier tests left live (a Prepare's run
+    blocks every superseded compaction until it ends)."""
+    db.psql("update public.runs r set status = 'completed' where r.run_identity->>'workflow_key' = 'operator_capture' "
+            "and r.status not in ('completed', 'partial_success', 'failed', 'cancelled', 'timed_out', "
+            "'budget_exhausted')")
+
+
+def test_a_superseded_snapshot_keeps_its_referenced_rows_as_skeletons(cdb):
+    from backend.catalog.register import compaction
+
+    marque = "מוחלף"
+    rows = [dict(r, _id=r["_id"] + 600000, degem_cd=r["degem_cd"] + 600000) for r in fixture_rows()]
+    old = _snapshot(cdb, _world(cdb), rows, "sup-old", marque=marque)
+    assert _build(cdb, old)["complete"] is True and _compact(cdb, old["key"])["mode"] == "active"
+    plan = _plan_on(cdb, old, marque)
+    queued = _scalar(cdb, f"select count(*) from public.catalog_work_scope_queue_items where snapshot_id = '{old['id']}'")
+    assert 0 < queued < len(rows)
+    run = _wsb_start(cdb, plan, plan["batches"][0], key=f"sup-{old['key'][-8:]}")["run"]["id"]
+    # A new capture of the tozar (one field changed), built and compacted: the old one is superseded.
+    new = _snapshot(cdb, _world(cdb), [dict(r, koah_sus=(r.get("koah_sus") or 0) + 1) for r in rows], "sup-new",
+                    marque=marque)
+    assert _build(cdb, new)["complete"] is True and _compact(cdb, new["key"])["mode"] == "active"
+    listed = json.loads(_rpc_as_service(cdb, f"select public.catalog_register_superseded_snapshots('{new['key']}')"))
+    assert [item["snapshot_key"] for item in listed] == [old["key"]]
+    # Something live can still read it: a run on its batch, a startable batch, the preparation's run.
+    assert _refused(cdb, old["key"]) == "CATALOG_COMPACTION_SNAPSHOT_IN_USE"
+    _wsb_finish(cdb, run, "partial_success")
+    assert _refused(cdb, old["key"]) == "CATALOG_COMPACTION_SNAPSHOT_IN_USE"
+    cdb.psql(f"update public.catalog_work_scopes set closed_at = now() where id = '{plan['plan']}'")
+    assert _refused(cdb, old["key"]) == "CATALOG_COMPACTION_SNAPSHOT_IN_USE"
+    _wsb_finish(cdb, plan["capture_run"], "completed")
+    # Any capture-job run that is not a register capture -- a Prepare, which can read a snapshot for
+    # reuse before it records a unit -- blocks it too, whatever it prepares.
+    _settle_capture_runs(cdb)
+    other, _args = _wsp_capture_run(cdb, _ws_world(cdb)[2])
+    assert _refused(cdb, old["key"]) == "CATALOG_COMPACTION_SNAPSHOT_IN_USE"
+    _wsb_finish(cdb, other, "completed")
+    ready = _compact(cdb, old["key"], apply=False)
+    assert (ready["status"], ready["mode"], ready["raw_rows"], ready["kept_rows"]) == (
+        "ready", "superseded", len(rows), queued)
+    done = _compact(cdb, old["key"])
+    assert (done["status"], done["kept_rows"]) == ("compacted", queued)
+    # Only the referenced rows stay, as skeletons; no variant, no build.
+    sid = old["id"]
+    assert _counts(cdb, old)["raw"] == queued == _counts(cdb, old)["candidates"]
+    assert _counts(cdb, old)["variants"] == 0
+    assert _scalar(cdb, f"select count(*) from public.catalog_variant_builds where snapshot_id = '{sid}'") == 0
+    assert _scalar(cdb, f"select count(*) from public.catalog_raw_records where snapshot_id = '{sid}' "
+                        "and payload is not null") == 0
+    assert _scalar(cdb, f"select count(*) from public.catalog_candidate_variants where snapshot_id = '{sid}' "
+                        "and manufacturer is not null") == 0
+    assert _scalar(cdb, f"select count(*) from public.catalog_work_scope_queue_items where snapshot_id = '{sid}'") \
+        == queued
+    assert cdb.psql("select string_agg(readers, ',' order by readers) from public.catalog_register_snapshot_compactions "
+                    f"where snapshot_id = '{sid}'") == "archive,variants"
+    # It is never browsed again; its archive is the record, for a kept row and a dropped one alike.
+    with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ARCHIVED"):
+        PsqlRepository(cdb).catalog_candidate_variant_page(sid)
+    reader = ArchiveReader({f"register/{RESOURCE}/{'0' * 16}/{old['key']}.jsonl.gz": arc.build(rows).data})
+    kept = cdb.psql(f"select min(upstream_record_id) from public.catalog_raw_records where snapshot_id = '{sid}'")
+    dropped = next(str(r["_id"]) for r in rows if not _scalar(
+        cdb, f"select count(*) from public.catalog_raw_records where snapshot_id = '{sid}' "
+             f"and upstream_record_id = '{r['_id']}'"))
+    for upstream in (kept, dropped):
+        record = compaction.source_record(ArchiveRepository(cdb), reader, sid, upstream)
+        assert record == next(r for r in rows if str(r["_id"]) == upstream)
+    # The active snapshot answers as before.
+    assert len(PsqlRepository(cdb).catalog_candidate_variant_page(new["id"], limit=100)) == len(rows)
+    assert json.loads(_rpc_as_service(cdb, f"select public.catalog_register_superseded_snapshots('{new['key']}')")) == []
+    assert _compact(cdb, old["key"])["status"] == "unchanged"
+
+
+def test_maintenance_blockers_and_the_mapper_gate(cdb):
+    blockers = json.loads(_rpc_as_service(cdb, "select public.catalog_register_maintenance_blockers()"))
+    assert blockers["live_runs"] == _scalar(cdb, "select count(*) from public.runs where status not in "
+                                                 "('completed','partial_success','failed','cancelled','timed_out',"
+                                                 "'budget_exhausted')")
+    _user, _project, conversation = _ws_world(cdb)
+    _wsp_capture_run(cdb, conversation)
+    assert json.loads(_rpc_as_service(cdb, "select public.catalog_register_maintenance_blockers()"))["live_runs"] \
+        == blockers["live_runs"] + 1
+    assert cdb.psql("select public.catalog_register_compaction_mapper_mismatches()") == "0"
+    # A compacted snapshot read through another mapper version: the deployed gate's finding.
+    probe = _snapshot(cdb, _world(cdb), [dict(r, _id=r["_id"] + 650000) for r in fixture_rows()[:2]], "mapper",
+                      marque="ממפה")
+    cdb.psql("insert into public.catalog_register_snapshot_compactions (snapshot_id, snapshot_key, readers, "
+             f"mapper_version, raw_rows, kept_rows, bytes_before, bytes_after) values ('{probe['id']}', "
+             f"'{probe['key']}', 'variants', 'gov.wltp.variant-mapper.0', 2, 2, 1, 1)")
+    assert cdb.psql("select public.catalog_register_compaction_mapper_mismatches()") == "1"
+    cdb.psql("alter table public.catalog_register_snapshot_compactions disable trigger "
+             "catalog_register_snapshot_compactions_append_only; "
+             f"delete from public.catalog_register_snapshot_compactions where snapshot_id = '{probe['id']}'; "
+             "alter table public.catalog_register_snapshot_compactions enable trigger "
+             "catalog_register_snapshot_compactions_append_only")
+
+
 # -- 4. privileges ----------------------------------------------------------------------
 
 def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
@@ -488,29 +717,83 @@ def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
         cdb.psql(f"set role {role}; select count(*) from public.catalog_register_snapshot_compactions; "
                  f"select public.catalog_register_prunable_list(); "
                  f"select public.catalog_register_measured_bytes('{snapshot['id']}'); "
-                 f"select count(*) from public.catalog_raw_records; reset role")
+                 f"select count(*) from public.catalog_raw_records; "
+                 f"select count(*) from public.catalog_candidate_variants; reset role")
+        # The candidates as every reader reads them, and the maintenance reads.
+        assert _identity(cdb, snapshot, "catalog_candidate_variants_resolved") == golden["identity"]
+        cdb.psql(f"set role {role}; select count(manufacturer) from public.catalog_candidate_variants_resolved; "
+                 "select public.catalog_register_maintenance_blockers(); "
+                 "select public.catalog_register_compaction_mapper_mismatches(); reset role")
         with pytest.raises(AssertionError, match="permission denied"):
             cdb.psql(f"set role {role}; select public.compact_register_snapshot('{snapshot['key']}', false)")
     for role in ("anon", "authenticated"):
         with pytest.raises(AssertionError, match="permission denied"):
             cdb.psql(f"set role {role}; select public.compact_register_snapshot('{snapshot['key']}', false)")
+    for role in ("anon", "authenticated"):
+        with pytest.raises(AssertionError, match="permission denied"):
+            cdb.psql(f"set role {role}; select count(*) from public.catalog_candidate_variants_resolved")
     assert cdb.psql("select prosecdef::text || '|' || array_to_string(proconfig, ',') from pg_proc "
                     "where proname = 'compact_register_snapshot'") == "true|search_path=pg_catalog"
+    # MAINTAIN (the operator's VACUUM FULL) exists from PostgreSQL 17: granted there to the release
+    # read-only role on exactly the two compacted tables; an older server has no such privilege.
+    if int(cdb.psql("select current_setting('server_version_num')")) >= 170000:
+        for table, granted in (("catalog_raw_records", "t"), ("catalog_candidate_variants", "t"),
+                               ("catalog_variants", "f"), ("runs", "f")):
+            assert cdb.psql(f"select has_table_privilege('{RELEASE_RO}', 'public.{table}', 'MAINTAIN')") == granted
+        assert cdb.psql(f"select string_agg(c.oid::regclass::text, ',' order by 1) from pg_class c "
+                        f"join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'm') "
+                        f"and n.nspname = 'public' and has_table_privilege('{RELEASE_RO}', c.oid, 'MAINTAIN')") \
+            == "catalog_candidate_variants,catalog_raw_records"
+    # Neither read-only role can write anywhere, whatever this migration granted.
+    for role in (RELEASE_RO, RO_ROLE):
+        assert cdb.psql("select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+                        "where c.relkind in ('r', 'p', 'v', 'm', 'f') "
+                        "and n.nspname not in ('pg_catalog', 'information_schema') and n.nspname !~ '^pg_toast' "
+                        f"and (has_table_privilege('{role}', c.oid, 'INSERT') "
+                        f"or has_table_privilege('{role}', c.oid, 'UPDATE') "
+                        f"or has_table_privilege('{role}', c.oid, 'DELETE') "
+                        f"or has_table_privilege('{role}', c.oid, 'TRUNCATE'))") == "0"
+    text = COMPACTION_MIGRATION.read_text()
+    assert "current_setting('server_version_num')::integer >= 170000" in text
+    assert "grant maintain on table public.catalog_raw_records, public.catalog_candidate_variants to %I" in text
 
 
 def test_the_migration_is_rerun_safe(cdb):
     cdb.psql(file=COMPACTION_MIGRATION)
     assert cdb.psql("select is_nullable from information_schema.columns where table_name = 'catalog_raw_records' "
                     "and column_name = 'payload'") == "YES"
+    # The view, and the three identity indexes still partial, after the second run.
+    assert cdb.psql("select count(*) from pg_views where schemaname = 'public' "
+                    "and viewname = 'catalog_candidate_variants_resolved'") == "1"
+    assert cdb.psql("select string_agg(indexname, ',' order by indexname) from pg_indexes "
+                    "where schemaname = 'public' and tablename = 'catalog_candidate_variants' "
+                    "and indexdef like '%WHERE (manufacturer IS NOT NULL)%'") == (
+        "catalog_candidate_variants_identity_idx,catalog_candidate_variants_natural_uidx,"
+        "catalog_candidate_variants_snapshot_identity_idx")
 
 
 # -- 5. bytes per register row after compaction (the capacity default) ------------------
 
-def test_bytes_per_register_row_after_compaction_and_the_projection(cdb, capsys):
+#: The two superseded Toyota snapshots' referenced rows (production 2026-09-30:
+#: 10 + 12 queue items), kept as skeletons once they are compacted.
+TOYOTA_SUPERSEDED_KEPT_ROWS = 22
+#: The share of the previous capture of every tozar a plan still references
+#: after a refresh (its queue items), planned generously: the skeletons it keeps.
+REFERENCED_SHARE = 0.10
+#: The candidate-slimming target this PR is held to (measured after VACUUM
+#: FULL), and the byte-regression bound on it.
+TARGET_BYTES_PER_ROW, REGRESSION = 2_890, 1.15
+
+
+def test_bytes_per_register_row_after_compaction_and_the_projections(cdb, capsys):
     """5,000 rows derived from the committed fixtures, captured, built,
     archived and compacted; every table's size (table + TOAST + indexes) after
-    the heap is rewritten, as `vacuum full` leaves it."""
+    the heap is rewritten, as `vacuum full` leaves it. Then ONE refresh of the
+    tozar (a changed field: the same variants, new content), built and
+    compacted, the first capture superseded and kept as its referenced rows:
+    the steady state, two snapshots per tozar."""
     marque, count = "מדידה-דחיסה", 5000
+    _settle_capture_runs(cdb)
     base = fixture_rows()
     rows = []
     for index in range(count):
@@ -525,36 +808,52 @@ def test_bytes_per_register_row_after_compaction_and_the_projection(cdb, capsys)
             cdb.psql(f"vacuum full analyze public.{table}")
         return {t: _scalar(cdb, f"select pg_total_relation_size('public.{t}')") for t in tables}
 
+    def captured(capture_rows: list[dict]) -> dict:
+        snapshot = _bulk_snapshot(cdb, capture_rows, marque)
+        snapshot.update(key=cdb.psql("select snapshot_key from public.catalog_source_snapshots "
+                                     f"where id='{snapshot['id']}'"))
+        for first in range(0, count, mapper.BUILD_BATCH_ROWS):
+            _build(cdb, snapshot, capture_rows[first:first + mapper.BUILD_BATCH_ROWS])
+        run = cdb.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot['id']}'")
+        cdb.psql("insert into public.catalog_register_snapshot_archives (snapshot_id, snapshot_key, gcs_uri, "
+                 f"byte_size, sha256, line_count, recorded_by_run_id) values ('{snapshot['id']}', '{snapshot['key']}', "
+                 f"'gs://milo-test-archive/register/{RESOURCE}/{'2' * 16}/{snapshot['key']}.jsonl.gz', 10, "
+                 f"'{'a' * 64}', {count}, '{run}'); update public.runs set status = 'completed' where id = '{run}'")
+        return snapshot
+
     start = sizes()
-    snapshot = _bulk_snapshot(cdb, rows, marque)
-    snapshot.update(key=cdb.psql(f"select snapshot_key from public.catalog_source_snapshots where id='{snapshot['id']}'"))
-    for first in range(0, count, mapper.BUILD_BATCH_ROWS):
-        _build(cdb, snapshot, rows[first:first + mapper.BUILD_BATCH_ROWS])
-    run = cdb.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot['id']}'")
-    cdb.psql("insert into public.catalog_register_snapshot_archives (snapshot_id, snapshot_key, gcs_uri, byte_size, "
-             f"sha256, line_count, recorded_by_run_id) values ('{snapshot['id']}', '{snapshot['key']}', "
-             f"'gs://milo-test-archive/register/{RESOURCE}/{'2' * 16}/{snapshot['key']}.jsonl.gz', 10, "
-             f"'{'a' * 64}', {count}, '{run}')")
+    first = captured(rows)
     built = sizes()
-    assert _compact(cdb, snapshot["key"])["status"] == "compacted"
+    assert _compact(cdb, first["key"])["status"] == "compacted"
     compacted = sizes()
     before = {t: (built[t] - start[t]) / count for t in tables}
     after = {t: (compacted[t] - start[t]) / count for t in tables}
-    total = sum(after.values())
-    # Production, read-only, 2026-09-29: pg_database_size and the two tables'
-    # total sizes (25,495 raw rows in 4 Toyota snapshots).
-    database, raw_now, candidates_now = 112_192_659, 60_809_216, 28_721_152
-    base = database - raw_now - candidates_now
-    register = 100_000 * total
-    # The two SUPERSEDED Toyota snapshots stay referenced (queue items) and are
-    # never built (rank 1 only), so never compacted: raw + candidate each.
-    superseded = 2 * 6_374 * (before["catalog_raw_records"] + before["catalog_candidate_variants"])
+    per_row = sum(after.values())
+    skeleton = after["catalog_raw_records"] + after["catalog_candidate_variants"]
+    # One refresh: the second capture active and compacted, the first kept as skeletons (none referenced here).
+    second = captured([dict(r, koah_sus=(r.get("koah_sus") or 0) + 1) for r in rows])
+    assert _compact(cdb, second["key"])["mode"] == "active"
+    superseded = _compact(cdb, first["key"])
+    assert (superseded["mode"], superseded["kept_rows"]) == ("superseded", 0)
+    steady_row = sum((v - start[t]) for t, v in sizes().items()) / count
+
+    full = (register_config.NON_REGISTER_BASE_BYTES + register_config.FULL_REGISTER_ROWS * per_row
+            + TOYOTA_SUPERSEDED_KEPT_ROWS * skeleton)
+    steady = (register_config.NON_REGISTER_BASE_BYTES + register_config.FULL_REGISTER_ROWS * steady_row
+              + REFERENCED_SHARE * register_config.FULL_REGISTER_ROWS * skeleton)
     with capsys.disabled():
         print("\nPR-L2 bytes per register row (table+TOAST+indexes), built -> compacted: "
               + ", ".join(f"{t.removeprefix('catalog_')} {before[t]:.0f} -> {after[t]:.0f}" for t in tables)
-              + f"; total {sum(before.values()):.0f} -> {total:.0f} (default {register_config.DEFAULT_BYTES_PER_ROW})."
-              f" Full register: base {base / 1e6:.1f} MB + 100,000 rows {register / 1e6:.1f} MB = "
-              f"{(base + register) / 1e6:.1f} MB; + 2 superseded Toyota snapshots {superseded / 1e6:.1f} MB = "
-              f"{(base + register + superseded) / 1e6:.1f} MB (guard 400 MB)")
+              + f"; total {sum(before.values()):.0f} -> {per_row:.0f} (default {register_config.DEFAULT_BYTES_PER_ROW},"
+              f" bound {TARGET_BYTES_PER_ROW * REGRESSION:.0f}). Full register: base "
+              f"{register_config.NON_REGISTER_BASE_BYTES / 1e6:.1f} MB + {register_config.FULL_REGISTER_ROWS:,} rows "
+              f"x {per_row:.0f} B + {TOYOTA_SUPERSEDED_KEPT_ROWS} superseded Toyota skeletons = {full / 1e6:.1f} MB"
+              f" (<= 360 MB). After one refresh: {steady_row:.0f} B per tozar row for both snapshots"
+              f" + {REFERENCED_SHARE:.0%} of the previous capture referenced ({skeleton:.0f} B each) ="
+              f" {steady / 1e6:.1f} MB (<= 400 MB)")
     assert after["catalog_raw_records"] < before["catalog_raw_records"] / 2
-    assert total <= register_config.DEFAULT_BYTES_PER_ROW
+    assert after["catalog_candidate_variants"] < before["catalog_candidate_variants"] / 2
+    assert per_row <= TARGET_BYTES_PER_ROW * REGRESSION
+    assert per_row <= register_config.DEFAULT_BYTES_PER_ROW
+    assert full <= 360_000_000
+    assert steady <= 400_000_000

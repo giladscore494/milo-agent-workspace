@@ -2015,6 +2015,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
         snapshot = self._catalog_snapshot_by_id(snapshot_id)
         if snapshot.get("activated_at") is None or snapshot.get("validation_state") != "complete":
             raise AppError("CATALOG_SNAPSHOT_NOT_ACTIVE", "catalog snapshot is not active", 409)
+        if self.register_snapshot_archived(str(snapshot["id"])):
+            raise AppError("CATALOG_SNAPSHOT_ARCHIVED", "the snapshot's archive is the record", 409)
         metadata = snapshot.get("retrieval_metadata") or {}
         contract = metadata.get("normalization_contract")
         if not contract or contract == "raw_only":

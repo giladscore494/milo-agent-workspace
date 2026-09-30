@@ -263,6 +263,10 @@ class Repository(Protocol):
     def catalog_compacted_record_reading(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
     def record_register_snapshot_archive_from_database(self, snapshot_id: str, gcs_uri: str, byte_size: int, sha256: str, line_count: int) -> dict[str, Any]: ...
     def catalog_raw_record_payload_matches(self, raw_record_id: str, line: str) -> bool: ...
+    def catalog_raw_record_lines_mismatched(self, snapshot_id: str, first_index: int, lines: list[str]) -> int: ...
+    def catalog_register_snapshot_archivable(self, snapshot_id: str) -> int: ...
+    def catalog_register_superseded_snapshots(self, snapshot_key: str) -> list[dict[str, Any]]: ...
+    def register_snapshot_archived(self, snapshot_id: str) -> bool: ...
     # PR-L1: catalog variants and the discovery tree.
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None: ...
     def record_catalog_variants(self, snapshot_id: str, mapper_version: str, rows: list[dict[str, Any]]) -> dict[str, Any]: ...
@@ -2553,6 +2557,40 @@ class SupabaseRepository:
         except Exception as exc:
             raise AppError("REPOSITORY_ERROR", "the archive line check failed", 502) from exc
         return data is True
+
+    def catalog_raw_record_lines_mismatched(self, snapshot_id: str, first_index: int, lines: list[str]) -> int:
+        """How many archive lines (capture indexes `first_index`..) are NOT
+        their stored rows, by the database's own digest."""
+        try:
+            data = self.client.rpc("catalog_raw_record_lines_mismatched", {
+                "p_snapshot_id": str(snapshot_id), "p_first": int(first_index),
+                "p_lines": [str(line) for line in lines]}).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "the archive line check failed", 502) from exc
+        if isinstance(data, bool) or not isinstance(data, int):
+            raise AppError("REPOSITORY_ERROR", "the archive line check was unreadable", 502)
+        return data
+
+    def catalog_register_snapshot_archivable(self, snapshot_id: str) -> int:
+        data = self._guarded_rpc("catalog_register_snapshot_archivable", {"p_snapshot_id": str(snapshot_id)},
+                                 "register snapshot archive", refusals=self._REGISTER_REFUSALS)
+        if isinstance(data, bool) or not isinstance(data, int):
+            raise AppError("REPOSITORY_ERROR", "the archive check was unreadable", 502)
+        return data
+
+    def catalog_register_superseded_snapshots(self, snapshot_key: str) -> list[dict[str, Any]]:
+        try:
+            data = self.client.rpc("catalog_register_superseded_snapshots",
+                                   {"p_snapshot_key": str(snapshot_key)}).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "the superseded snapshot read failed", 502) from exc
+        return [row for row in data if isinstance(row, dict)] if isinstance(data, list) else []
+
+    def register_snapshot_archived(self, snapshot_id: str) -> bool:
+        """A superseded snapshot kept as referenced skeletons: its archive is the record."""
+        rows = self._many(self.client.table("catalog_register_snapshot_compactions").select("snapshot_id")
+                          .eq("snapshot_id", str(snapshot_id)).eq("readers", "archive").limit(1))
+        return bool(rows)
 
     # -- PR-L1: catalog variants (migration 20260930000100) --------------
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None:

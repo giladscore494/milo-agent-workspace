@@ -184,7 +184,7 @@ def captured_world(records=None, *, writer: FakeWriter | None = None, client: Da
     lease = claimed_lease(repo, group["run_id"])
     writer = writer if writer is not None else FakeWriter()
     with mock.patch.object(capture_module, "compact_after_build",
-                           capture_module.compact_after_build if compact else lambda *_a: None):
+                           capture_module.compact_after_build if compact else lambda *_a, **_k: None):
         report = capture_group(repo, lease, client=client or scoped_client(records or planned_records()),
                                group_id=answer["group_id"], archive_writer=writer)
     return repo, w, version, report, writer
@@ -580,8 +580,8 @@ def test_the_capacity_guard_refuses_with_the_exact_numbers_and_starts_nothing():
     trigger = FakeTrigger()
     with pytest.raises(register_service.CapacityRefusal) as refused:
         request(repo, w, version, [LEXUS], trigger)
-    # 399,000,000 + 1000 x 4000 = 403,000,000 > 0.80 x 500,000,000.
-    assert refused.value.capacity == {"current_bytes": 399_000_000, "projected_bytes": 403_000_000,
+    # 399,000,000 + 1000 x 3000 = 402,000,000 > 0.80 x 500,000,000.
+    assert refused.value.capacity == {"current_bytes": 399_000_000, "projected_bytes": 402_000_000,
                                       "limit_bytes": 400_000_000}
     assert refused.value.code == "CATALOG_CAPACITY_THRESHOLD_EXCEEDED"
     assert trigger.calls == [] and repo.register_capture_units() == []
@@ -666,7 +666,7 @@ def test_the_api_captures_answers_202_then_200_and_a_capacity_body():
     assert error["code"] == "CATALOG_CAPACITY_THRESHOLD_EXCEEDED"
     # The first request's 28 rows are still in flight: they count too.
     assert error["capacity"] == {"current_bytes": 399_999_000,
-                                 "projected_bytes": 399_999_000 + (5000 + 28) * 4000,
+                                 "projected_bytes": 399_999_000 + (5000 + 28) * 3000,
                                  "limit_bytes": 400_000_000}
 
 
@@ -1065,13 +1065,13 @@ def test_a_register_that_reverts_records_its_old_version_again():
 
 def test_the_capacity_guard_counts_rows_still_in_flight():
     repo, w = world()
-    repo.register_database_bytes = 393_900_000
+    repo.register_database_bytes = 395_450_000
     version = directory(repo, {TOYOTA: 28, LEXUS: 1500})
-    assert request(repo, w, version, [LEXUS])[1]  # 393,900,000 + 1500 x 4000 = 399,900,000: fits
+    assert request(repo, w, version, [LEXUS])[1]  # 395,450,000 + 1500 x 3000 = 399,950,000: fits
     with pytest.raises(register_service.CapacityRefusal) as refused:
-        # Alone it would fit (394,012,000); with LEXUS still in flight it does not.
+        # Alone it would fit (395,534,000); with LEXUS still in flight it does not.
         request(repo, w, version, [TOYOTA])
-    assert refused.value.capacity["projected_bytes"] == 393_900_000 + (28 + 1500) * 4000
+    assert refused.value.capacity["projected_bytes"] == 395_450_000 + (28 + 1500) * 3000
 
 
 def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_change():
@@ -1081,7 +1081,7 @@ def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_chan
     from datetime import UTC, datetime, timedelta
 
     repo, w = world()
-    repo.register_database_bytes = 390_900_000
+    repo.register_database_bytes = 393_000_000
     old = directory(repo, {TOYOTA: 28, LEXUS: 1500})
     answer, started = request(repo, w, old, [LEXUS])
     assert started
@@ -1089,10 +1089,10 @@ def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_chan
     claimed_lease(repo, run_id)  # the job started: running, under a lease
     new = directory(repo, {TOYOTA: 28, LEXUS: 1501})
     assert new != old
-    # Live: the old unit still counts (390,900,000 + (1501 + 1500) x 4000 > 400,000,000).
+    # Live: the old unit still counts (393,000,000 + (1501 + 1500) x 3000 > 400,000,000).
     with pytest.raises(register_service.CapacityRefusal) as refused:
         request(repo, w, new, [LEXUS])
-    assert refused.value.capacity["projected_bytes"] == 390_900_000 + (1501 + 1500) * 4000
+    assert refused.value.capacity["projected_bytes"] == 393_000_000 + (1501 + 1500) * 3000
     # Killed: the job's lease expired an hour ago and nothing renewed it.
     repo.runs[run_id]["lease_expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     assert repo.runs[run_id]["status"] in ("starting", "running")

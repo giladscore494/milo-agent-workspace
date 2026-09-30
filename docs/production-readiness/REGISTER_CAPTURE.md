@@ -44,30 +44,63 @@ snapshot. A re-measurement sets `measured_at`, never `updated_at`: it never
 makes an older unit the tozar's newest. Heap sizes only (a floor): the
 estimate below includes indexes.
 
-The estimate (PR-L2, 4,000 B/row) is the measured total per register row
-ONCE COMPACTED, tables + TOAST + indexes, rounded up to the next 500: raw
-record without its payload 601 B, candidate 1,067 B, variant 981 B, ledger at
-two levels 906 B = 3,555 B (5,000 rows, `tests/test_register_compaction_postgres.py`;
-5,246 B before compaction, of which the raw record 2,292 B). PR-L1b's 6,000
-counted the payload. A capture's rows hold their payload only until their
-build completes: the space a compaction frees is reused by the next capture
-once (auto)vacuum has run; `pg_database_size` itself shrinks only after a
-`vacuum full` (operator step 7).
+The estimate (PR-L2, 3,000 B/row) is the measured total per register row
+ONCE COMPACTED, tables + TOAST + indexes after VACUUM FULL, rounded up to the
+next 500: raw record without its payload ~603 B, candidate keys ~431 B (its
+identity is read from the variant row; the identity indexes skip it), variant
+~983 B, ledger at two levels ~903 B = ~2,920 B (5,000 rows,
+`tests/test_register_compaction_postgres.py`; 5,246 B before compaction).
+That test asserts:
+
+| | |
+|---|---|
+| bytes per row | <= 2,890 x 1.15 and <= the default |
+| full register | 25 MB non-register base (`NON_REGISTER_BASE_BYTES`, production 144.5 - 121.0 MB) + 101,686 rows x ~2,920 B + the two superseded Toyota snapshots' 22 referenced skeletons = **~321.9 MB** (<= 360 MB) |
+| after one refresh (two snapshots per tozar) | the active snapshot compacted, the one before it kept as its referenced rows (10% planned) = **~332.4 MB** (<= 400 MB) |
+
+The capture gate stays `pg_database_size` + incoming rows x the estimate: the
+plan limit counts the database's size on disk, dead space included. A
+capture's rows hold their payload only until their build completes; the
+space a compaction frees is reused by later captures, but `pg_database_size`
+drops only after the two tables are rewritten (**Register retention**,
+`operation = vacuum-full`; operator step 7).
 
 ### Compaction (PR-L2, 20261002000100)
 
-When a snapshot's variants are completely built under the current mapper
-version AND its archive is recorded, its raw payloads leave the database
-(`public.compact_register_snapshot`): the capture job does it right after the
-build (the unit's document reports `compaction.status`: `compacted`,
-`unchanged`, `refused` with a code, `skipped` or `failed`; never failing the
-unit), and the **Register variants** workflow does it for an already built
-snapshot (`compact = dry-run`, then `apply`). Every raw record row stays, with
-its id, keys, `payload_sha256` and `source_locator` (the archive line); no
-candidate is touched; every foreign key, evidence link, queue item and
-reservation stays valid. The raw records' append-only trigger is suspended
-only inside that one security-definer function (search_path pinned,
-service_role only). Refusals, each writing nothing:
+`public.compact_register_snapshot` has two modes.
+
+**Active** (the tozar's rank-1 snapshot). When its variants are completely
+built under the current mapper version AND its archive is recorded, its raw
+payloads leave the database and every candidate keeps only its keys (id,
+snapshot, raw record, `candidate_key`, status): its identity columns are
+NULL and read from the variant row through `catalog_candidate_variants_resolved`
+(the table's own columns; every candidate reader reads it). The capture job
+does it right after the build (the unit's document reports
+`compaction.status`: `compacted`, `unchanged`, `refused` with a code,
+`skipped` or `failed`; never failing the unit), and the **Register variants**
+workflow does it for an already built snapshot (`compact = dry-run`, then
+`apply`). Every row stays, with its id, keys, `payload_sha256` and
+`source_locator` (the archive line); every foreign key, evidence link, queue
+item and reservation stays valid.
+
+**Superseded** (any older activated snapshot of the tozar). Once the active
+one is built and nothing live can read the old one -- no live run on it (its
+writer, an adopter, a preparation, a batch run, a run whose checkpoint names
+it), no batch its open plan can still start, no open reservation
+(`CATALOG_COMPACTION_SNAPSHOT_IN_USE` otherwise) -- it keeps only the rows
+something references (a candidate named by a queue item, evidence link, field
+provenance, promotion or reservation, and its raw record) as skeletons, and
+drops every other row and all its variants. `catalog_readable_snapshot` then
+refuses it (`CATALOG_SNAPSHOT_ARCHIVED`); its archive is the record. The
+capture job does it for the tozar's older snapshots right after it compacts
+the new one (the unit's document lists them under `compaction.superseded`);
+the operator path does it by key. This includes the two superseded Toyota
+Prepare snapshots: their batches are completed (no run can start again), so
+only their 10 + 12 queued rows stay.
+
+The append-only triggers are suspended only inside that one security-definer
+function (search_path pinned, service_role only). Refusals, each writing
+nothing:
 `CATALOG_COMPACTION_SNAPSHOT_UNKNOWN`, `CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE`
 (not an activated whole-tozar Government snapshot),
 `CATALOG_COMPACTION_COUNT_UNVERIFIED` (the newest register unit that captured
@@ -75,7 +108,9 @@ it is not count-verified, or stored rows differ from declared rows),
 `CATALOG_COMPACTION_BUILD_INCOMPLETE` (no complete current-mapper build
 covering every raw row), `CATALOG_COMPACTION_TYPED_MISMATCH` (a row's typed
 variant does not read exactly as its payload -- e.g. a zero-padded code;
-checked per row by `catalog_variant_reads_as_payload`) and, last,
+checked per row by `catalog_variant_reads_as_payload` -- or a candidate's
+identity is not its variant's, `catalog_candidate_reads_as_variant`),
+`CATALOG_COMPACTION_SNAPSHOT_IN_USE` (superseded mode) and, last,
 `CATALOG_COMPACTION_ARCHIVE_MISSING` (so a dry-run naming it passed every other
 check).
 
@@ -87,18 +122,24 @@ register states nothing" as the typed column null AND no parse issue for the
 field (an unparseable value stays a hard gap). The original record is read
 from the archive only: `python -m backend.catalog.register.compaction
 --snapshot-key <key> --show-record <upstream id>` (and the replay export)
-fetch the object, check its SHA-256 against the recorded one and have the
-database check the line against the row's `payload_sha256`. A compacted
-snapshot is not rebuilt under a new mapper version
-(`CATALOG_VARIANT_SNAPSHOT_COMPACTED`); rebuilding one from its archive is a
-follow-up.
+fetch the object and check its SHA-256 against the recorded one; for an active
+snapshot the database also checks the line against the row's
+`payload_sha256`. A compacted snapshot is not rebuilt under a new mapper
+version: the database refuses any variant row for it
+(`CATALOG_VARIANT_SNAPSHOT_COMPACTED`), CI refuses a migration that redefines
+`catalog_variant_mapper_version()` after PR-L2, and the deployed gate is NOT
+ready while a live compaction names another mapper (`CATALOG_COMPACTION_MAPPER`
+in `production-verify.sh`). Rebuilding from the archive is the follow-up a
+mapper bump needs first.
 
-A Prepare snapshot captured before PR-D1 has no archive: `compact = apply`
-first writes it from the stored rows in capture order with PR-D1's
-create-only writer (the same object a register capture of the same rows
-writes) and records it (`record_register_snapshot_archive_from_database`),
-then compacts. A SUPERSEDED snapshot is never built (rank 1 only), so it is
-never compacted: it is pruned when nothing references it, or stays whole.
+A snapshot with no archive (a Prepare snapshot captured before PR-D1) gets it
+written from its stored rows first, only once every other precondition holds:
+the database checks the rows are exactly an archive's lines
+(`catalog_register_snapshot_archivable`), every line is checked against its
+row's `payload_sha256` (`catalog_raw_record_lines_mismatched`), then PR-D1's
+create-only writer uploads it (the same object a register capture of the
+same rows writes) and it is recorded
+(`record_register_snapshot_archive_from_database`).
 
 ### Archive
 
@@ -158,7 +199,7 @@ build under the current mapper version is complete. Their digest item is
 | `MILO_ENABLE_REGISTER_CAPTURE` | off | the website stage flag |
 | `MILO_DB_CAPACITY_BYTES` | `500000000` (500 MB) | |
 | `MILO_DB_CAPACITY_THRESHOLD` | `0.80` | |
-| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `4000` | compacted raw record + candidate + variant + two ledger levels, per row (PR-L2) |
+| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `3000` | compacted raw record + candidate keys + variant + two ledger levels, per row (PR-L2) |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |
@@ -245,16 +286,38 @@ build under the current mapper version is complete. Their digest item is
    means that; any other failure of the report reads
    `INFO not available (the coverage report did not run: exit <n>)`.
 7. **Compaction (PR-L2)**: apply `20261002000100_catalog_register_compaction.sql`
-   with the release. A new capture compacts by itself. For each existing
-   built snapshot (the active Toyota snapshot once its variants are built):
-   Actions -> **Register variants** with its `snapshot_key` and
-   `compact = dry-run` (expect `READY ...`, or `READY ... archive=from-database`
-   for a Prepare snapshot), then `compact = apply` (expect `COMPACTED ...`;
-   `UNCHANGED` when it already was). The capture job's bucket
-   (`REGISTER_ARCHIVE_BUCKET`) must be set: an archive written from the stored
-   rows needs it. To return the freed space to the plan, run once, in a quiet
-   window (it locks the table while it rewrites it), in the SQL editor:
-   `vacuum (full, analyze) public.catalog_raw_records;`
+   with the release (it also grants the release read-only role MAINTAIN on
+   the two compacted tables). A new capture compacts by itself, then its
+   tozar's older snapshots. For the existing snapshots, each by key: Actions
+   -> **Register variants** with its `snapshot_key` and `compact = dry-run`,
+   then `compact = apply`:
+   - Audit `cs1.6fb07b73d273aa8b8a2a10a1a61f38f2` (archived by its capture;
+     expect `READY ... mode=active`) and the active Toyota
+     `cs1.ae06a5c5f8585e420e10eced830e2719` (a Prepare snapshot; expect
+     `READY ... mode=active archive=from-database`), then `COMPACTED ... mode=active`;
+   - then the superseded Toyota `cs1.e335295707fa8d6935b113bb6a0165f4` and
+     `cs1.41cdbb31f18f96429eb62651bc71131d` (expect `READY ... mode=superseded
+     archive=from-database`, then `COMPACTED ... mode=superseded raw_rows=6374
+     kept_rows=12` and `kept_rows=10`).
+   The capture job's bucket (`REGISTER_ARCHIVE_BUCKET`) must be set: an
+   archive written from the stored rows needs it. Then, with nothing live,
+   hand the space back: Actions -> **Register retention** with
+   `operation = vacuum-full`, `mode = dry-run` (the two tables' sizes,
+   `pg_database_size`, what is live, and `register-vacuum maintain <table>`
+   PASS/FAIL: `has_table_privilege(current_user, table, 'MAINTAIN')` read
+   back for both tables), then `mode = apply`, `confirm = VACUUM` (refused
+   `CATALOG_VACUUM_NOT_PERMITTED` unless both read PASS, and
+   `CATALOG_VACUUM_BLOCKED` while any run or register capture is not
+   terminal; VACUUM (FULL,
+   ANALYZE) holds ACCESS EXCLUSIVE on each table for the seconds it rewrites
+   it, waiting at most 5 s for the lock -- set on the connection itself, so
+   `MILO_READONLY_DB_URL` must be the direct or session-mode connection; a
+   transaction pooler refuses it and nothing is rewritten). Check
+   `pg_database_size` in its summary (or on the Register page). MAINTAIN is
+   not a write, but it also lets that role LOCK the two tables: the
+   read-only credential is as sensitive as a writer's for availability.
+   A superseded compaction also waits for every capture-job run that is not
+   a register capture (a Prepare) to end.
 
 ## Error codes
 

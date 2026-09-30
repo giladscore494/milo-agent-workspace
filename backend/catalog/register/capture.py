@@ -21,9 +21,10 @@ across snapshots):
    outcome with the snapshot's MEASURED bytes (computed in the database);
 5. PR-L1: the captured snapshot's catalog variants, built in bounded batches
    (`variants.build_after_capture`; reported, never failing the unit);
-6. PR-L2: once built (and archived, step 3), its raw payloads are removed
-   from the database (`compaction.compact_after_build`; reported, never
-   failing the unit).
+6. PR-L2: once built (and archived, step 3), its raw payloads and its
+   candidates' identity are removed from the database, then the tozar's
+   superseded snapshots keep only their referenced rows
+   (`compaction.compact_after_build`; reported, never failing the unit).
 
 A snapshot that was already active (captured earlier, e.g. by Prepare) is
 reused as is: its archive is written if missing and its count verified. A
@@ -244,7 +245,8 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         outcome.variants = build_after_capture(repository, report.snapshot_id)
         # PR-L2: built and archived, the payloads leave the database (a
         # refusal or a failure is reported and changes nothing).
-        outcome.compaction = compact_after_build(repository, report.snapshot_key, outcome.variants)
+        outcome.compaction = compact_after_build(repository, report.snapshot_key, outcome.variants,
+                                                 writer=archive_writer)
         return outcome
     except Exception as failure:  # noqa: BLE001 - reduced to a static code
         if _is_fatal(failure) or isinstance(failure, CancellationRequested):
