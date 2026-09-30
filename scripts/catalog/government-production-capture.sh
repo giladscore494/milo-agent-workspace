@@ -323,9 +323,11 @@ ensure_normalisation_job() {
   grant_api_run_without_overrides "$NORMALISATION_JOB"
 }
 
-# PR-D3: the API identity may RUN the normalisation job, exactly as defined,
-# and read it (the release check): roles/run.jobsExecutor -- run.jobs.run and
-# run.jobs.get, NOT run.jobs.runWithOverrides. That job holds the provider
+# PR-D3: the API identity may RUN the normalisation job, exactly as defined:
+# roles/run.jobsExecutor -- run.jobs.run, NOT run.jobs.runWithOverrides. (Its
+# READ of the job for the release check comes from roles/run.viewer,
+# MILO_API_JOB_READ_ROLE, bound by website-execution-activate.sh; the executor
+# roles do not carry run.jobs.get.) That job holds the provider
 # key; an override (`python -c ...`) would hand the key to whoever controls
 # the API. website-execution-activate.sh reads back that no role the API holds
 # on it carries run.jobs.runWithOverrides.

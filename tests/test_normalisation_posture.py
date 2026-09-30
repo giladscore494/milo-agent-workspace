@@ -26,10 +26,10 @@ FLAG = "MILO_ENABLE_MANUFACTURER_NORMALISATION"
 #: The permission sets the mocks answer `gcloud iam roles describe` with (the
 #: Cloud Run and basic roles, as IAM documents them; abridged to what matters).
 ROLES = {
-    "roles/run.jobsExecutor": ["run.executions.get", "run.executions.list", "run.jobs.get", "run.jobs.list",
-                               "run.jobs.run", "run.operations.get"],
-    "roles/run.jobsExecutorWithOverrides": ["run.executions.get", "run.jobs.get", "run.jobs.run",
-                                            "run.jobs.runWithOverrides"],
+    # The executor roles do not carry run.jobs.get: the API's read is roles/run.viewer.
+    "roles/run.jobsExecutor": ["run.executions.get", "run.executions.list", "run.jobs.run",
+                               "run.operations.get"],
+    "roles/run.jobsExecutorWithOverrides": ["run.executions.get", "run.jobs.run", "run.jobs.runWithOverrides"],
     "roles/run.invoker": ["run.jobs.run", "run.routes.invoke"],
     "roles/run.viewer": ["run.jobs.get", "run.jobs.list", "run.services.get"],
     "roles/run.developer": ["run.jobs.create", "run.jobs.run", "run.jobs.runWithOverrides"],

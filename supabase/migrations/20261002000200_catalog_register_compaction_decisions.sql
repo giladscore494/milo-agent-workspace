@@ -22,6 +22,15 @@
 --       resolved view's branch (b) reads its identity; a candidate whose
 --       variant row is gone (the view's branch (c)) keeps a null identity and
 --       null codes, as before.
+-- The split rests on an INVARIANT: a candidate that was never compacted never
+-- has `manufacturer IS NULL`. A new candidate must carry its identity (the
+-- BEFORE INSERT trigger catalog_candidate_variants_identity_required,
+-- CATALOG_CANDIDATE_IDENTITY_REQUIRED, 20261002000100), and its identity is
+-- immutable afterwards (catalog_candidate_variants_identity_immutable,
+-- 20260914200000), a trigger suspended only inside compact_register_snapshot
+-- -- which nulls the identity together with the row's payload -- and inside
+-- the prune, which deletes rows. So branch (a) is exactly the uncompacted rows
+-- and branch (b) exactly the compacted (or skeleton) ones.
 -- It is inlinable SQL (stable, no SET, one SELECT; every name qualified), and
 -- the decisions read it with nothing else changed: the placeholder rule, the
 -- ledger join, the archived-snapshot guard and the year filter. Same result,

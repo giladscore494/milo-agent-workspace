@@ -531,7 +531,8 @@ MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS=(
 MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME="MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
 MILO_NORMALISATION_JOB_ENV_NAME="CLOUD_RUN_NORMALISATION_JOB"
 # The API runs the normalisation job WITHOUT overrides (it holds the provider
-# key): run.jobs.run and run.jobs.get, never run.jobs.runWithOverrides.
+# key): run.jobs.run, never run.jobs.runWithOverrides. Its read of the job
+# (the release check) is MILO_API_JOB_READ_ROLE (roles/run.viewer) above.
 MILO_API_NORMALISATION_RUN_ROLE="roles/run.jobsExecutor"
 MILO_RUN_WITH_OVERRIDES_PERMISSION="run.jobs.runWithOverrides"
 # Every permission that lets a holder make the job run something other than
