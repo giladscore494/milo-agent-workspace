@@ -376,14 +376,15 @@ class StatusTransport:
 
     BODY = b"<html>Access denied LEAKED-BODY-MARKER</html>"
 
-    def __init__(self, status: int) -> None:
-        self.status = status
+    def __init__(self, *statuses: int) -> None:
+        self.statuses = statuses  # one per attempt; the last one repeats
         self.calls = 0
 
     def get(self, url: str, *, params: Mapping[str, str], connect_timeout: float,
             read_timeout: float, max_bytes: int) -> HttpResponse:
+        status = self.statuses[min(self.calls, len(self.statuses) - 1)]
         self.calls += 1
-        return HttpResponse(status=self.status, body=self.BODY, content_type="text/html",
+        return HttpResponse(status=status, body=self.BODY, content_type="text/html",
                             final_url=src.canonical_request_url(str(url).rsplit("/", 1)[-1], params))
 
 
@@ -403,8 +404,26 @@ def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
     with pytest.raises(GovernmentSourceError) as refused:
         discover_directory(DataGovClient(transport, sleep_fn=lambda _s: None), clock=lambda: 0.0)
     assert refused.value.detail == {"http_status": status} and transport.calls == 2 * attempts
-    # Any other refusal carries no detail.
+    # Any other refusal carries no detail, even if handed a status.
     assert GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID").detail == {}
+    assert GovernmentSourceError("GOV_TRANSPORT_FAILED", http_status=403).detail == {}
+
+
+@pytest.mark.parametrize(("statuses", "reported", "calls"), [
+    ((503, 404), 404, 2), ((503, 502, 429), 429, 3), ((429, 200), None, 2)])
+def test_a_retried_request_reports_the_status_of_its_last_attempt(statuses, reported, calls):
+    transport = StatusTransport(*statuses)
+    client = DataGovClient(transport, sleep_fn=lambda _s: None)
+    if reported is None:
+        # The retry answered 200: whatever it holds is judged as before.
+        with pytest.raises(GovernmentSourceError) as refused:
+            count_tozar(client, TOYOTA, clock=lambda: 0.0)
+        assert refused.value.reason_code == "GOV_RESPONSE_NOT_JSON" and refused.value.detail == {}
+    else:
+        with pytest.raises(GovernmentSourceError) as refused:
+            count_tozar(client, TOYOTA, clock=lambda: 0.0)
+        assert refused.value.detail == {"http_status": reported}
+    assert transport.calls == calls
 
 
 def test_the_capture_job_logs_the_status_of_a_failed_directory_refresh(capsys, monkeypatch):
@@ -726,6 +745,29 @@ def test_the_capture_job_entrypoint_runs_the_invocation_the_api_sent(capsys, mon
     # The register text never leaves in the report... except its own tozar,
     # which is the unit's name, not row content.
     assert "kinuy_mishari" not in json.dumps(document, ensure_ascii=False)
+
+
+def test_the_capture_job_logs_the_statuses_of_a_group_s_failed_units(capsys, monkeypatch):
+    repo, w = world()
+    version = directory(repo)
+    trigger = FakeTrigger()
+    answer, _ = request(repo, w, version, [TOYOTA], trigger)
+    args = list(trigger.calls[0].entrypoint_args)
+    run_id = args[args.index("--run-id") + 1]
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    monkeypatch.setattr(entrypoint, "_open_archive_writer", lambda env: FakeWriter())
+    env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
+    status = entrypoint.main(authorized_argv(run_id, **{"--register-group-id": answer["group_id"]}), env=env)
+    out, err = capsys.readouterr()
+    document = json.loads(out)
+    assert status == entrypoint.EXIT_FAILED
+    assert (document["reason_code"], document["detail"]) == ("CATALOG_REGISTER_CAPTURE_FAILED",
+                                                             {"http_statuses": [403]})
+    assert document["register"]["group"]["units"][0]["http_status"] == 403
+    assert err.strip().startswith("CATALOG_REGISTER_CAPTURE_FAILED: ")
+    assert err.strip().endswith(" http_statuses=403")
+    assert "LEAKED" not in out + err
 
 
 def test_the_capture_job_refuses_register_mode_without_its_switch(capsys, monkeypatch):

@@ -222,8 +222,8 @@ class GovernmentSourceError(ValueError):
         self.reason_code = reason_code
         self.retryable = retryable
         self.safe_message = GOVERNMENT_SOURCE_REASONS[reason_code]
-        self.http_status = (http_status if isinstance(http_status, int)
-                            and not isinstance(http_status, bool)
+        self.http_status = (http_status if reason_code == "GOV_HTTP_STATUS_UNEXPECTED"
+                            and isinstance(http_status, int) and not isinstance(http_status, bool)
                             and 100 <= http_status <= 599 else None)
         super().__init__(self.safe_message)
 
