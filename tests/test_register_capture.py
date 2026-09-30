@@ -241,7 +241,7 @@ class DirectoryClient:
             total = self.counts[tozar] + (1 if tozar == self.miscount else 0)
             result.update(total=total, records=[], filters=params["filters"])
         else:
-            page = len(self.scans)
+            page = len(self.scans)  # 1 = the first scan page (this call included)
             offset, limit = int(params["offset"]), int(params["limit"])
             rows = self.rows[offset:offset + limit]
             if page == self.short_page:
@@ -309,22 +309,38 @@ def test_an_unavailable_distinct_total_is_only_a_missing_cross_check():
     assert found.distinct_total is None
 
 
-@pytest.mark.parametrize(("fault", "reason"), [
-    ({"total_moves_on_page": 2}, "GOV_DIRECTORY_REGISTER_CHANGED"),
-    ({"short_page": 1}, "GOV_DIRECTORY_RESULT_INVALID"),
-    ({"miscount": LEXUS}, "GOV_DIRECTORY_RESULT_INVALID"),
-    ({"total_bias": 1}, "GOV_DIRECTORY_RESULT_INVALID"),
-    ({"total_bias": -1}, "GOV_DIRECTORY_RESULT_INVALID"),
-    ({"estimated": True}, "GOV_DIRECTORY_RESULT_INVALID"),
-    ({"extra_fields": True}, "GOV_DIRECTORY_RESULT_INVALID"),
+@pytest.mark.parametrize(("fault", "reason", "scan_pages", "counts"), [
+    # the total moves on the 2nd scan page: the register changed mid-read
+    ({"total_moves_on_page": 2}, "GOV_DIRECTORY_REGISTER_CHANGED", 2, 0),
+    # the 1st page is one row short although the total needs more pages
+    ({"short_page": 1}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
+    # the scan is whole, but LEXUS's filtered count disagrees with it
+    ({"miscount": LEXUS}, "GOV_DIRECTORY_RESULT_INVALID", 4, 2),
+    # the rows counted fall short of / run past the scan's total
+    ({"total_bias": 1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
+    ({"total_bias": -1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
+    ({"estimated": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
+    # a scan row carrying any field but tozar is row payload
+    ({"extra_fields": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
 ])
-def test_an_inconsistent_scan_writes_no_directory_version(fault, reason):
+def test_an_inconsistent_scan_writes_no_directory_version(fault, reason, scan_pages, counts):
     repo = MemoryRepository()
     fake = DirectoryClient({TOYOTA: 28, LEXUS: 3000}, **fault)
     with pytest.raises(GovernmentSourceError) as refused:
         refresh_directory(repo, client=fake, env={})
     assert refused.value.reason_code == reason
+    # Refused at the intended check: no further page or count was requested.
+    assert len(fake.scans) == scan_pages
+    assert sum("filters" in call for call in fake.calls) == counts
     assert repo.latest_register_directory() is None
+
+
+@pytest.mark.parametrize(("rows", "pages"), [(0, 1), (1000, 1), (1001, 2), (2000, 2)])
+def test_the_scan_stops_exactly_at_the_total(rows, pages):
+    fake = DirectoryClient({TOYOTA: rows} if rows else {})
+    found = discover_directory(fake, clock=lambda: 0.0)
+    assert len(fake.scans) == pages
+    assert [(u.tozar, u.expected_rows) for u in found.units] == ([(TOYOTA, rows)] if rows else [])
 
 
 def test_the_directory_refuses_past_its_request_or_time_cap():

@@ -18,7 +18,8 @@ reported as `RegisterDirectory.distinct_total` -- a cross-check only; its
 records are never read, and an unavailable answer reports ``None``.
 
 The scan is refused whole (``GOV_DIRECTORY_RESULT_INVALID``) unless every page
-but the last is full, the rows counted add up to the scan's ``total``, and
+but the last is full, the rows counted (unfilterable values included) add up
+to the scan's ``total``, and
 every unit's scan count equals its independent filtered count. A ``total``
 that moves between scan pages refuses with ``GOV_DIRECTORY_REGISTER_CHANGED``:
 the register changed mid-read.
