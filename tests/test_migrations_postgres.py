@@ -3855,6 +3855,7 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260930000200_catalog_work_scope_placeholder_exclusion.sql",
         "20261001000100_catalog_variant_retention.sql",
         "20261002000100_catalog_register_compaction.sql",
+        "20261002000200_catalog_register_compaction_decisions.sql",
         "20261003000100_catalog_manufacturer_normalization.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
@@ -5574,6 +5575,8 @@ def pr3_db(db):
     # PR-L2 restates it again (the candidates read through the resolved view,
     # a skeleton snapshot refused): production applies that one after R5 too.
     db.psql(file=next(m for m in MIGRATIONS if m.name == "20261002000100_catalog_register_compaction.sql"))
+    # ...and its follow-up restates the coverage decisions after it.
+    db.psql(file=next(m for m in MIGRATIONS if m.name == "20261002000200_catalog_register_compaction_decisions.sql"))
     return db
 
 
@@ -8859,7 +8862,7 @@ SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100
 PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
                               "20260928000100", "20260929000100", "20260930000100",
                               "20260930000200", "20261001000100", "20261002000100",
-                              "20261003000100")
+                              "20261002000200", "20261003000100")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -9003,7 +9006,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 51
+        assert len(applied) == 41 and len(MIGRATIONS) == 52
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -9037,8 +9040,8 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/51" in state.stdout, state.stdout
-    assert "10 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/52" in state.stdout, state.stdout
+    assert "11 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
@@ -9059,7 +9062,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (51/51" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (52/52" in state.stdout, state.stdout
 
 
 

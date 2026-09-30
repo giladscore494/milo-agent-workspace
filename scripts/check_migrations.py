@@ -279,6 +279,14 @@ REQUIRED_PER_FILE["20261002000100_catalog_register_compaction.sql"] = [
     "public.catalog_raw_record_content_sha256(r)",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20261002000200_catalog_register_compaction_decisions.sql"] = [
+    # PR-L2 follow-up: a compacted row's codes and content hash come from its
+    # variant row joined once; the decisions read nothing else differently.
+    "create or replace function public.catalog_candidate_register_reading(p_snapshot_id uuid)",
+    "from public.catalog_candidate_register_reading(p_snapshot_id) x",
+    "v.tozeret_cd::text, v.degem_cd::text, v.sug_degem, v.content_sha256",
+    "and public.catalog_snapshot_not_archived(p_snapshot_id)",
+]
 REQUIRED_PER_FILE["20261003000100_catalog_manufacturer_normalization.sql"] = [
     # PR-D3: the source tozar never changes; the normalisation is versioned
     # and append-only, the model's output is validated again in the database,

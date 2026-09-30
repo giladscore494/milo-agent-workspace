@@ -80,10 +80,18 @@ variant is gone (identity null). `catalog_work_scope_coverage_decisions` is an
 inlinable SQL function (no `SET`; every name qualified), planned with its
 caller's values; the two register-code helpers carry no `SET` either (no
 per-call search_path switch; their sub-select keeps them from being
-inlined). Measured on 6,000 rows (ms,
-before -> after compaction): coverage decisions 26 -> 113, the candidate page
-by model 17 -> 20, an identity lookup 0.9 -> 2.5; a model filter never scans
-the snapshot (asserted with EXPLAIN).
+inlined). Since `20261002000200` the decisions read
+`catalog_candidate_register_reading`, which joins a compacted row's variant
+row ONCE for its identity, register codes and content hash (instead of the
+view plus four correlated helper calls per row). Measured on 6,000 rows (ms,
+before -> after compaction, every decision evaluated -- grouped by decision,
+since a bare `count(*)` lets the planner skip the decision entirely): coverage
+decisions 3,524 -> 2,616 (the earlier definition: 3,452 -> 3,515; most of the
+cost is the per-row `catalog_variant_identity_key` of the ledger join, which
+predates PR-L2), the candidate page by model 16 -> 21, an identity lookup
+0.6 -> 2.7. A model filter never scans the snapshot, and the compacted rows
+are reached through `catalog_variants_reading_idx` -- in the view and inside
+the candidate page (asserted with EXPLAIN and auto_explain).
 
 ### Compaction (PR-L2, 20261002000100)
 
@@ -351,7 +359,10 @@ build under the current mapper version is complete. Their digest item is
    passed as `PGPASSWORD`, never printed); the read-only role holds no
    MAINTAIN. The owner connects to `MILO_READONLY_DB_URL`'s host: a Supabase
    pooler in session mode (port 5432, `postgres.<project ref>`), or the direct
-   host (`postgres`). Refused `CATALOG_VACUUM_NOT_PERMITTED` unless the owner
+   host (`postgres`). The read-only connection (sizes, liveness, headroom) is
+   made from `MILO_READONLY_DB_URL` read from the environment and split into
+   libpq's variables, its password as `PGPASSWORD`: neither URL nor password
+   is ever on psql's argv. Refused `CATALOG_VACUUM_NOT_PERMITTED` unless the owner
    read-back is PASS for both tables; then BEFORE EACH TABLE,
    `CATALOG_VACUUM_BLOCKED` while any run or register capture is not
    terminal, and `CATALOG_VACUUM_NO_HEADROOM` when `pg_database_size` + the

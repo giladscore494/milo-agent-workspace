@@ -99,9 +99,29 @@ db_url() {
   printf '%s' "$url"
 }
 read_only() {
-  local url
-  url="$(db_url)" || return 1
-  psql "$url" -X -A -t -v ON_ERROR_STOP=1 -c "$1" 2> /dev/null
+  local parts host port user database sslmode password
+  db_url > /dev/null || return 1
+  # The URL carries the read-only password: it is split here, from the
+  # environment, into libpq's variables -- never on psql's argv (where any
+  # process listing shows it) -- and the password travels as PGPASSWORD only.
+  parts="$(python3 - "$DB_URL_ENV" << 'PY'
+import os, sys
+from urllib.parse import parse_qs, unquote, urlsplit
+url = urlsplit(os.environ[sys.argv[1]])
+if url.scheme not in ("postgres", "postgresql") or not url.hostname:
+    sys.exit(1)
+query = parse_qs(url.query)
+print(url.hostname, url.port or 5432, unquote(url.username or "postgres"),
+      unquote((url.path or "/postgres").lstrip("/") or "postgres"), (query.get("sslmode") or ["-"])[0])
+PY
+)" || return 1
+  password="$(python3 -c 'import os, sys
+from urllib.parse import unquote, urlsplit
+print(unquote(urlsplit(os.environ[sys.argv[1]]).password or ""))' "$DB_URL_ENV")" || return 1
+  read -r host port user database sslmode <<< "$parts"
+  [[ "$sslmode" != "-" ]] || sslmode="${PGSSLMODE:-prefer}"
+  PGHOST="$host" PGPORT="$port" PGUSER="$user" PGDATABASE="$database" PGSSLMODE="$sslmode" \
+    PGPASSWORD="$password" psql -X -A -t -v ON_ERROR_STOP=1 -c "$1" 2> /dev/null
 }
 # The owner's connection: the read-only URL's host, session mode on a Supabase
 # pooler; "HOST PORT USER DATABASE" (no secret) or nonzero.

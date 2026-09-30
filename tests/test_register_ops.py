@@ -375,11 +375,19 @@ def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
 # =============================================================================
 
 VACUUM_PSQL = """#!/usr/bin/env bash
-owner="${PGUSER:+ [owner PGUSER=$PGUSER PGHOST=$PGHOST PGPORT=$PGPORT PGSSLMODE=$PGSSLMODE]}"
-printf 'psql%s%s %s\\n' "$owner" "${PGOPTIONS:+ [PGOPTIONS=$PGOPTIONS]}" "$*" | sed 's/postgresql:[^ ]*/<url>/' >> "$OPS_TEST_CALLS"
-# The owner's password arrives through PGPASSWORD only, and only the owner's.
-if [[ -n "${PGUSER:-}" ]]; then [[ "${PGPASSWORD:-}" == "$OPS_TEST_OWNER_PASSWORD" ]] || exit 7
-else [[ -z "${PGPASSWORD:-}" ]] || exit 7; fi
+# Both connections arrive through libpq's variables; no URL is ever on argv.
+owner_user=0; [[ "${PGUSER:-}" == postgres || "${PGUSER:-}" == postgres.* ]] && owner_user=1
+if [[ -n "${PGUSER:-}" && "$owner_user" -eq 0 ]]; then
+  who=" [readonly PGUSER=$PGUSER PGHOST=$PGHOST PGPORT=$PGPORT PGDATABASE=$PGDATABASE]"
+else
+  who="${PGUSER:+ [owner PGUSER=$PGUSER PGHOST=$PGHOST PGPORT=$PGPORT PGSSLMODE=$PGSSLMODE]}"
+fi
+printf 'psql%s%s %s\\n' "$who" "${PGOPTIONS:+ [PGOPTIONS=$PGOPTIONS]}" "$*" | sed 's/postgresql:[^ ]*/<url>/' >> "$OPS_TEST_CALLS"
+[[ "$*" != *postgresql:* && "$*" != *postgres:* ]] || exit 8
+# Each password arrives through PGPASSWORD only, and only its own.
+if [[ -n "${PGUSER:-}" && "$owner_user" -eq 0 ]]; then [[ "${PGPASSWORD:-}" == "$OPS_TEST_RO_PASSWORD" ]] || exit 7
+elif [[ -n "${PGUSER:-}" ]]; then [[ "${PGPASSWORD:-}" == "$OPS_TEST_OWNER_PASSWORD" ]] || exit 7
+else exit 7; fi
 case "$*" in
   *"vacuum (full"*) exit "${OPS_TEST_VACUUM_STATUS:-0}" ;;
   *"'OWNER '"*)
@@ -403,7 +411,8 @@ OWNER_PASSWORD = "S3NTINEL-OWNER-PASSWORD"
 #: session mode (5432) as postgres.<project ref>.
 POOLER_URL = "postgresql://ro.abcdefghijklmnopqrst:S3NTINEL-DB-PASSWORD@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
 OWNER_ENV = {"MILO_READONLY_DB_URL": POOLER_URL, "SUPABASE_DB_PASSWORD": OWNER_PASSWORD,
-             "SUPABASE_PROJECT_ID": "abcdefghijklmnopqrst", "OPS_TEST_OWNER_PASSWORD": OWNER_PASSWORD}
+             "SUPABASE_PROJECT_ID": "abcdefghijklmnopqrst", "OPS_TEST_OWNER_PASSWORD": OWNER_PASSWORD,
+             "OPS_TEST_RO_PASSWORD": "S3NTINEL-DB-PASSWORD"}
 
 
 def vacuum_tree(tmp_path: Path) -> OpsTree:
@@ -433,6 +442,12 @@ def test_the_vacuum_dry_run_reads_sizes_and_the_owner_only(tmp_path):
     assert denied.returncode == 0 and "SUMMARY|register-vacuum owner catalog_raw_records|FAIL|" in denied.stdout
     no_secret(result.stdout, result.stderr, tree.summary.read_text(), "\n".join(tree.tool_calls()))
     assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(tree.tool_calls())
+    # The read-only URL never reaches psql's argv: its parts arrive as libpq's
+    # variables, its password as PGPASSWORD (the stub refuses anything else).
+    reads = [c for c in tree.tool_calls() if "[readonly" in c]
+    assert reads and all("PGUSER=ro.abcdefghijklmnopqrst PGHOST=aws-0-us-east-1.pooler.supabase.com "
+                         "PGPORT=6543 PGDATABASE=postgres" in c for c in reads)
+    assert not [c for c in tree.tool_calls() if "<url>" in c or "S3NTINEL-DB-PASSWORD" in c]
 
 
 def test_the_read_only_role_holds_no_maintain_and_the_owner_rewrites():
