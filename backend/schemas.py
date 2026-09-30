@@ -1089,3 +1089,41 @@ class RegisterDirectoryRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     conversation_id: UUID
+
+
+# --- PR-D3: manufacturer normalisation ----------------------------------------
+
+class NormalisationRequest(BaseModel):
+    """Make the ONE guarded model call over every unmapped source name."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    conversation_id: UUID
+
+
+class NormalisationGroup(BaseModel):
+    """One pending group, exactly as the approval screen received it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    canonical: str = Field(min_length=1, max_length=120)
+    members: list[str] = Field(min_length=1, max_length=2000)
+    rule_id: str | None = Field(default=None, max_length=40)
+    proposal_id: str | None = Field(default=None, pattern=r"^[0-9a-f-]{36}$")
+
+
+class NormalisationRejection(BaseModel):
+    """The owner's rejection of ONE pending group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group: NormalisationGroup
+
+
+class NormalisationApproval(BaseModel):
+    """The owner's approval: several high-confidence groups, or one group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=0)
+    groups: list[NormalisationGroup] = Field(min_length=1, max_length=500)

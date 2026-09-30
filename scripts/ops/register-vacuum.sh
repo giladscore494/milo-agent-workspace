@@ -99,9 +99,49 @@ db_url() {
   printf '%s' "$url"
 }
 read_only() {
-  local url
-  url="$(db_url)" || return 1
-  psql "$url" -X -A -t -v ON_ERROR_STOP=1 -c "$1" 2> /dev/null
+  local -a pg_env=()
+  local pair
+  db_url > /dev/null || return 1
+  # The URL carries the read-only password: it is split here, from the
+  # environment, into libpq's own variables -- never on psql's argv (where any
+  # process listing shows it) -- and exported by the shell (a builtin, no
+  # argv), the password as PGPASSWORD. Every URL parameter libpq would honour
+  # maps to its variable; one this cannot map (or a multi-host URL) refuses
+  # rather than connecting differently from `psql "$url"`. A user or database
+  # the URL leaves out stays libpq's default.
+  mapfile -t pg_env < <(python3 - "$DB_URL_ENV" << 'PY'
+import os, sys
+from urllib.parse import parse_qs, unquote, urlsplit
+url = urlsplit(os.environ[sys.argv[1]])
+if url.scheme not in ("postgres", "postgresql") or not url.hostname or "," in url.netloc:
+    sys.exit(1)
+names = {"sslmode": "PGSSLMODE", "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT", "sslkey": "PGSSLKEY",
+         "connect_timeout": "PGCONNECT_TIMEOUT", "application_name": "PGAPPNAME", "options": "PGOPTIONS",
+         "target_session_attrs": "PGTARGETSESSIONATTRS", "channel_binding": "PGCHANNELBINDING"}
+env = {"PGHOST": url.hostname}
+if url.port:
+    env["PGPORT"] = str(url.port)
+if url.username:
+    env["PGUSER"] = unquote(url.username)
+if url.password:
+    env["PGPASSWORD"] = unquote(url.password)
+if url.path.lstrip("/"):
+    env["PGDATABASE"] = unquote(url.path.lstrip("/"))
+for key, values in parse_qs(url.query, keep_blank_values=True).items():
+    if key not in names or len(values) != 1:
+        sys.exit(1)
+    env[names[key]] = values[0]
+if any("\n" in value or "\0" in value for value in env.values()):
+    sys.exit(1)
+for name, value in env.items():
+    print(f"{name}={value}")
+PY
+  )
+  [[ "${#pg_env[@]}" -gt 0 ]] || return 1
+  (
+    for pair in "${pg_env[@]}"; do export "${pair?}"; done
+    psql -X -A -t -v ON_ERROR_STOP=1 -c "$1" 2> /dev/null
+  )
 }
 # The owner's connection: the read-only URL's host, session mode on a Supabase
 # pooler; "HOST PORT USER DATABASE" (no secret) or nonzero.

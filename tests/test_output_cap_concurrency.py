@@ -265,7 +265,9 @@ def test_settlement_releases_everything_and_cannot_double_release():
 def test_every_swarm_v2_role_has_an_explicit_server_owned_cap():
     assert set(ROLE_OUTPUT_CAPS) == {
         ("commander", "planning"), ("commander", "replanning"),
-        ("worker", "execute"), ("verifier", "verification")}
+        ("worker", "execute"), ("verifier", "verification"),
+        # PR-D3: the one manufacturer-normalisation call (never part of a run).
+        ("normaliser", "manufacturers")}
     assert all(isinstance(cap, int) and cap > 0 for cap in ROLE_OUTPUT_CAPS.values())
 
 

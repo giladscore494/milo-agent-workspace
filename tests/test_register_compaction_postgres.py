@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 import re
+import subprocess
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -50,6 +51,9 @@ from tests.test_migrations_postgres import (BASELINE, MIGRATIONS, SEED_LEGACY_RO
 COMPACTION_PG_PORT = "54996"
 #: By name, never by position.
 COMPACTION_MIGRATION = next(m for m in MIGRATIONS if m.name == "20261002000100_catalog_register_compaction.sql")
+#: The follow-up that restates the coverage decisions (found by name, never by position).
+DECISIONS_MIGRATION = next(m for m in MIGRATIONS
+                           if m.name == "20261002000200_catalog_register_compaction_decisions.sql")
 TOYOTA = WSP_TOYOTA
 RESOURCE = src.WLTP_RESOURCE_ID
 
@@ -776,6 +780,11 @@ def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
 
 def test_the_migration_is_rerun_safe(cdb):
     cdb.psql(file=COMPACTION_MIGRATION)
+    # The follow-up restates the decisions after it, as production applies them.
+    cdb.psql(file=DECISIONS_MIGRATION)
+    cdb.psql(file=DECISIONS_MIGRATION)
+    assert "catalog_candidate_register_reading" in cdb.psql(
+        "select prosrc from pg_proc where proname = 'catalog_work_scope_coverage_decisions'")
     assert cdb.psql("select is_nullable from information_schema.columns where table_name = 'catalog_raw_records' "
                     "and column_name = 'payload'") == "YES"
     # The view, and the three identity indexes still partial, after the second run.
@@ -980,14 +989,32 @@ def _ms(db, sql: str, repeat: int = 3) -> float:
 
 def _scans(db, sql: str) -> list[tuple[str, str]]:
     """Every (node type, relation) of the statement's plan."""
-    found: list[tuple[str, str]] = []
+    return [(kind, relation) for kind, relation, _index in _plan_nodes(db, sql)]
+
+
+def _plan_nodes(db, sql: str) -> list[tuple[str, str, str]]:
+    """Every (node type, relation, index) of the statement's plan."""
+    found: list[tuple[str, str, str]] = []
 
     def walk(node: dict) -> None:
-        found.append((node["Node Type"], node.get("Relation Name", "")))
+        found.append((node["Node Type"], node.get("Relation Name", ""), node.get("Index Name", "")))
         for child in node.get("Plans") or []:
             walk(child)
     walk(json.loads(db.psql(f"explain (format json) {sql}"))[0]["Plan"])
     return found
+
+
+def _nested_plans(db, sql: str) -> str:
+    """The plans of every statement a function runs (auto_explain, sent to the
+    client as notices): a PL/pgSQL reader's own query is invisible to EXPLAIN."""
+    cmd = ["psql", "-h", db.dir, "-p", db.port, "-U", "postgres", "-d", "milo", "-v", "ON_ERROR_STOP=1",
+           "-X", "-q", "-t", "-A", "-c",
+           "load 'auto_explain'; set auto_explain.log_min_duration = 0; "
+           "set auto_explain.log_nested_statements = on; set auto_explain.log_level = notice; "
+           f"set client_min_messages = notice; {sql}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return result.stderr
 
 
 def test_readers_keep_their_indexes_after_compaction(cdb, capsys):
@@ -1015,7 +1042,10 @@ def test_readers_keep_their_indexes_after_compaction(cdb, capsys):
              f"'{'a' * 64}', {READER_ROWS}, '{run}'); update public.runs set status = 'completed' where id = '{run}'")
     sid, model = snapshot["id"], rows[0]["kinuy_mishari"]
     queries = {
-        "coverage_decisions": f"select count(*) from public.catalog_work_scope_coverage_decisions('{sid}', null, null, false)",
+        # Grouped by the decision, so every row's decision is evaluated (a bare
+        # count(*) lets the planner skip the decision expression entirely).
+        "coverage_decisions": "select decision, count(*) from public.catalog_work_scope_coverage_decisions("
+                              f"'{sid}', null, null, false) group by decision order by decision",
         "candidate_page": f"select count(*) from public.catalog_candidate_variant_page('{sid}', p_manufacturer => "
                           f"'{marque}', p_commercial_model => '{model}', p_limit => 50)",
         "identity_lookup": "select count(*) from public.catalog_candidate_variants_resolved "
@@ -1027,14 +1057,28 @@ def test_readers_keep_their_indexes_after_compaction(cdb, capsys):
     # A model filter never reads the whole snapshot: no sequential scan of the three large tables,
     # before compaction (the partial identity indexes) and after (the variant rows).
     assert not [s for s in _scans(cdb, queries["identity_lookup"]) if s[0] == "Seq Scan" and s[1] in large]
-    before = {name: _ms(cdb, sql) for name, sql in queries.items()}
+    before = {name: _ms(cdb, sql, repeat=5) for name, sql in queries.items()}
     answers = {name: cdb.psql(sql) for name, sql in queries.items()}
+    decisions = (f"select candidate_id, upstream_record_id, decision from "
+                 f"public.catalog_work_scope_coverage_decisions('{sid}', null, null, false) order by candidate_id")
+    decided = cdb.psql(decisions)
     assert _compact(cdb, snapshot["key"], verified=True)["status"] == "compacted"
     cdb.psql("analyze public.catalog_candidate_variants; analyze public.catalog_variants; "
              "analyze public.catalog_raw_records")
-    after = {name: _ms(cdb, sql) for name, sql in queries.items()}
+    after = {name: _ms(cdb, sql, repeat=5) for name, sql in queries.items()}
     assert {name: cdb.psql(sql) for name, sql in queries.items()} == answers
+    # The decisions answer row for row as they did from the payloads.
+    assert cdb.psql(decisions) == decided
     with capsys.disabled():
         print(f"\nPR-L2 reader timings ({READER_ROWS:,} rows, ms, before -> after compaction): "
               + ", ".join(f"{name} {before[name]:.1f} -> {after[name]:.1f}" for name in queries))
     assert not [s for s in _scans(cdb, queries["identity_lookup"]) if s[0] == "Seq Scan" and s[1] in large]
+    # "No Seq Scan" alone cannot see a dropped or broken reading index: the
+    # compacted rows are reached THROUGH catalog_variants_reading_idx -- in
+    # the view directly, and inside the candidate page (a PL/pgSQL reader).
+    assert "catalog_variants_reading_idx" in {index for _kind, _rel, index in _plan_nodes(cdb, queries["identity_lookup"])}
+    assert "catalog_variants_reading_idx" in _nested_plans(cdb, queries["candidate_page"])
+    # The decisions read a compacted row's variant once (20261002000200): with
+    # every decision evaluated they are no slower than on the same rows before
+    # compaction (measured 0.74x; bound 1.5x for a noisy runner).
+    assert after["coverage_decisions"] <= 1.5 * max(before["coverage_decisions"], 5.0), (before, after)

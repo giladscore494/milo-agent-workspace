@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     # E': the capture job the website's Prepare route executes. Empty (the
     # default) means this API has no capture job, so it can prepare nothing.
     cloud_run_capture_job: str = Field(default="", alias="CLOUD_RUN_CAPTURE_JOB")
+    # PR-D3: the manufacturer normalisation job (the only one holding the
+    # provider key). Empty means this API can normalise nothing.
+    cloud_run_normalisation_job: str = Field(default="", alias="CLOUD_RUN_NORMALISATION_JOB")
 
     @property
     def cors_origin_list(self) -> list[str]:

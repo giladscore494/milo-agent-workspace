@@ -191,6 +191,41 @@ else
   fi
 fi
 
+# --- PR-D3: the normalisation job exists exactly while its stage is on ------
+# It is the only surface holding the provider key while the stage is on; a
+# job left behind with the stage off (or a stage on without its job) is not a
+# deployed posture.
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
+if [[ -z "$NORMALISATION_JOB" ]] || ! command -v gcloud > /dev/null 2>&1; then
+  printf 'NORMALISATION_JOB=UNVERIFIED (no capture job configured, or gcloud is unavailable)\n'
+elif ! normalisation_state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID")"; then
+  printf 'NORMALISATION_JOB=UNVERIFIED (the Cloud Run jobs could not be listed)\n'
+  [[ "${FACTS[CODE_DEPLOYED]:-}" != "VERIFIED" ]] \
+    || fact CODE_DEPLOYED UNVERIFIED "NORMALISATION_JOB: the Cloud Run jobs could not be listed"
+elif ! api_json="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+       --format=json 2> /dev/null)"; then
+  printf 'NORMALISATION_JOB=UNVERIFIED (the API service could not be described)\n'
+  [[ "${FACTS[CODE_DEPLOYED]:-}" != "VERIFIED" ]] \
+    || fact CODE_DEPLOYED UNVERIFIED "NORMALISATION_JOB: the API service could not be described"
+else
+  normalisation_flag="$(milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" <<< "$api_json")"
+  posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
+  printf 'NORMALISATION_JOB=%s (%s: %s)\n' "${posture%% *}" "$NORMALISATION_JOB" "${posture#* }"
+  [[ "${posture%% *}" == "PASS" ]] || fact CODE_DEPLOYED NO "NORMALISATION_JOB: ${posture#* }"
+  # While it exists (it holds the provider key) the API runs it only as
+  # defined: no role carrying run.jobs.runWithOverrides, read from IAM.
+  if [[ "$normalisation_state" == "present" ]]; then
+    if [[ -z "$(milo_op API_SERVICE_ACCOUNT)" ]]; then
+      override="BLOCKED no API_SERVICE_ACCOUNT is configured, so who may override the job is unknown"
+    else
+      override="$(milo_normalisation_override_posture "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID" \
+        "serviceAccount:$(milo_op API_SERVICE_ACCOUNT)")"
+    fi
+    printf 'NORMALISATION_JOB_OVERRIDES=%s (%s)\n' "${override%% *}" "${override#* }"
+    [[ "${override%% *}" == "PASS" ]] || fact CODE_DEPLOYED NO "NORMALISATION_JOB_OVERRIDES: ${override#* }"
+  fi
+fi
+
 # --- DATABASE_READY: the EXACT migration set, then the path's schema ------
 DB_ENV="$(milo_op READONLY_DATABASE_URL_ENV)"
 state_status=0

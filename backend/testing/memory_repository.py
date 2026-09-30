@@ -19,6 +19,7 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from backend.testing.register_memory import RegisterMemoryMixin
+from backend.testing.normalization_memory import NormalizationMemoryMixin
 from backend.testing.variants_memory import VariantsMemoryMixin
 from backend.catalog import coverage as catalog_coverage
 from backend.catalog.contracts import (CANDIDATE_STATUSES, CATALOG_SOURCE_FAMILIES,
@@ -134,7 +135,7 @@ def _support_set(support: Any) -> frozenset[tuple[str, Any, Any]]:
                      for link in (support or []) if isinstance(link, Mapping))
 
 
-class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
+class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin, NormalizationMemoryMixin):
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.users: set[str] = set()

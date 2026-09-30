@@ -22,6 +22,9 @@ CONTRACT = REPO / "scripts" / "deploy" / "deployment-contract.sh"
 ACTIVATE = REPO / "scripts" / "deploy" / "website-execution-activate.sh"
 ACK = "I_UNDERSTAND_THIS_CHANGES_PRODUCTION"
 DEPLOYMENT = "https://milo-prod-abc123.vercel.app"
+CAPTURE_SA = "capture@p.iam.gserviceaccount.com"
+SA_CONFIG = (f"CAPTURE_SERVICE_ACCOUNT={CAPTURE_SA}\nWORKER_SERVICE_ACCOUNT=worker@p.iam.gserviceaccount.com\n"
+             "SECRET_PROVIDER_API_KEY=kimi\nSECRET_REDIS_URL=redis-url\nSECRET_REDIS_TOKEN=redis-token\n")
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash
 args="$*"
@@ -39,6 +42,15 @@ case "${args}" in
   "run jobs describe capture "*)
     [[ -f "${MOCK_DIR}/capture.json" ]] || { echo "not found" >&2; exit 1; }
     cat "${MOCK_DIR}/capture.json" ;;
+  "run jobs list --region r --project p --filter=metadata.name=capture-normalisation --format=value(metadata.name)")
+    [[ "${MOCK_JOBS_LIST_EXIT:-0}" == 0 ]] || exit "${MOCK_JOBS_LIST_EXIT}"
+    [[ ! -f "${MOCK_DIR}/normalisation.present" ]] || echo capture-normalisation ;;
+  "run jobs delete capture-normalisation --region r --project p --quiet")
+    [[ "${MOCK_IGNORE_UPDATES:-0}" == 1 ]] || rm -f "${MOCK_DIR}/normalisation.present" ;;
+  "secrets get-iam-policy "*" --project p --format=json")
+    cat "${MOCK_DIR}/policy-$3.json" 2> /dev/null || echo '{}' ;;
+  "secrets remove-iam-policy-binding "*" --project p --member serviceAccount:capture@p.iam.gserviceaccount.com --role roles/secretmanager.secretAccessor --all")
+    [[ "${MOCK_IGNORE_UPDATES:-0}" == 1 ]] || rm -f "${MOCK_DIR}/policy-$3.json" ;;
   *) echo "unexpected gcloud invocation: ${args}" >&2; exit 9 ;;
 esac
 """
@@ -134,7 +146,8 @@ WORKER_WITH_SECRET_KEY = env_doc({**{flag: "true" for flag in WORKER_OPENED},
 
 
 def run_switch(tmp_path, *args, env=None, api=CLOSED_API, worker=CLOSED_WORKER, capture=None,
-               ack=True, capture_configured=True, vercel_linked=True):
+               ack=True, capture_configured=True, vercel_linked=True, normalisation_job=False,
+               capture_sa_reads=(), extra_config=""):
     tmp_path.mkdir(parents=True, exist_ok=True)
     mock_dir = tmp_path / "mock"
     mock_dir.mkdir(exist_ok=True)
@@ -144,6 +157,11 @@ def run_switch(tmp_path, *args, env=None, api=CLOSED_API, worker=CLOSED_WORKER, 
     (mock_dir / "job.json").write_text(worker if isinstance(worker, str) else json.dumps(worker))
     if capture is not None:
         (mock_dir / "capture.json").write_text(json.dumps(capture))
+    if normalisation_job:
+        (mock_dir / "normalisation.present").write_text("")
+    for secret in capture_sa_reads:
+        (mock_dir / f"policy-{secret}.json").write_text(json.dumps({"bindings": [
+            {"role": "roles/secretmanager.secretAccessor", "members": [f"serviceAccount:{CAPTURE_SA}"]}]}))
     (mock_dir / "apply.py").write_text(MOCK_APPLY)
     for name, body in (("gcloud", MOCK_GCLOUD), ("vercel", MOCK_VERCEL)):
         shim = bin_dir / name
@@ -152,7 +170,7 @@ def run_switch(tmp_path, *args, env=None, api=CLOSED_API, worker=CLOSED_WORKER, 
     config = tmp_path / "operator.env"
     config.write_text("GCP_PROJECT_ID=p\nGCP_REGION=r\nCLOUD_RUN_API_SERVICE=api\n"
                       "CLOUD_RUN_WORKER_JOB=job\n"
-                      + ("CLOUD_RUN_CAPTURE_JOB=capture\n" if capture_configured else ""))
+                      + ("CLOUD_RUN_CAPTURE_JOB=capture\n" if capture_configured else "") + extra_config)
     log = tmp_path / "calls.log"
     log.write_text("")
     # The directory linked to the Vercel project; every vercel command runs in it.
@@ -173,7 +191,8 @@ def run_switch(tmp_path, *args, env=None, api=CLOSED_API, worker=CLOSED_WORKER, 
 
 def mutations(calls):
     return [c for c in calls
-            if not re.match(r"gcloud (auth list|config get-value|run (jobs|services) describe)|vercel whoami", c)]
+            if not re.match(r"gcloud (auth list|config get-value|run (jobs|services) describe|run jobs list"
+                            r"|secrets get-iam-policy)|vercel whoami", c)]
 
 
 def vercel_dirs(tmp_path):
@@ -487,7 +506,9 @@ def test_the_script_never_enables_anything():
     assert "--update-secrets" not in text and "--set-env-vars" not in text
     code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#")).lower()
     assert "executions" not in code, "the switch never cancels (or touches) an execution"
-    assert "delete" not in code, "the switch never deletes a resource"
+    # It deletes one resource only: the normalisation job (PR-D3), which holds the provider key.
+    assert all("normalisation_job" in line for line in code.splitlines() if "delete" in line), \
+        "the switch deletes nothing but the normalisation job"
     assert not re.search(r"vercel (rm|remove)\b", code), "only env values are replaced, never a deployment"
 
 
@@ -496,3 +517,53 @@ def test_help_exits_zero_without_configuration():
                             env={"PATH": "/usr/bin:/bin"}, timeout=30)
     assert result.returncode == 0
     assert "--dry-run" in result.stdout and "--apply" in result.stdout
+
+
+# --- PR-D3: the normalisation job and the capture identity ----------------------
+
+def test_the_normalisation_job_is_deleted_and_read_back_absent(tmp_path):
+    result, calls = run_switch(tmp_path, "--apply", "--vercel-deployment", DEPLOYMENT, capture=CLOSED_WORKER,
+                               normalisation_job=True, extra_config=SA_CONFIG)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "gcloud run jobs delete capture-normalisation --region r --project p --quiet" in mutations(calls)
+    assert not (tmp_path / "mock" / "normalisation.present").exists()
+    assert "normalisation: the job capture-normalisation is absent" in result.stdout
+    # The capture identity held nothing: nothing was revoked, and each secret was read.
+    assert not any("remove-iam-policy-binding" in c for c in calls)
+    assert sum("secrets get-iam-policy" in c for c in calls) == 6  # step 6 + read-back, three secrets
+
+
+def test_an_absent_normalisation_job_is_left_alone_and_read_back(tmp_path):
+    result, calls = run_switch(tmp_path, "--apply", "--vercel-deployment", DEPLOYMENT, capture=CLOSED_WORKER)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not any("jobs delete" in c for c in calls)
+    assert "normalisation: the job capture-normalisation is absent" in result.stdout
+
+
+def test_a_normalisation_job_that_survives_or_cannot_be_listed_fails_the_switch(tmp_path):
+    kept, _ = run_switch(tmp_path / "kept", "--apply", "--vercel-deployment", DEPLOYMENT, capture=CLOSED_WORKER,
+                         normalisation_job=True, env={"MOCK_IGNORE_UPDATES": "1"})
+    assert kept.returncode == 1
+    assert "NOT CLOSED (normalisation): the job capture-normalisation is present" in kept.stdout
+    unlisted, _ = run_switch(tmp_path / "unlisted", "--apply", "--vercel-deployment", DEPLOYMENT,
+                             capture=CLOSED_WORKER, env={"MOCK_JOBS_LIST_EXIT": "1"})
+    assert unlisted.returncode == 1 and "STEP 6 FAILED: the normalisation job" in unlisted.stderr
+    assert "NOT CLOSED (normalisation): the job capture-normalisation is unreadable" in unlisted.stdout
+
+
+def test_the_capture_identity_loses_any_provider_or_quota_accessor(tmp_path):
+    result, calls = run_switch(tmp_path, "--apply", "--vercel-deployment", DEPLOYMENT, capture=CLOSED_WORKER,
+                               extra_config=SA_CONFIG, capture_sa_reads=("kimi", "redis-token"))
+    assert result.returncode == 0, result.stdout + result.stderr
+    revoked = [c for c in mutations(calls) if "remove-iam-policy-binding" in c]
+    assert [c.split()[3] for c in revoked] == ["kimi", "redis-token"]
+    held, _ = run_switch(tmp_path / "held", "--apply", "--vercel-deployment", DEPLOYMENT, capture=CLOSED_WORKER,
+                         extra_config=SA_CONFIG, capture_sa_reads=("kimi",), env={"MOCK_IGNORE_UPDATES": "1"})
+    assert held.returncode == 1 and "NOT CLOSED (capture identity): it may read kimi" in held.stdout
+
+
+def test_the_dry_run_names_the_normalisation_teardown_and_calls_nothing(tmp_path):
+    result, calls = run_switch(tmp_path, ack=False, extra_config=SA_CONFIG)
+    assert result.returncode == 0 and calls == []
+    assert "gcloud run jobs delete capture-normalisation --region r --project p --quiet" in result.stdout
+    assert "gcloud secrets remove-iam-policy-binding kimi" in result.stdout

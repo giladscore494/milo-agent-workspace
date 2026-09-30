@@ -47,6 +47,7 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_REGISTER_CAPTURE=false
   MILO_ENABLE_REGISTER_CAPTURE_JOB=false
   MILO_ENABLE_CATALOG_BROWSER=false
+  MILO_ENABLE_MANUFACTURER_NORMALISATION=false
 )
 
 # PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
@@ -435,6 +436,7 @@ MILO_CAPTURE_PINNED_OFF_FLAGS=(
   MILO_ENABLE_EXECUTION_CONTROL=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
   MILO_ENABLE_REGISTER_CAPTURE_JOB=false
+  MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB=false
 )
 
 # Scoped catalog PR2: the scoped-preparation switch, BY NAME ONLY. The job
@@ -511,6 +513,201 @@ MILO_REGISTER_CAPTURE_JOB_FLAG_NAME="MILO_ENABLE_REGISTER_CAPTURE_JOB"
 MILO_CATALOG_BROWSER_API_ENABLE_FLAGS=(
   MILO_ENABLE_CATALOG_BROWSER
 )
+
+# PR-D3 — manufacturer normalisation (decisions 14, 33). API: the "Normalise
+# manufacturers" button, which executes its OWN small job (the API's
+# CLOUD_RUN_NORMALISATION_JOB) with its per-execution switch
+# (MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB) for ONE guarded K3 call under
+# the deployment's RuntimePolicy caps. That job -- and only that job -- binds
+# the provider key and the shared provider-quota store, running as the worker
+# identity: the capture job and the capture identity never hold the key
+# (website-execution-activate.sh --apply-manufacturer-normalisation, read back).
+# Off: --remove-manufacturer-normalisation (the kill switch and every deploy's
+# Stage A reset) deletes the job and revokes any capture-identity access.
+# Allowed while paid runs are off; run creation and paid execution stay off.
+MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS=(
+  MILO_ENABLE_MANUFACTURER_NORMALISATION
+)
+MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME="MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
+MILO_NORMALISATION_JOB_ENV_NAME="CLOUD_RUN_NORMALISATION_JOB"
+# The API runs the normalisation job WITHOUT overrides (it holds the provider
+# key): run.jobs.run, never run.jobs.runWithOverrides. Its read of the job
+# (the release check) is MILO_API_JOB_READ_ROLE (roles/run.viewer) above.
+MILO_API_NORMALISATION_RUN_ROLE="roles/run.jobsExecutor"
+MILO_RUN_WITH_OVERRIDES_PERMISSION="run.jobs.runWithOverrides"
+# Every permission that lets a holder make the job run something other than
+# its definition: an override, or rewriting / replacing / re-granting the job
+# and then running it with plain run.jobs.run.
+MILO_JOB_REWRITE_PERMISSIONS=(run.jobs.runWithOverrides run.jobs.update run.jobs.create run.jobs.replace
+  run.jobs.setIamPolicy)
+
+# milo_normalisation_job_name — CLOUD_RUN_NORMALISATION_JOB, else
+# <CLOUD_RUN_CAPTURE_JOB>-normalisation ('' when neither is configured).
+milo_normalisation_job_name() {
+  local name capture
+  name="$(milo_op CLOUD_RUN_NORMALISATION_JOB)"
+  capture="$(milo_op CLOUD_RUN_CAPTURE_JOB)"
+  [[ -n "$name" || -z "$capture" ]] || name="${capture}-normalisation"
+  printf '%s' "$name"
+}
+
+# milo_job_state JOB REGION PROJECT — "present" or "absent", from a listing,
+# so a listing that fails is nonzero and never reads as "absent".
+milo_job_state() {
+  local listed
+  [[ -n "$1" ]] || { printf 'absent'; return 0; }
+  listed="$(gcloud run jobs list --region "$2" --project "$3" --filter="metadata.name=$1" \
+    --format='value(metadata.name)' 2> /dev/null)" || return 1
+  if [[ "$listed" == "$1" ]]; then printf 'present'; else printf 'absent'; fi
+}
+
+# milo_remove_job JOB REGION PROJECT — delete the job where it is, then read
+# back its absence; nonzero unless it reads back absent.
+milo_remove_job() {
+  local state
+  state="$(milo_job_state "$@")" || return 1
+  if [[ "$state" == "present" ]]; then
+    gcloud run jobs delete "$1" --region "$2" --project "$3" --quiet > /dev/null || return 1
+    state="$(milo_job_state "$@")" || return 1
+  fi
+  [[ "$state" == "absent" ]]
+}
+
+# milo_env_value NAME < DESCRIBE_JSON — the plain value NAME carries on the
+# described service or job ('' when unset, secret-backed or unreadable).
+milo_env_value() {
+  python3 -c '
+import json, sys
+try:
+    doc = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    doc = {}
+def containers(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            yield from node["containers"]
+        for value in node.values():
+            yield from containers(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from containers(value)
+for container in containers(doc):
+    for env in container.get("env") or []:
+        if isinstance(env, dict) and env.get("name") == sys.argv[1] and "value" in env:
+            print(env["value"])
+            sys.exit(0)
+' "$1"
+}
+
+# milo_normalisation_posture JOB_STATE API_FLAG_VALUE — "PASS <why>" or
+# "BLOCKED <why>". The job holds the provider key, so it exists exactly while
+# the stage is on.
+milo_normalisation_posture() {
+  local on=0
+  case "$(tr -d "[]'\" " <<< "$2" | tr '[:upper:]' '[:lower:]')" in 1 | true | yes | on) on=1 ;; esac
+  case "$1|$on" in
+    present\|1) printf 'PASS the normalisation job exists and the stage is on' ;;
+    absent\|0) printf 'PASS no normalisation job, and the stage is off' ;;
+    present\|0) printf 'BLOCKED the normalisation job (which holds the provider key) exists while the stage is off. Remediation: Actions -> Website stage -> stage = normalisation-off (bash scripts/ops/website-stage.sh --stage normalisation-off), which deletes the job and revokes the capture identity'"'"'s access, both read back' ;;
+    *) printf 'BLOCKED the stage is on but its normalisation job is absent. Remediation: Actions -> Website stage -> stage = normalisation-off to turn it off, or stage = manufacturer-normalisation to restore it' ;;
+  esac
+}
+
+# milo_policy_member_roles MEMBER < POLICY_JSON — every role MEMBER holds,
+# one per line (" conditional" appended for a conditional binding); nonzero
+# when the policy is not readable JSON (never "no roles").
+milo_policy_member_roles() {
+  python3 -c '
+import json, sys
+try:
+    policy = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(2)
+if not isinstance(policy, dict):
+    sys.exit(2)
+for b in policy.get("bindings") or []:
+    if isinstance(b, dict) and sys.argv[1] in (b.get("members") or []):
+        print(str(b.get("role")) + (" conditional" if b.get("condition") else ""))
+' "$1"
+}
+
+# milo_role_permissions ROLE — the permissions ROLE includes, one per line,
+# read from IAM itself (a predefined role, or a custom one by its full
+# projects/.../roles/... or organizations/.../roles/... name); nonzero when it
+# cannot be read (never "no permissions").
+milo_role_permissions() {
+  local json
+  json="$(gcloud iam roles describe "$1" --format=json 2> /dev/null)" || return 1
+  python3 -c '
+import json, sys
+try:
+    role = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(2)
+permissions = role.get("includedPermissions") if isinstance(role, dict) else None
+if not isinstance(permissions, list) or not permissions:
+    sys.exit(2)
+print("\n".join(str(p) for p in permissions))
+' <<< "$json"
+}
+
+# milo_normalisation_override_posture JOB REGION PROJECT MEMBER — "PASS <why>"
+# or "BLOCKED <why>": MEMBER (the API identity) holds no role carrying
+# run.jobs.runWithOverrides, neither on the normalisation job nor at project
+# level (a project role reaches every job). Any unreadable policy or role is
+# BLOCKED, never a pass.
+milo_normalisation_override_posture() {
+  local job="$1" region="$2" project="$3" member="$4" policy roles role permissions permission where holders=""
+  for where in job project; do
+    if [[ "$where" == "job" ]]; then
+      policy="$(gcloud run jobs get-iam-policy "$job" --region "$region" --project "$project" --format=json 2> /dev/null)" \
+        || { printf 'BLOCKED the IAM policy of %s could not be read' "$job"; return 0; }
+    else
+      policy="$(gcloud projects get-iam-policy "$project" --format=json 2> /dev/null)" \
+        || { printf 'BLOCKED the project IAM policy of %s could not be read' "$project"; return 0; }
+    fi
+    roles="$(milo_policy_member_roles "$member" <<< "$policy")" \
+      || { printf 'BLOCKED the %s IAM policy is not readable JSON' "$where"; return 0; }
+    while IFS= read -r role; do
+      [[ -n "$role" ]] || continue
+      role="${role% conditional}"
+      permissions="$(milo_role_permissions "$role")" \
+        || { printf 'BLOCKED the permissions of %s (held by %s) could not be read' "$role" "$member"; return 0; }
+      for permission in "${MILO_JOB_REWRITE_PERMISSIONS[@]}"; do
+        if grep -qx "$permission" <<< "$permissions"; then
+          holders+="${role} (${where}: ${permission}) "
+          break
+        fi
+      done
+    done <<< "$roles"
+  done
+  if [[ -n "$holders" ]]; then
+    printf 'BLOCKED %s can run %s with overrides, or rewrite it, through %s-- either would hand it the provider key. Remediation: gcloud run jobs remove-iam-policy-binding %s --region %s --project %s --member %s --role <that role> (or remove the project-level role), then grant %s only' \
+      "$member" "$job" "$holders" "$job" "$region" "$project" "$member" "$MILO_API_NORMALISATION_RUN_ROLE"
+  else
+    printf 'PASS %s holds no role carrying %s on %s or its project' "$member" "$(IFS=/; printf '%s' "${MILO_JOB_REWRITE_PERMISSIONS[*]}")" "$job"
+  fi
+}
+
+# milo_revoke_accessor SECRET MEMBER PROJECT — MEMBER holds no role at all on
+# SECRET: its secretAccessor bindings (conditional ones too, --all) removed,
+# then read back. Any OTHER role (admin, owner) is refused and named, never
+# removed silently; an unreadable policy is a failure.
+milo_revoke_accessor() {
+  local policy roles
+  policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
+  roles="$(milo_policy_member_roles "$2" <<< "$policy")" || return 1
+  [[ -n "$roles" ]] || return 0
+  if grep -qv '^roles/secretmanager.secretAccessor\( conditional\)\?$' <<< "$roles"; then
+    printf 'FAIL: %s holds %s on %s: remove it by hand.\n' "$2" "$(tr '\n' ' ' <<< "$roles")" "$1" >&2
+    return 1
+  fi
+  gcloud secrets remove-iam-policy-binding "$1" --project "$3" --member "$2" \
+    --role roles/secretmanager.secretAccessor --all > /dev/null || return 1
+  policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
+  roles="$(milo_policy_member_roles "$2" <<< "$policy")" || return 1
+  [[ -z "$roles" ]]
+}
 
 # Stage 2 (website execution), API service.
 #

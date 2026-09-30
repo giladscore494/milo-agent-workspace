@@ -7,6 +7,12 @@
                       Run capture-job trigger (`prepare_trigger.py`), release
                       refusal first (both jobs on the current release).
 `request_directory_refresh`  the same trigger, directory mode.
+`normalization_view` / `request_normalization` / `approve_normalization`
+                      PR-D3: manufacturer normalisation -- the canonical
+                      names, the deterministic groups and the latest model
+                      proposal; the ONE guarded K3 call (the same trigger,
+                      normalisation mode, behind its own flag); the owner's
+                      approval.
 
 Capture is $0 and is NOT a product run: it depends on the register stage flag
 (`MILO_ENABLE_REGISTER_CAPTURE`) and nothing else -- never on
@@ -29,8 +35,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping, Sequence
 from uuid import UUID
 
-from backend.capture_invocation import InvocationError, register_capture, register_directory
+from backend.capture_invocation import (InvocationError, manufacturer_normalisation, register_capture,
+                                       register_directory)
 from backend.catalog.register import config as register_config
+from backend.catalog.register import normalization
 from backend.catalog.scope import prepare_trigger as trig
 from backend.errors import AppError
 from backend.production_config import TRUE_VALUES
@@ -60,6 +68,16 @@ REQUEST_REASONS: Mapping[str, tuple[int, str]] = {
         (404, "that conversation does not belong to this project"),
     "CATALOG_REGISTER_WORKFLOW_UNSUPPORTED":
         (409, "this project's engine does not read the Government catalog"),
+    # PR-D3.
+    "CATALOG_NORMALIZATION_DISABLED": (404, "manufacturer normalisation is not enabled"),
+    "CATALOG_NORMALIZATION_NOTHING_UNMAPPED": (409, "every source manufacturer name is already mapped"),
+    "CATALOG_NORMALIZATION_OWNER_ONLY": (403, "only a project owner starts, approves or rejects a normalisation"),
+    "CATALOG_NORMALIZATION_APPROVAL_INVALID": (422, "that is not a pending group, or it must be approved alone"),
+    "CATALOG_NORMALIZATION_REJECTION_INVALID": (422, "that is not a pending group"),
+    "CATALOG_NORMALIZATION_VERSION_STALE": (409, "the active normalisation changed; reload"),
+    "CATALOG_NORMALIZATION_COOLDOWN": (429, "a normalisation was requested moments ago; try again later"),
+    "CATALOG_NORMALIZATION_INPUT_TOO_LARGE":
+        (422, "more unmapped manufacturer names than one normalisation may carry"),
 }
 
 _TRIGGER_CODES = {trig.JOB_NOT_RELEASE: "CATALOG_REGISTER_JOB_NOT_RELEASE",
@@ -201,9 +219,13 @@ def register_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: Any,
                 continue
     rows: list[dict[str, Any]] = []
     captured_units = captured_rows = 0
+    # A label beside the exact tozar: unreadable, the page shows the source names.
+    canonical = normalization.current_map_or_empty(repo) if directory is not None else {}
     if directory is not None:
         for entry in directory["units"]:
             view = {"tozar": entry["tozar"], "expected_rows": int(entry["expected_rows"]),
+                    # PR-D3: the approved canonical manufacturer (the tozar stays exact).
+                    "canonical_manufacturer": canonical.get(str(entry["tozar"])),
                     **_state(latest_by_tozar.get(str(entry["tozar"])), runs, groups)}
             if view["state"] == "captured":
                 captured_units += 1
@@ -392,6 +414,199 @@ def request_directory_refresh(repo: Any, user_id: UUID, project_id: UUID, *, con
         raise
 
 
+# -- PR-D3: manufacturer normalisation ---------------------------------------------
+
+def _normalization_inputs(repo: Any) -> tuple[dict[str, int], dict[str, Any], dict[str, str]]:
+    """(every directory tozar -> rows, per captured tozar its evidence, the active map)."""
+    directory = repo.latest_register_directory()
+    if directory is None:
+        raise _refusal("CATALOG_REGISTER_NO_DIRECTORY")
+    names = {str(unit["tozar"]): int(unit["expected_rows"]) for unit in directory["units"]}
+    evidence = {str(row["tozar"]): row for row in repo.catalog_manufacturer_evidence()}
+    return names, evidence, normalization.current_map(repo)
+
+
+def _pending(repo: Any) -> dict[str, Any]:
+    names, evidence, active = _normalization_inputs(repo)
+    rules = normalization.deterministic_groups(names, evidence, active)
+    # The newest ANSWERED proposal: a later request, refused or still running,
+    # never hides the groups waiting for approval.
+    answered = repo.latest_manufacturer_normalization_proposal("proposed")
+    model = [dict(group, proposal_id=str(answered["id"]))
+             for group in (answered or {}).get("groups") or []
+             if any(active.get(m) != group["canonical"] for m in group["members"])]
+    proposal = repo.latest_manufacturer_normalization_proposal()
+    # A group the owner rejected, exactly as it was proposed, is not pending.
+    rejected = {(row["canonical_name"], tuple(sorted(row["members"], key=str.encode)), row.get("rule_id"),
+                 str(row["proposal_id"]) if row.get("proposal_id") else None)
+                for row in repo.manufacturer_normalization_rejections()}
+    pending = [group for group in rules + model
+               if (group["canonical"], tuple(sorted(group["members"], key=str.encode)), group.get("rule_id"),
+                   group.get("proposal_id")) not in rejected]
+    for group in pending:
+        group["conflicting"] = normalization.conflicts(group, active, pending)
+        # A single-member group re-names one source: always approved on its own.
+        group["bulk_approvable"] = (group["confidence"] == "high" and not group["conflicting"]
+                                    and len(group["members"]) >= 2)
+    current = repo.manufacturer_normalization_current() or {}
+    return {"version": int(current.get("version") or 0), "active": active, "pending": pending,
+            "proposal": proposal, "unmapped": len(set(names) - set(active))}
+
+
+def normalization_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: Any,
+                       env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The approval screen: the active version (canonical -> its exact
+    sources), the pending groups (rules, then the latest model proposal) and
+    whether the "Normalise manufacturers" button may be pressed."""
+    environment = os.environ if env is None else env
+    require_enabled(environment)
+    if not _supported(repo.get_project(project_id, user_id)):
+        raise _refusal("CATALOG_REGISTER_DISABLED")
+    state = _pending(repo)
+    owner = repo.project_member_role(project_id, user_id) == "owner"
+    canonical: dict[str, list[str]] = {}
+    for source, name in sorted(state["active"].items(), key=lambda item: item[0].encode("utf-8")):
+        canonical.setdefault(name, []).append(source)
+    proposal = state["proposal"] or None
+    return {
+        "version": state["version"], "unmapped": state["unmapped"],
+        "canonical": [{"canonical": name, "sources": sources} for name, sources in sorted(
+            canonical.items(), key=lambda item: item[0].encode("utf-8"))],
+        "pending": state["pending"],
+        "proposal": None if proposal is None else {
+            key: proposal.get(key) for key in ("id", "status", "reason_code", "model", "created_at")},
+        "can_normalise": (normalization.enabled(environment) and trigger is not None and state["unmapped"] > 0
+                          and owner),
+        "can_approve": owner,
+    }
+
+
+def request_normalization(repo: Any, user_id: UUID, project_id: UUID, *, conversation_id: UUID,
+                          trigger: Any, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """Start the ONE guarded K3 call over every unmapped name (the capture job,
+    normalisation mode), or answer with the one still live."""
+    environment = os.environ if env is None else env
+    try:
+        require_enabled(environment)
+        if not normalization.enabled(environment):
+            raise _refusal("CATALOG_NORMALIZATION_DISABLED")
+        _authorized_conversation(repo, user_id, project_id, conversation_id)
+        if repo.project_member_role(project_id, user_id) != "owner":
+            raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")  # it spends the owner's daily budget
+        if trigger is None:
+            raise _refusal("CATALOG_REGISTER_UNAVAILABLE")
+        _release_gate(trigger)
+        names, evidence, active = _normalization_inputs(repo)
+        try:
+            rows = normalization.model_input(names, evidence, active)
+        except normalization.NormalizationRefused:
+            raise _refusal("CATALOG_NORMALIZATION_INPUT_TOO_LARGE") from None
+        if not rows:
+            raise _refusal("CATALOG_NORMALIZATION_NOTHING_UNMAPPED")
+        claim = repo.request_manufacturer_normalization(user_id, rows, grace_seconds=START_GRACE_SECONDS)
+        group, proposal = claim["group"], claim["proposal"]
+        if claim["decision"] == "cooldown":
+            raise _refusal("CATALOG_NORMALIZATION_COOLDOWN")
+        if claim["decision"] != "claimed":
+            # `existing` (one is live) or `reused` (this exact input already has
+            # an answer): nothing starts, nothing is spent.
+            return {"started": False, "proposal_id": str(proposal["id"]), "decision": claim["decision"]}
+
+        def record(state: str, run_id: str | None, execution: str | None = None) -> None:
+            repo.record_register_capture_trigger(group["id"], run_id=run_id, trigger_state=state,
+                                                 execution_name=execution)
+
+        run_id = _run_for(repo, conversation_id=conversation_id, user_id=user_id,
+                          key=f"manufacturer-normalisation-{group['id']}", environment=environment)
+        if run_id is None:
+            record(trig.TRIGGER_FAILED, None)
+            raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED")
+        # The run is recorded on the group BEFORE the job starts: the job
+        # claims this proposal and its run from the database, since it is
+        # executed exactly as defined (no overrides, no id passed).
+        record("claimed", run_id)
+        outcome = trigger.run(manufacturer_normalisation())
+        if outcome.state not in (trig.TRIGGERED, trig.TRIGGER_FAILED, trig.TRIGGER_UNKNOWN):
+            outcome = trig.TriggerOutcome(trig.TRIGGER_UNKNOWN)
+        record(outcome.state, run_id, outcome.execution_name)
+        if outcome.state == trig.TRIGGER_FAILED:
+            raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED")
+        return {"started": True, "proposal_id": str(proposal["id"]), "run_id": run_id}
+    except AppError as refused:
+        _log_refusal(project_id, refused.code)
+        raise
+
+
+def approve_normalization(repo: Any, user_id: UUID, project_id: UUID, *, expected_version: int,
+                          groups: Sequence[Mapping[str, Any]], env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The owner approves pending groups exactly as proposed: several at once
+    only when every one is high-confidence and conflicts with nothing; a
+    low-confidence or conflicting group alone. Creates the next version."""
+    try:
+        require_enabled(env)
+        if not _supported(repo.get_project(project_id, user_id)):
+            raise _refusal("CATALOG_REGISTER_DISABLED")
+        if repo.project_member_role(project_id, user_id) != "owner":
+            raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")
+        pending = _pending(repo)["pending"]
+        chosen = []
+        for asked in groups:
+            match = next((group for group in pending if _same_group(asked, group)), None)
+            if match is None or match in chosen:
+                raise _refusal("CATALOG_NORMALIZATION_APPROVAL_INVALID")
+            chosen.append(match)
+        if not chosen or (len(chosen) > 1 and not all(group["bulk_approvable"] for group in chosen)):
+            raise _refusal("CATALOG_NORMALIZATION_APPROVAL_INVALID")
+        entries = [{"source_tozar": member, "canonical_name": group["canonical"],
+                    **({"provenance": "rule", "rule_id": group["rule_id"]} if group.get("rule_id")
+                       else {"provenance": "model", "proposal_id": group["proposal_id"]})}
+                   for group in chosen for member in group["members"]]
+        try:
+            return repo.approve_manufacturer_normalization(user_id, int(expected_version), entries)
+        except AppError as refused:
+            if refused.code in REQUEST_REASONS:
+                raise _refusal(refused.code) from None
+            raise
+    except AppError as refused:
+        _log_refusal(project_id, refused.code)
+        raise
+
+
+def _same_group(asked: Mapping[str, Any], group: Mapping[str, Any]) -> bool:
+    """The group exactly as the server proposed it (provenance included)."""
+    return (asked.get("canonical") == group["canonical"]
+            and list(asked.get("members") or []) == list(group["members"])
+            and asked.get("rule_id") == group.get("rule_id")
+            and asked.get("proposal_id") == group.get("proposal_id"))
+
+
+def reject_normalization(repo: Any, user_id: UUID, project_id: UUID, *, group: Mapping[str, Any],
+                         env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The owner rejects ONE pending group, exactly as proposed: an
+    append-only record; the group is no longer pending. Nothing is mapped."""
+    try:
+        require_enabled(env)
+        if not _supported(repo.get_project(project_id, user_id)):
+            raise _refusal("CATALOG_REGISTER_DISABLED")
+        if repo.project_member_role(project_id, user_id) != "owner":
+            raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")
+        match = next((pending for pending in _pending(repo)["pending"] if _same_group(group, pending)), None)
+        if match is None:
+            raise _refusal("CATALOG_NORMALIZATION_REJECTION_INVALID")
+        body = {"canonical": match["canonical"], "members": list(match["members"]),
+                **({"rule_id": match["rule_id"]} if match.get("rule_id") else {"proposal_id": match["proposal_id"]})}
+        try:
+            repo.reject_manufacturer_normalization_group(user_id, body)
+        except AppError as refused:
+            if refused.code in REQUEST_REASONS:
+                raise _refusal(refused.code) from None
+            raise
+        return {"rejected": True}
+    except AppError as refused:
+        _log_refusal(project_id, refused.code)
+        raise
+
+
 __all__ = ["CapacityRefusal", "REGISTER_FLAG", "REQUEST_REASONS", "START_GRACE_SECONDS", "register_enabled",
-           "register_view", "request_capture", "request_directory_refresh", "require_enabled",
-           "server_can_capture"]
+           "approve_normalization", "normalization_view", "register_view", "request_capture",
+           "request_directory_refresh", "request_normalization", "require_enabled", "server_can_capture", "reject_normalization"]

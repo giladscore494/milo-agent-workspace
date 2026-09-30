@@ -147,6 +147,21 @@ export const api = {
    */
   register: (projectId: string) => request<unknown>(`/projects/${projectId}/register`),
 
+  /** PR-D3: manufacturer normalisation (read, the ONE model call, the owner's approval or rejection). */
+  normalisation: (projectId: string) => request<unknown>(`/projects/${projectId}/register/normalisation`),
+  requestNormalisation: (projectId: string, conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/normalisation`, {
+      method: 'POST', body: JSON.stringify({ conversation_id: conversationId }),
+    }),
+  approveNormalisation: (projectId: string, expectedVersion: number, groups: unknown[]) =>
+    request<unknown>(`/projects/${projectId}/register/normalisation/approvals`, {
+      method: 'POST', body: JSON.stringify({ expected_version: expectedVersion, groups }),
+    }),
+  rejectNormalisation: (projectId: string, group: unknown) =>
+    request<unknown>(`/projects/${projectId}/register/normalisation/rejections`, {
+      method: 'POST', body: JSON.stringify({ group }),
+    }),
+
   requestRegisterCapture: (projectId: string, registerVersion: string, tozars: string[], conversationId: string) =>
     request<unknown>(`/projects/${projectId}/register/captures`, {
       method: 'POST',

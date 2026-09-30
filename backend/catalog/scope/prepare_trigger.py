@@ -103,7 +103,11 @@ def release_refusal_for(capture_job: Any, worker_job: Any, release_sha: str) -> 
 
 
 def run_request_body(invocation: Invocation) -> dict[str, Any]:
-    """The `jobs.run` body for one invocation: args REPLACE the job's own."""
+    """The `jobs.run` body for one invocation: args REPLACE the job's own.
+    An invocation with neither (PR-D3's normalisation job) sends NO overrides
+    at all: the job runs exactly as defined (run.jobs.run, not runWithOverrides)."""
+    if not invocation.entrypoint_args and not invocation.env_overrides:
+        return {}
     return {"overrides": {"containerOverrides": [{
         "args": list(invocation.container_args),
         "env": [{"name": name, "value": value} for name, value in invocation.env_overrides],
@@ -185,9 +189,11 @@ class CloudRunCaptureJobTrigger:
         return TriggerOutcome(TRIGGERED, execution_name_from(body))
 
 
-def build_capture_trigger(settings: Any, env: Mapping[str, str]) -> CaptureJobTrigger | None:
-    """The trigger this API is configured for, or None (it can prepare nothing)."""
-    job = str(getattr(settings, "cloud_run_capture_job", "") or "").strip()
+def build_capture_trigger(settings: Any, env: Mapping[str, str], *,
+                          job_setting: str = "cloud_run_capture_job") -> CaptureJobTrigger | None:
+    """The trigger this API is configured for, or None (it can prepare nothing).
+    PR-D3: job_setting="cloud_run_normalisation_job" is the normalisation job's."""
+    job = str(getattr(settings, job_setting, "") or "").strip()
     if not job:
         return None
     return CloudRunCaptureJobTrigger(

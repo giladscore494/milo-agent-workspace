@@ -40,8 +40,10 @@ from tests.test_ops_workflows import (
 
 STAGES = ("plan-authoring", "web-preparation", "both")
 RESTORE_VALUES = ("none", "plan-authoring", "web-preparation", "both", "register-capture", "catalog-browser",
-                  "all")
+                  "manufacturer-normalisation", "all")
 BUCKET_LINE = "REGISTER_ARCHIVE_BUCKET=test-project-milo-register-archive\n"
+# PR-D3: the normalisation stage binds the shared quota store on the capture job.
+BUCKET_LINE += "SECRET_REDIS_URL=UPSTASH_REDIS_REST_URL\nSECRET_REDIS_TOKEN=UPSTASH_REDIS_REST_TOKEN\n"
 STAGE2_MARKERS = ("--apply-backend", "--apply-runtime-policy", "--update-secrets", "KIMI_API_KEY=",
                   "MILO_ENABLE_PAID_EXECUTION=true", "MILO_ENABLE_RUN_CREATION=true", "arm.sh")
 
@@ -61,17 +63,19 @@ def assert_no_stage2(text: str) -> None:
 # 1. the workflows
 # =============================================================================
 
-def test_website_stage_workflow_offers_exactly_the_six_stages_and_validates_them():
+def test_website_stage_workflow_offers_exactly_the_eight_stages_and_validates_them():
     doc = workflow("website-stage.yml")
     inputs = triggers(doc)["workflow_dispatch"]["inputs"]
     assert inputs["stage"]["type"] == "choice"
     assert inputs["stage"]["options"] == ["both", "plan-authoring", "web-preparation", "register-capture",
-                                         "catalog-browser", "all"]
+                                         "catalog-browser", "manufacturer-normalisation", "normalisation-off",
+                                         "all"]
     assert inputs["dry_run"]["type"] == "boolean" and inputs["dry_run"]["default"] is False
     assert inputs["sha"]["required"] is False
     first = steps(doc)[0]
     assert first["env"]["STAGE_INPUT"] == "${{ inputs.stage }}"
-    assert "plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;" in first["run"]
+    assert ("plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation"
+            " | normalisation-off | all) ;;") in first["run"]
     assert "refs/heads/main" in first["run"] and "^[0-9a-f]{40}$" in first["run"]
     assert doc["concurrency"] == {"group": "milo-production-operations", "cancel-in-progress": False}
     (job,) = doc["jobs"].values()
@@ -149,10 +153,29 @@ def test_website_stage_refuses_an_unknown_stage(tmp_path, bad):
     tree = OpsTree(tmp_path)
     result = tree.run("website-stage.sh", "--stage", bad, "--dry-run")
     assert result.returncode == 2
-    assert ("--stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, all or none"
-            in result.stderr)
+    assert ("--stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, "
+            "manufacturer-normalisation, normalisation-off, all or none" in result.stderr)
     assert tree.tool_calls() == []
     assert tree.run("website-stage.sh", "--dry-run").returncode == 2
+
+
+def test_normalisation_off_is_its_own_stage_through_the_removal_path(tmp_path):
+    """PR-D3 review item 6: normalisation can be turned off alone -- no deploy,
+    no kill switch -- through the path that deletes the job and revokes the
+    capture identity's access, each read back."""
+    tree = OpsTree(tmp_path)
+    result = tree.run("website-stage.sh", "--stage", "normalisation-off", "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert tree.tool_calls() == []
+    (plan,) = [line for line in result.stdout.splitlines() if line.startswith("DRY-RUN:")]
+    assert plan.endswith("--remove-manufacturer-normalisation")
+    assert re.findall(r"^SUMMARY\|([^|]+)\|DRY-RUN\|", result.stdout, re.M) == ["1 normalisation-off"]
+    # Turning it OFF needs none of the values turning a stage ON does.
+    tree.config.write_text("".join(line + "\n" for line in tree.config.read_text().splitlines()
+                                   if not line.startswith(("MILO_WORKER_AUDIENCE", "MILO_GATEWAY_AUDIENCE",
+                                                           "PRODUCTION_ORIGIN", "SECRET_PROVIDER_API_KEY"))))
+    minimal = tree.run("website-stage.sh", "--stage", "normalisation-off", "--dry-run")
+    assert minimal.returncode == 0, minimal.stdout + minimal.stderr
 
 
 def test_website_stage_all_is_both_then_the_register_page_then_the_catalog_browser(tmp_path):
@@ -215,6 +238,10 @@ def doc(env):
     containers = [{"env": [{"name": k, "value": v} for k, v in env.items()]}]
     return {"spec": {"template": {"spec": {"template": {"spec": {"containers": containers}},
                                            "containers": containers}}}}
+if args[:2] == ["auth", "list"]:
+    print("operator@example.test"); sys.exit(0)
+if args[:3] == ["config", "get-value", "project"]:
+    print("test-project"); sys.exit(0)
 if args[:1] == ["run"] and args[2] == "describe":
     print(json.dumps(doc(state[args[1]].get(args[3], {})))); sys.exit(0)
 if args[:1] == ["run"] and args[2] == "update":
@@ -229,6 +256,39 @@ if args[:1] == ["run"] and args[2] == "update":
             for pair in value.split(delimiter):
                 name, _, val = pair.partition("=")
                 env[name] = val
+    json.dump(state, open(path, "w")); sys.exit(0)
+if args[:3] == ["run", "services", "list"] and args[3:7] == ["--region", "test-region", "--project", "test-project"]:
+    if os.environ.get("OPS_TEST_SERVICES_LIST_EXIT"):
+        sys.exit(int(os.environ["OPS_TEST_SERVICES_LIST_EXIT"]))
+    name = args[7].split("=", 2)[2]
+    if name in state["services"]:
+        print(name)
+    sys.exit(0)
+if args[:3] == ["run", "jobs", "list"] and args[3:7] == ["--region", "test-region", "--project", "test-project"] \
+        and len(args) == 9 and args[7].startswith("--filter=metadata.name=") \
+        and args[8] == "--format=value(metadata.name)":
+    if os.environ.get("OPS_TEST_JOBS_LIST_EXIT"):
+        sys.exit(int(os.environ["OPS_TEST_JOBS_LIST_EXIT"]))
+    name = args[7].split("=", 2)[2]
+    if name in state["jobs"]:
+        print(name)
+    sys.exit(0)
+if args[:3] == ["run", "jobs", "delete"] and args[4:] == ["--region", "test-region", "--project", "test-project",
+                                                          "--quiet"]:
+    if not os.environ.get("OPS_TEST_DELETE_IGNORED"):
+        state["jobs"].pop(args[3])
+    json.dump(state, open(path, "w")); sys.exit(0)
+if args[:2] == ["secrets", "get-iam-policy"] and args[3:] == ["--project", "test-project", "--format=json"]:
+    if os.environ.get("OPS_TEST_SECRET_POLICY_EXIT"):
+        sys.exit(int(os.environ["OPS_TEST_SECRET_POLICY_EXIT"]))
+    bindings = [{"role": r, "members": [m]} for r, m in state.get("secret_iam", {}).get(args[2], [])]
+    print(json.dumps({"bindings": bindings})); sys.exit(0)
+if args[:2] == ["secrets", "remove-iam-policy-binding"]:
+    assert "--all" in args and args[3:5] == ["--project", "test-project"], args
+    member, role = args[args.index("--member") + 1], args[args.index("--role") + 1]
+    if not os.environ.get("OPS_TEST_REVOKE_IGNORED"):
+        state.setdefault("secret_iam", {})[args[2]] = [
+            b for b in state.get("secret_iam", {}).get(args[2], []) if b != [role, member]]
     json.dump(state, open(path, "w")); sys.exit(0)
 sys.stderr.write("unmocked gcloud " + " ".join(args) + "\n"); sys.exit(2)
 '''
@@ -293,8 +353,11 @@ def stub_calls(tree: OpsTree) -> list[str]:
 
 
 def restore_calls(tree: OpsTree) -> list[str]:
+    """The website stage the deploy restores (step 11); step 6's removal of
+    manufacturer normalisation is a reset, not a restore."""
     return [call for call in stub_calls(tree)
-            if call.startswith(("website-execution-activate.sh", "government-production-capture.sh"))]
+            if call.startswith(("website-execution-activate.sh", "government-production-capture.sh"))
+            and not call.endswith("--remove-manufacturer-normalisation")]
 
 
 @pytest.mark.parametrize("restore", RESTORE_VALUES)
@@ -320,6 +383,10 @@ def test_a_successful_deploy_restores_exactly_the_named_stage_after_the_deployed
             "government-production-capture.sh --operator-config {c} --ensure-job --enable-catalog-execution",
             "website-execution-activate.sh --operator-config {c} --apply-register-capture"],
         "catalog-browser": ["website-execution-activate.sh --operator-config {c} --apply-catalog-browser"],
+        "manufacturer-normalisation": [
+            "government-production-capture.sh --operator-config {c} --ensure-job --enable-catalog-execution",
+            "website-execution-activate.sh --operator-config {c} --apply-register-capture",
+            "website-execution-activate.sh --operator-config {c} --apply-manufacturer-normalisation"],
         "all": [
             "website-execution-activate.sh --operator-config {c} --apply-plan-authoring",
             "government-production-capture.sh --operator-config {c} --ensure-job --enable-catalog-execution",
@@ -344,6 +411,8 @@ def test_a_successful_deploy_restores_exactly_the_named_stage_after_the_deployed
             "both": {"11a plan-authoring", "11b capture-job", "11c web-preparation"},
             "register-capture": {"11b capture-job", "11c register-capture"},
             "catalog-browser": {"11a catalog-browser"},
+            "manufacturer-normalisation": {"11a capture-job", "11b register-capture",
+                                           "11c manufacturer-normalisation"},
             "all": {"11a plan-authoring", "11b capture-job", "11c web-preparation", "11d register-capture",
                     "11e catalog-browser"},
         }[restore]
@@ -395,7 +464,7 @@ def test_a_failed_restore_fails_the_deploy_run_but_says_the_release_is_deployed(
 # the deploy dry run, with every restore value
 # =============================================================================
 
-@pytest.mark.parametrize("restore", ("register-capture", "all"))
+@pytest.mark.parametrize("restore", ("register-capture", "manufacturer-normalisation", "all"))
 def test_a_deploy_restoring_the_register_page_without_its_bucket_refuses_before_it_starts(tmp_path, restore):
     tree = OpsTree(tmp_path)
     result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", restore, "--dry-run")
@@ -417,8 +486,11 @@ def test_deploy_dry_run_with_each_restore_value(tmp_path, restore):
     assert after_gate.count("--ensure-job --enable-catalog-execution") == (
         restore not in ("none", "plan-authoring", "catalog-browser"))
     assert ("--apply-web-preparation" in after_gate) == (restore in ("web-preparation", "both", "all"))
-    assert ("--apply-register-capture" in after_gate) == (restore in ("register-capture", "all"))
+    assert ("--apply-register-capture" in after_gate) == (
+        restore in ("register-capture", "manufacturer-normalisation", "all"))
     assert ("--apply-catalog-browser" in after_gate) == (restore in ("catalog-browser", "all"))
+    # Never part of `all`: it binds a paid provider key.
+    assert ("--apply-manufacturer-normalisation" in after_gate) == (restore == "manufacturer-normalisation")
     if restore == "none":
         assert "SUMMARY|11 website-stage|SKIPPED|" in result.stdout
     assert result.stdout.count("DRY RUN: nothing was called") == 1
@@ -439,7 +511,7 @@ def test_deploy_refuses_an_unknown_restore_value(tmp_path, bad):
     result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", bad, "--dry-run")
     assert result.returncode == 2
     assert ("--restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture,"
-            " catalog-browser or all") in result.stderr
+            " catalog-browser, manufacturer-normalisation or all") in result.stderr
     assert tree.tool_calls() == []
 
 
@@ -510,3 +582,91 @@ def test_setup_wif_covers_the_capture_job_identity_with_or_without_its_own_accou
     assert '[[ -n "$CAPTURE_SA" ]] && ACT_AS+=("$CAPTURE_SA")' in wif
     assert '"roles/run.admin"' in wif and '"roles/artifactregistry.reader"' in wif
 
+
+
+# =============================================================================
+# PR-D3: the Stage A reset deletes the normalisation job and reads it back
+# =============================================================================
+
+NORMALISATION_JOB = "test-capture-normalisation"
+CAPTURE_MEMBER = "serviceAccount:capture@test-project.iam.gserviceaccount.com"
+ACCESSOR = "roles/secretmanager.secretAccessor"
+
+
+def with_normalisation_job(tmp_path: Path, *, stray_accessor: bool = True) -> Path:
+    """The normalisation job left behind, and -- stray -- the capture identity
+    holding an accessor on the provider key and on both quota-store secrets."""
+    state = tmp_path / "gcloud.json"
+    stray = [[ACCESSOR, CAPTURE_MEMBER]] if stray_accessor else []
+    state.write_text(json.dumps({"jobs": {"test-worker": {"MILO_CAPTURE_REPLAY": "false"},
+                                          NORMALISATION_JOB: {"MILO_ENABLE_PAID_EXECUTION": "false"}},
+                                 "services": {"test-api": {}},
+                                 "secret_iam": {name: stray + [[ACCESSOR, "serviceAccount:worker@test-project"
+                                                                          ".iam.gserviceaccount.com"]]
+                                                for name in ("KIMI_API_KEY", "UPSTASH_URL", "UPSTASH_TOKEN")}}))
+    return state
+
+
+def real_removal(tree: OpsTree) -> None:
+    """Step 6 runs the REAL --remove-manufacturer-normalisation path (the kill
+    switch's), against the stateful gcloud above."""
+    source = Path(__file__).resolve().parents[1] / "scripts" / "deploy" / "website-execution-activate.sh"
+    (tree.root / "scripts" / "deploy" / "website-execution-activate.sh").write_text(source.read_text())
+    tree.config.write_text(tree.config.read_text() + "SECRET_REDIS_URL=UPSTASH_URL\nSECRET_REDIS_TOKEN=UPSTASH_TOKEN\n")
+    subprocess.run(["git", "-c", "user.email=t@example.test", "-c", "user.name=t", "commit", "-qam", "removal"],
+                   cwd=tree.root, check=True)
+    tree.sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=tree.root, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+
+def test_the_stage_a_reset_removes_normalisation_and_reads_it_back(tmp_path, checks_api):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    real_removal(tree)
+    state = with_normalisation_job(tmp_path)
+    result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none", extra_env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    after = json.loads(state.read_text())
+    assert NORMALISATION_JOB not in after["jobs"]
+    # The stray accessor is revoked on all three secrets; the worker's is untouched.
+    for name, bindings in after["secret_iam"].items():
+        assert [ACCESSOR, CAPTURE_MEMBER] not in bindings, name
+        assert len(bindings) == 1, name
+    calls = tree.tool_calls()
+    delete = f"gcloud run jobs delete {NORMALISATION_JOB} --region test-region --project test-project --quiet"
+    revoke = next(c for c in calls if c.startswith("gcloud secrets remove-iam-policy-binding KIMI_API_KEY"))
+    activate = calls.index(next(c for c in calls if c.startswith("stub production-activate.sh")))
+    assert calls.index(delete) < activate and calls.index(revoke) < activate
+    assert "SUMMARY|6 stage2-reset|PASS|" in result.stdout
+    assert "capture identity's access revoked (read back)" in result.stdout
+    # Absent already, nothing held: read, nothing deleted or revoked again.
+    again = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none", extra_env=env)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert tree.tool_calls().count(delete) == 1
+    assert sum(c.startswith("gcloud secrets remove-iam-policy-binding") for c in tree.tool_calls()) == 3
+
+
+@pytest.mark.parametrize("failure, cause", [
+    ({"OPS_TEST_DELETE_IGNORED": "1"}, "is still there, or could not be listed"),
+    ({"OPS_TEST_JOBS_LIST_EXIT": "1"}, "is still there, or could not be listed"),
+    ({"OPS_TEST_REVOKE_IGNORED": "1"}, "provider access could not be revoked or read back"),
+    ({"OPS_TEST_SECRET_POLICY_EXIT": "1"}, "provider access could not be revoked or read back")])
+def test_a_normalisation_left_behind_by_the_reset_stops_the_deploy(tmp_path, checks_api, failure, cause):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    real_removal(tree)
+    with_normalisation_job(tmp_path)
+    result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none",
+                      extra_env={**env, **failure})
+    assert result.returncode == 1, result.stdout
+    assert "SUMMARY|6 stage2-reset|FAIL|manufacturer normalisation is not fully removed" in result.stdout
+    assert cause in result.stdout + result.stderr
+    assert not any(c.startswith("stub production-activate.sh") for c in tree.tool_calls())
+
+
+def test_permanent_mode_keeps_the_normalisation_job(tmp_path, checks_api):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    state = with_normalisation_job(tmp_path)
+    result = tree.run("deploy.sh", "--sha", tree.sha, "--permanent-mode", "true", extra_env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert NORMALISATION_JOB in json.loads(state.read_text())["jobs"]
+    assert not any("jobs delete" in c or "jobs list" in c for c in tree.tool_calls())
+    assert not any(c.endswith("--remove-manufacturer-normalisation") for c in stub_calls(tree))

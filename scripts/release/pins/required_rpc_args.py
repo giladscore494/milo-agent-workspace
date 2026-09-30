@@ -32,6 +32,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "append_usage_ledger_guarded": {
         "p_attempt", "p_entry", "p_lease_token", "p_run_id", "p_worker_id"
     },
+    "approve_manufacturer_normalization": {"p_approved_by", "p_entries", "p_expected_version"},
     "bind_work_scope_batch_run": {
         "p_batch_id", "p_bound_by", "p_expected_digest", "p_expected_revision",
         "p_run_id"
@@ -57,6 +58,8 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_candidate_variant_page": {"p_snapshot_id"},
     "catalog_canonical_manufacturer_coverage": {"p_manufacturers"},
     "catalog_compacted_record_reading": {"p_snapshot_id", "p_upstream_record_id"},
+    "catalog_manufacturer_evidence": set(),
+    "catalog_manufacturer_normalization_current": set(),
     "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
     "catalog_raw_record_lines_mismatched": {"p_first", "p_lines", "p_snapshot_id"},
     "catalog_raw_record_payload_matches": {"p_line", "p_raw_record_id"},
@@ -73,6 +76,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
     "catalog_variant_coverage_runs": {"p_after_finished_at", "p_after_run_id", "p_limit"},
     "catalog_variant_reservations_settling": {"p_limit"},
+    "claim_manufacturer_normalization": {"p_lease_seconds", "p_proposal_id", "p_run_id", "p_worker_id"},
     "claim_current_verdict_states": {"p_run_id"},
     "claim_run_lease": {"p_run_id", "p_worker_id"},
     "compact_register_snapshot": {"p_apply", "p_snapshot_key"},
@@ -158,6 +162,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_evidence_fragment_guarded": {
         "p_attempt", "p_fragment", "p_lease_token", "p_run_id", "p_worker_id"
     },
+    "record_manufacturer_normalization_proposal": {
+        "p_attempt", "p_groups", "p_lease_token", "p_model", "p_proposal_id", "p_reason_code", "p_run_id", "p_status", "p_worker_id"
+    },
     "record_register_capture_trigger": {
         "p_execution_name", "p_group_id", "p_run_id", "p_trigger_state"
     },
@@ -177,6 +184,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_work_scope_preparation_trigger": {
         "p_attempt", "p_execution_name", "p_request_id", "p_run_id", "p_trigger_state"
     },
+    "reject_manufacturer_normalization_group": {"p_group", "p_rejected_by"},
+    "request_manufacturer_normalization": {"p_grace_seconds", "p_input", "p_requested_by"},
+    "requested_manufacturer_normalization": set(),
     "request_register_capture": {
         "p_bytes_per_row", "p_capacity_limit_bytes", "p_grace_seconds", "p_group_max_rows", "p_register_version", "p_requested_by", "p_tozars"
     },

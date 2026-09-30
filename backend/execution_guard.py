@@ -64,6 +64,10 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS", re.compile(rf"^/work-scopes/{_SEGMENT}/preparations/?$"), "work scope preparation"),
     # PR-D1: register capture and the directory refresh execute the capture job.
     ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/(captures|directory)/?$"), "register capture"),
+    # PR-D3: the ONE guarded model call executes the capture job (its own flag);
+    # an approval writes the normalisation (the Register page's flag).
+    ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/normalisation(/approvals|/rejections)?/?$"), "manufacturer normalisation"),
+    ("POST", "MILO_ENABLE_MANUFACTURER_NORMALISATION", re.compile(rf"^/projects/{_SEGMENT}/register/normalisation/?$"), "manufacturer normalisation"),
 )
 
 

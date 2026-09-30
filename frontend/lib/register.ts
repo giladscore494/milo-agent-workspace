@@ -17,6 +17,8 @@ export type RegisterUnitState = 'not_captured' | 'capturing' | 'captured' | 'fai
 
 export type RegisterUnit = {
   tozar: string;
+  /** PR-D3: the approved canonical manufacturer (the tozar stays exact). */
+  canonicalManufacturer?: string;
   expectedRows: number;
   state: RegisterUnitState;
   snapshotKey?: string;
@@ -86,6 +88,10 @@ function unit(value: unknown): RegisterUnit | undefined {
     return undefined;
   }
   const out: RegisterUnit = { tozar, expectedRows, state: source.state as RegisterUnitState };
+  if (typeof source.canonical_manufacturer === 'string' && source.canonical_manufacturer.length >= 1
+      && source.canonical_manufacturer.length <= 120) {
+    out.canonicalManufacturer = source.canonical_manufacturer;
+  }
   if (out.state === 'not_captured') return out;
   const numbers = {
     capturedRows: optionalCount(source.captured_rows), apiTotal: optionalCount(source.api_total),

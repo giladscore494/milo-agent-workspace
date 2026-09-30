@@ -60,6 +60,14 @@ PREPARATION_SWITCH_ON = "true"
 #: and group capture). Set ONLY by these invocations, like the one above.
 REGISTER_SWITCH = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
 REGISTER_SWITCH_ON = "true"
+#: PR-D3: the switch of the manufacturer normalisation mode. It is baked into
+#: the normalisation job's own definition (never an override): that job runs
+#: exactly `normalisation_job_arguments`, and nothing else can be sent to it.
+NORMALISATION_SWITCH = "MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
+NORMALISATION_SWITCH_ON = "true"
+#: The normalisation mode's one flag: the job claims the single requested
+#: proposal (and its run) from the database; it takes no id from args or env.
+NORMALISATION_CLAIM_FLAG = "--normalisation-claim"
 
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _REVISION = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -148,16 +156,42 @@ def register_directory(*, project_ref: str, run_id: str) -> Invocation:
         env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
 
 
+def normalisation_job_arguments(*, project_ref: str) -> tuple[str, ...]:
+    """PR-D3: the normalisation job's WHOLE, fixed entrypoint arguments (its
+    definition, `government-production-capture.sh --ensure-normalisation-job`):
+    the capture's own arguments without a run id, and the claim flag."""
+    arguments = capture_arguments(project_ref=project_ref, run_id="0" * 8 + "-0000-0000-0000-" + "0" * 12)
+    at = arguments.index("--run-id")
+    return (*arguments[:at], *arguments[at + 2:], NORMALISATION_CLAIM_FLAG)
+
+
+#: PR-D3: the API executes the normalisation job WITHOUT overrides -- its
+#: identity holds no run.jobs.runWithOverrides on that job, the one holding
+#: the provider key -- so this invocation carries nothing.
+NO_OVERRIDES = Invocation((), ())
+
+
+def manufacturer_normalisation() -> Invocation:
+    """PR-D3: the ONE execution of the normalisation job, exactly as defined."""
+    return NO_OVERRIDES
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Print a capture job invocation.")
-    parser.add_argument("what", choices=("capture-args", "work-scope-args", "work-scope-env"))
+    parser.add_argument("what", choices=("capture-args", "work-scope-args", "work-scope-env",
+                                         "normalisation-job-args"))
     parser.add_argument("--project-ref", required=True)
-    parser.add_argument("--run-id", required=True)
+    parser.add_argument("--run-id")
     parser.add_argument("--work-scope-id")
     parser.add_argument("--work-scope-revision")
     parser.add_argument("--work-scope-digest")
     args = parser.parse_args(argv)
     try:
+        if args.what == "normalisation-job-args":
+            print(Invocation(normalisation_job_arguments(project_ref=args.project_ref), ()).entrypoint_args_csv())
+            return 0
+        if args.run_id is None:
+            raise InvocationError("--run-id is required")
         if args.what == "capture-args":
             invocation = Invocation(capture_arguments(project_ref=args.project_ref,
                                                       run_id=args.run_id), ())

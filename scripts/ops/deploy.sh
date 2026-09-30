@@ -12,8 +12,12 @@
 #      (website-execution-check.sh, read-only)
 #   5. 0 live runs (the RUNS_QUIESCENT statement, read-only)
 #   6. Stage 2 reset -- unless permanent operating mode: the worker's provider
-#      key binding is removed (RUNBOOK A.6) and the deploy is FORCED, so API and
-#      worker come back at Stage A
+#      key binding is removed (RUNBOOK A.6), manufacturer normalisation is
+#      removed through the kill switch's own path (website-execution-activate.sh
+#      --remove-manufacturer-normalisation: the job -- the only other holder of
+#      that key -- deleted, and the capture identity's access to the key and
+#      the quota store revoked, each read back), and the deploy is FORCED, so
+#      API and worker come back at Stage A
 #   7. production-activate.sh --all (preflight, database gate, deploy,
 #      deployed gate); in permanent mode with --preserve-stage
 #   8. model env: the reviewed worker model names, set and read back
@@ -42,7 +46,7 @@ REQUIRED_CI_JOBS=(offline-checks frontend-and-docker postgres-checks e2e)
 usage() {
   cat << 'EOF'
 Usage: deploy.sh --sha <40-hex> [--permanent-mode true|false] [--dry-run]
-                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|catalog-browser|all]
+                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|catalog-browser|manufacturer-normalisation|all]
                  [--operator-config <path>]
 
 Deploys the checked-out release after proving CI, migrations, the website and
@@ -65,8 +69,8 @@ done
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { printf 'FAIL: --sha must be a full 40-character lowercase SHA\n' >&2; exit 2; }
 case "$PERMANENT" in true | false) ;; *) printf 'FAIL: --permanent-mode must be true or false\n' >&2; exit 2 ;; esac
 case "$RESTORE_STAGE" in
-  none | plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;
-  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture, catalog-browser or all\n' >&2; exit 2 ;;
+  none | plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all) ;;
+  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation or all\n' >&2; exit 2 ;;
 esac
 
 ops_load_config
@@ -78,10 +82,16 @@ if ! build_sa_problem="$(milo_build_service_account_problem "$(milo_op CLOUD_BUI
 fi
 # Restoring the Register page needs the archive bucket: refused before the
 # deploy starts, not after it (step 11).
-if [[ "$RESTORE_STAGE" == "register-capture" || "$RESTORE_STAGE" == "all" ]]; then
+if [[ "$RESTORE_STAGE" == "register-capture" || "$RESTORE_STAGE" == "all" || "$RESTORE_STAGE" == "manufacturer-normalisation" ]]; then
   milo_require_op REGISTER_ARCHIVE_BUCKET || exit 2
 fi
+if [[ "$RESTORE_STAGE" == "manufacturer-normalisation" ]]; then
+  milo_require_op SECRET_REDIS_URL SECRET_REDIS_TOKEN || exit 2
+fi
 CONFIG_ARG=(--operator-config "$CONFIG_PATH")
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
+NORMALISATION_OFF=(bash "${REPO_ROOT}/scripts/deploy/website-execution-activate.sh" "${CONFIG_ARG[@]}"
+  --remove-manufacturer-normalisation)
 summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT}; restore website stage: ${RESTORE_STAGE})"
 
 # 1. The checkout is the release: every tool builds and tags `git rev-parse HEAD`.
@@ -183,7 +193,8 @@ elif [[ "$DRY_RUN" -eq 1 ]]; then
   for name in "${MILO_PROVIDER_KEY_ENV_NAMES[@]}"; do
     ops_run gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets "$name"
   done
-  summary "6 stage2-reset" DRY-RUN "would remove any provider key from the worker and force a Stage A deploy"
+  ops_run "${NORMALISATION_OFF[@]}"
+  summary "6 stage2-reset" DRY-RUN "would remove any provider key from the worker, remove manufacturer normalisation (its job, the capture identity's access) and force a Stage A deploy"
 else
   facts="$(ops_worker_json | ops_container_facts)" || ops_fail "the worker job could not be read" "6 stage2-reset"
   removed=()
@@ -196,7 +207,10 @@ else
       removed+=("$name")
     fi
   done
-  summary "6 stage2-reset" PASS "provider key binding(s) removed: ${removed[*]:-none}; the deploy returns both surfaces to Stage A"
+  # Every step of the removal runs and is read back; any failure fails this step.
+  "${NORMALISATION_OFF[@]}" \
+    || ops_fail "manufacturer normalisation is not fully removed: the job ${NORMALISATION_JOB:-<none>}, or the capture identity's access to the provider key or the quota store (above)" "6 stage2-reset"
+  summary "6 stage2-reset" PASS "provider key binding(s) removed: ${removed[*]:-none}; normalisation job ${NORMALISATION_JOB:-<none>} absent and the capture identity's access revoked (read back); the deploy returns both surfaces to Stage A"
 fi
 
 # 7. The deploy itself, through the one orchestrator.

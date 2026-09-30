@@ -21,3 +21,13 @@ def get_capture_trigger():
 
     from backend.catalog.scope.prepare_trigger import build_capture_trigger
     return build_capture_trigger(get_settings(), os.environ)
+
+
+@lru_cache
+def get_normalisation_trigger():
+    """PR-D3: the normalisation job's trigger (its own job: the only one holding
+    the provider key), or None."""
+    import os
+
+    from backend.catalog.scope.prepare_trigger import build_capture_trigger
+    return build_capture_trigger(get_settings(), os.environ, job_setting="cloud_run_normalisation_job")

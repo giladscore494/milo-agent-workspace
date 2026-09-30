@@ -48,6 +48,7 @@ on:
           - web-preparation
           - register-capture
           - catalog-browser
+          - manufacturer-normalisation
           - all
           - none
       dry_run:

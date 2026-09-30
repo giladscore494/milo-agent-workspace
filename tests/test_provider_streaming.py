@@ -148,7 +148,8 @@ def test_every_swarm_v2_request_streams_without_undocumented_stream_options(mode
 def test_every_role_declares_its_total_deadline():
     deadlines = {role: policy.total_deadline_seconds for role, policy in ROLE_POLICIES.items()}
     assert deadlines == {("commander", "planning"): 600.0, ("commander", "replanning"): 300.0,
-                         ("verifier", "verification"): 480.0, ("worker", "execute"): 300.0}
+                         ("verifier", "verification"): 480.0, ("worker", "execute"): 300.0,
+                         ("normaliser", "manufacturers"): 300.0}
     assert MAX_ROLE_TOTAL_DEADLINE_SECONDS == 600.0
 
 
