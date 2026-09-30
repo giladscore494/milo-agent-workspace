@@ -249,7 +249,8 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         # PR-L2: built and archived, the payloads leave the database (a
         # refusal or a failure is reported and changes nothing).
         outcome.compaction = compact_after_build(repository, report.snapshot_key, outcome.variants,
-                                                 writer=archive_writer)
+                                                 writer=archive_writer, snapshot_id=str(report.snapshot_id),
+                                                 run_id=lease.run_id)
         return outcome
     except Exception as failure:  # noqa: BLE001 - reduced to a static code
         if _is_fatal(failure) or isinstance(failure, CancellationRequested):

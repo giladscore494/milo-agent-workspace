@@ -5564,6 +5564,9 @@ def pr3_db(db):
     # `test_reapplying_the_catalog_promotion_migration_needs_this_one_again`
     # states.
     db.psql(file=next(m for m in MIGRATIONS if "current_verdict_authority" in m.name))
+    # PR-L2 restates it again (the candidates read through the resolved view,
+    # a skeleton snapshot refused): production applies that one after R5 too.
+    db.psql(file=next(m for m in MIGRATIONS if m.name == "20261002000100_catalog_register_compaction.sql"))
     return db
 
 
@@ -6287,6 +6290,29 @@ def test_a_canonical_fact_is_never_promoted_out_of_an_unresolved_conflict(pr3_db
     assert db.psql("select count(*) from public.catalog_model_variants v "
                    "join public.catalog_models m on m.id = v.model_id "
                    f"where m.manufacturer='{make}'") == "0"
+
+
+def test_the_pending_promotion_read_refuses_a_skeleton_snapshot(pr3_db):
+    """PR-L2 should-fix 7: a superseded snapshot kept as skeletons has no
+    identity left on its candidates; a `{}` scope must never match one."""
+    db = pr3_db
+    args, snapshot, _record, _candidate, _links, _make = _pr3_promotable(db, "skeleton")
+    run_id = args.split(",")[0].strip("'")
+    read = f"select count(*) from public.catalog_run_pending_promotions('{run_id}','{PROMOTABLE_TOOL_OPERATION}',25)"
+    assert int(db.psql(read)) > 0
+    db.psql("insert into public.catalog_register_snapshot_compactions (snapshot_id, snapshot_key, readers, raw_rows, "
+            "kept_rows, bytes_before, bytes_after) select id, snapshot_key, 'archive', 1, 1, 0, 0 "
+            f"from public.catalog_source_snapshots where id = '{snapshot}'")
+    try:
+        with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ARCHIVED"):
+            db.psql(read)
+    finally:
+        db.psql("alter table public.catalog_register_snapshot_compactions disable trigger "
+                "catalog_register_snapshot_compactions_append_only; "
+                f"delete from public.catalog_register_snapshot_compactions where snapshot_id = '{snapshot}'; "
+                "alter table public.catalog_register_snapshot_compactions enable trigger "
+                "catalog_register_snapshot_compactions_append_only")
+    assert int(db.psql(read)) > 0
 
 
 def test_the_pending_promotion_read_reconstructs_the_candidate_from_durable_rows(pr3_db):

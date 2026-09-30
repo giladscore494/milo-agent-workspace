@@ -263,14 +263,15 @@ psql_value() {
 
 # --- PR-L2: a compacted snapshot is read through its compaction's mapper ----
 # version. A database whose variant mapper (a migration) differs from the one
-# a live compacted snapshot was compacted under would hide that tozar: no
-# rebuild from the archive exists yet, so the database is NOT ready.
+# a live compacted snapshot was compacted under would hide that tozar, and no
+# path rebuilds a compacted snapshot yet (a rebuild-from-archive must land
+# before any variant mapper bump), so the database is NOT ready.
 if [[ "${FACTS[DATABASE_READY]:-}" == "VERIFIED" ]]; then
   if mismatches="$(psql_value "select public.catalog_register_compaction_mapper_mismatches();")" \
      && [[ "$mismatches" =~ ^[0-9]+$ ]]; then
     printf 'CATALOG_COMPACTION_MAPPER=%s\n' "$([[ "$mismatches" -eq 0 ]] && printf 'VERIFIED' || printf 'NO (%s)' "$mismatches")"
     if [[ "$mismatches" -gt 0 ]]; then
-      fact DATABASE_READY NO "CATALOG_COMPACTION_MAPPER: ${mismatches} compacted snapshot(s) were compacted under another variant mapper version; rebuild them from their archive before this release"
+      fact DATABASE_READY NO "CATALOG_COMPACTION_MAPPER: ${mismatches} compacted snapshot(s) were compacted under another variant mapper version; no path rebuilds a compacted snapshot yet (a rebuild-from-archive must land before any variant mapper bump)"
     fi
   elif [[ -n "$DB_URL" ]]; then
     # Connected, yet unanswered (a read-only role without EXECUTE on it):

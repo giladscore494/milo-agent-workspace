@@ -65,6 +65,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_register_prunable_list": set(),
     "catalog_register_snapshot_archivable": {"p_snapshot_id"},
     "catalog_register_superseded_snapshots": {"p_snapshot_key"},
+    "catalog_register_uncompacted_captures": set(),
     "catalog_register_unit_states": set(),
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},

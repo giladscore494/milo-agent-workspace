@@ -11,6 +11,7 @@ here the in-memory mirrors (backend/testing/register_memory.py) stand in.
 from __future__ import annotations
 
 import gzip
+import base64
 import hashlib
 import json
 import socket
@@ -119,6 +120,12 @@ class FakeWriter:
             return arc.EXISTS_VERIFIED if self.objects[name] == archive.data else arc.EXISTS_UNVERIFIED
         self.objects[name] = archive.data
         return arc.CREATED
+
+    def get(self, name: str) -> bytes:
+        """Read back (objectViewer): the object's bytes as stored."""
+        if self.fail or name not in self.objects:
+            raise arc.ArchiveWriteError("read failed")
+        return self.objects[name]
 
 
 def world(repo: MemoryRepository | None = None) -> tuple[MemoryRepository, dict[str, Any]]:
@@ -544,7 +551,7 @@ class FakeSession:
         self.posts: list[dict[str, Any]] = []
 
     def post(self, url, params, data, timeout, headers):
-        self.posts.append({"url": url, "params": dict(params), "headers": headers})
+        self.posts.append({"url": url, "params": dict(params), "headers": headers, "data": data})
         return FakeResponse(self.post_status, {"size": str(self.size)})
 
     def get(self, url, params, timeout):
@@ -556,6 +563,9 @@ def test_the_upload_is_create_only_and_a_precondition_conflict_is_verified_never
     session = FakeSession(200, size=built.byte_size)
     assert arc.GcsArchiveWriter(BUCKET, session_factory=lambda: session).put("n", built) == arc.CREATED
     assert session.posts[0]["params"] == {"uploadType": "multipart", "ifGenerationMatch": "0"}
+    # Cloud Storage checks the received bytes against md5Hash and refuses a corrupted upload.
+    metadata = json.loads(session.posts[0]["data"].split(b"\r\n\r\n", 1)[1].split(b"\r\n", 1)[0])
+    assert metadata["md5Hash"] == base64.b64encode(hashlib.md5(built.data).digest()).decode()
     same = FakeResponse(200, {"size": str(built.byte_size), "metadata": {"sha256": built.sha256}})
     assert arc.GcsArchiveWriter(BUCKET, session_factory=lambda: FakeSession(412, same)).put("n", built) \
         == arc.EXISTS_VERIFIED
