@@ -182,6 +182,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_work_scope_preparation_trigger": {
         "p_attempt", "p_execution_name", "p_request_id", "p_run_id", "p_trigger_state"
     },
+    "reject_manufacturer_normalization_group": {"p_group", "p_rejected_by"},
     "request_manufacturer_normalization": {"p_grace_seconds", "p_input", "p_requested_by"},
     "request_register_capture": {
         "p_bytes_per_row", "p_capacity_limit_bytes", "p_grace_seconds", "p_group_max_rows", "p_register_version", "p_requested_by", "p_tozars"
