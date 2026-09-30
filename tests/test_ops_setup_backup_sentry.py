@@ -172,6 +172,63 @@ def test_setup_backup_is_idempotent(env):
     assert check.returncode == 0 and "FAIL" not in check.stdout
 
 
+def test_an_enabled_api_with_similarly_named_services_is_found_exactly(env):
+    """`config.name:X` is not exact: production answered storage.googleapis.com
+    with bigquerystorage, storage-api, storage-component and storage, one per
+    line, and the check read "not enabled". The exact filter finds it, and
+    nothing is enabled again."""
+    assert env.run(SETUP_BACKUP, "--pg-major", "17").returncode == 0
+    data = env.data()
+    data["apis"] = ["bigquerystorage.googleapis.com", "storage-api.googleapis.com",
+                    "storage-component.googleapis.com", "storage.googleapis.com",
+                    *(a for a in data["apis"] if a != "storage.googleapis.com")]
+    env.state.write_text(json.dumps(data))
+    count = len(data["mutations"])
+    for args in (("--check",), ()):
+        result = env.run(SETUP_BACKUP, *args, "--pg-major", "17")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "PASS API storage.googleapis.com enabled" in result.stdout
+        assert "FAIL" not in result.stdout
+    assert not [m for m in env.mutations()[count:] if m[0] == "enable"]
+    assert '--filter=config.name=storage.googleapis.com' in env.log.read_text()
+
+
+def test_a_missing_environment_is_created_on_apply_and_a_fail_line_on_check(env):
+    """`gh api` answers a missing environment with its 404 document on stdout
+    and exit 1. That body was concatenated with '{}', python3 crashed and
+    `set -e` ended the script silently before the environment was created."""
+    check = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
+    assert check.returncode == 1
+    _only_pass_fail(check)
+    assert ("FAIL GitHub environment production-backup is not as required (missing)" in check.stdout)
+    # The script went on past the environment: the secrets were still checked.
+    assert "FAIL environment secret MILO_BACKUP_DB_URL is not set in production-backup" in check.stdout
+    assert "Traceback" not in check.stderr and "production-backup" not in env.data().get("environments", {})
+    applied = env.run(SETUP_BACKUP, "--pg-major", "17")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert "PASS GitHub environment production-backup: no required reviewer, deployments from main only" \
+        in applied.stdout
+    assert "production-backup" in env.data()["environments"]
+
+
+def test_an_unreadable_environment_answer_is_a_fail_line_not_a_silent_exit(env):
+    assert env.run(SETUP_BACKUP, "--pg-major", "17").returncode == 0
+    data = env.data()
+    data["gh_environment_garbage"] = True
+    env.state.write_text(json.dumps(data))
+    check = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
+    assert check.returncode == 1
+    _only_pass_fail(check)
+    assert "FAIL GitHub environment production-backup is not as required (unreadable)" in check.stdout
+    assert "PASS environment secret MILO_BACKUP_DB_URL is set (value not shown)" in check.stdout
+
+
+def test_no_setup_or_deploy_script_matches_an_api_by_substring():
+    """The same `config.name:` pattern was in setup-wif.sh and cloud-run.sh."""
+    for script in sorted((REPO / "scripts").rglob("*.sh")):
+        assert "config.name:" not in script.read_text(), script
+
+
 def test_setup_backup_check_changes_nothing_and_fails_on_a_fresh_project(env):
     result = env.run(SETUP_BACKUP, "--check", "--pg-major", "17")
     assert result.returncode == 1

@@ -1,12 +1,28 @@
 """The register DIRECTORY: every distinct tozar and its row count (PR-D1, D1-2).
 
-Read with bounded METADATA requests only -- no row payload is fetched here:
+Read with bounded requests that never fetch row payload:
 
-1. one distinct read: ``datastore_search`` with ``fields=tozar`` and
-   ``distinct=true`` (paged, sorted), which answers tozar VALUES only;
-2. then, per tozar, one count: ``limit=0`` with ``filters={"tozar": <exact>}``,
-   whose ``total`` is the unit's expected rows and whose ``records`` must be
-   empty.
+1. one bounded SCAN of the tozar column: ``datastore_search`` with
+   ``fields=tozar``, ``sort=_id``, full pages of `SCAN_PAGE_LIMIT` rows, offset
+   paging until the offset reaches the scan's ``total``. Every row's tozar is
+   counted locally, by its exact string;
+2. then, per capturable tozar, one count: ``limit=0`` with
+   ``filters={"tozar": <exact>}``, whose ``total`` must equal the scan's count
+   for that tozar and whose ``records`` must be empty.
+
+CKAN's ``distinct=true`` is NOT read for values: on data.gov.il its ``total``
+counts the distinct values while its ``records`` are truncated (1 of 137 with
+``sort``, 26 without), so a paged distinct read stops after one short page.
+One ``distinct=true, limit=0`` request is still made and its ``total``
+reported as `RegisterDirectory.distinct_total` -- a cross-check only; its
+records are never read, and an unavailable answer reports ``None``.
+
+The scan is refused whole (``GOV_DIRECTORY_RESULT_INVALID``) unless every page
+but the last is full, the rows counted (unfilterable values included) add up
+to the scan's ``total``, and
+every unit's scan count equals its independent filtered count. A ``total``
+that moves between scan pages refuses with ``GOV_DIRECTORY_REGISTER_CHANGED``:
+the register changed mid-read.
 
 Every request goes through `DataGovClient._request` -- the same allowlisted
 host, action, envelope, size, redirect and retry rules as a capture -- and the
@@ -46,12 +62,13 @@ from backend.catalog.government.source import GovernmentSourceError
 
 DIRECTORY_CONTRACT = "gov.register.directory.1"
 TOZAR_FIELD = "tozar"
-#: Distinct values per distinct-read page (the client's own page ceiling).
-DISTINCT_PAGE_LIMIT = src.MAX_PAGE_LIMIT
+#: Rows per tozar-column scan page (the client's own page ceiling).
+SCAN_PAGE_LIMIT = src.MAX_PAGE_LIMIT
 MAX_REQUESTS_ENV = "MILO_REGISTER_DIRECTORY_MAX_REQUESTS"
 MAX_SECONDS_ENV = "MILO_REGISTER_DIRECTORY_MAX_SECONDS"
-#: A full directory is one distinct page per 1000 values plus one count per
-#: tozar, so the request cap sits above the database's 5000-unit bound.
+#: A full directory is one distinct cross-check, one scan page per 1000 rows
+#: and one count per tozar: ~102 pages and ~137 counts at the register's
+#: current size, far inside the cap.
 DEFAULT_MAX_REQUESTS = 6000
 DEFAULT_MAX_SECONDS = 3000.0
 #: The database bounds a directory at 5000 units and a tozar at 200 chars.
@@ -72,6 +89,9 @@ class RegisterDirectory:
     fetched_at: datetime
     requests: int
     unfilterable_values: int = 0
+    #: CKAN's ``distinct`` total for the tozar column, reported as a
+    #: cross-check only (never trusted, never a unit); ``None`` if unavailable.
+    distinct_total: int | None = None
 
     @property
     def register_version(self) -> str:
@@ -143,16 +163,25 @@ def discover_directory(client: DataGovClient, *, resource_id: str = src.WLTP_RES
     budget = _Budget(max_requests=int(max_requests or default_requests),
                      max_seconds=float(max_seconds or default_seconds), clock=clock)
     resource_id = src.require_allowed_resource(resource_id)
-    values, unfilterable = _distinct_values(client, resource_id, budget)
+    distinct_total = _distinct_total(client, resource_id, budget)
+    scanned, unfilterable = _scan_counts(client, resource_id, budget)
     units = []
-    for tozar in values:
-        units.append(DirectoryUnit(tozar=tozar, expected_rows=_count(client, resource_id, tozar, budget)))
+    for tozar in sorted(scanned, key=lambda value: value.encode("utf-8")):
+        # The scan's count and an independent filtered count must agree.
+        if _count(client, resource_id, tozar, budget) != scanned[tozar]:
+            raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+        units.append(DirectoryUnit(tozar=tozar, expected_rows=scanned[tozar]))
     return RegisterDirectory(resource_id=resource_id, units=tuple(units), fetched_at=now(),
-                             requests=budget.used, unfilterable_values=unfilterable)
+                             requests=budget.used, unfilterable_values=unfilterable,
+                             distinct_total=distinct_total)
 
 
 def _search(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -> Mapping[str, Any]:
     budget.spend()
+    return _answer(client, params)
+
+
+def _answer(client: DataGovClient, params: Mapping[str, str]) -> Mapping[str, Any]:
     document, _response, _url = client._request(src.DATASTORE_SEARCH, params)  # noqa: SLF001 - same package seam
     result = document["result"]
     if str(result.get("resource_id")) != str(params["resource_id"]):
@@ -160,22 +189,51 @@ def _search(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -
     return result
 
 
-def _distinct_values(client: DataGovClient, resource_id: str,
-                     budget: _Budget) -> tuple[list[str], int]:
-    values: list[str] = []
-    seen: set[str] = set()
-    unfilterable = 0
+def _exact_total(result: Mapping[str, Any]) -> int:
+    total = result.get("total")
+    if (not isinstance(total, int) or isinstance(total, bool) or total < 0
+            or result.get("total_was_estimated") not in (None, False)):
+        raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+    return total
+
+
+def _distinct_total(client: DataGovClient, resource_id: str, budget: _Budget) -> int | None:
+    """CKAN's distinct-value total, for the report only. Its records are never
+    read (data.gov.il truncates them), and an unusable answer is ``None``:
+    the directory never depends on it."""
+    budget.spend()
+    try:
+        result = _answer(client, {"resource_id": resource_id, "fields": TOZAR_FIELD,
+                                  "distinct": "true", "limit": "0"})
+        return _exact_total(result)
+    except GovernmentSourceError:
+        return None
+
+
+def _scan_counts(client: DataGovClient, resource_id: str,
+                 budget: _Budget) -> tuple[dict[str, int], int]:
+    """Every row's exact tozar, counted: (capturable tozar -> rows, number of
+    distinct unfilterable values)."""
+    counts: dict[str, int] = {}
+    unfilterable: set[str | None] = set()
+    scanned = 0
+    first_total: int | None = None
     offset = 0
     while True:
         result = _search(client, {"resource_id": resource_id, "fields": TOZAR_FIELD,
-                                  "distinct": "true", "sort": TOZAR_FIELD,
-                                  "limit": str(DISTINCT_PAGE_LIMIT), "offset": str(offset)}, budget)
+                                  "sort": "_id", "limit": str(SCAN_PAGE_LIMIT),
+                                  "offset": str(offset)}, budget)
+        total = _exact_total(result)
+        if first_total is None:
+            first_total = total
+        elif total != first_total:
+            raise GovernmentSourceError("GOV_DIRECTORY_REGISTER_CHANGED")
         records = result.get("records")
         if not isinstance(records, list):
             raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
         for record in records:
-            # A distinct read answers the requested field ONLY: anything else
-            # would be row payload, which this step never takes.
+            # The scan answers the requested field ONLY: anything else would
+            # be row payload, which this step never takes.
             if not isinstance(record, Mapping) or set(record) - {TOZAR_FIELD, "_id"} \
                     or TOZAR_FIELD not in record:
                 raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
@@ -187,17 +245,21 @@ def _distinct_values(client: DataGovClient, resource_id: str,
                 # padded, over-long, or carrying a control/format character
                 # (CaptureScope refuses exactly these) -- is counted, never a
                 # unit: a unit is always capturable.
-                unfilterable += 1
+                unfilterable.add(value)
                 continue
-            if value in seen:
-                raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
-            seen.add(value)
-            values.append(value)
-        if len(values) > MAX_UNITS:
+            counts[value] = counts.get(value, 0) + 1
+        if len(counts) > MAX_UNITS:
             raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
-        if len(records) < DISTINCT_PAGE_LIMIT:
-            return values, unfilterable
-        offset += DISTINCT_PAGE_LIMIT
+        scanned += len(records)
+        offset += SCAN_PAGE_LIMIT
+        if offset >= first_total:
+            # The last page: every row the total names was counted, no more.
+            if scanned != first_total:
+                raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+            return counts, len(unfilterable)
+        if len(records) != SCAN_PAGE_LIMIT:
+            # A short page before the total is reached is a truncated answer.
+            raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
 
 
 def _capturable(value: str | None) -> bool:
@@ -214,7 +276,7 @@ def _count(client: DataGovClient, resource_id: str, tozar: str, budget: _Budget)
     filters = json.dumps({TOZAR_FIELD: tozar}, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False)
     result = _search(client, {"resource_id": resource_id, "limit": "0", "filters": filters}, budget)
-    total = result.get("total")
+    total = _exact_total(result)
     records = result.get("records")
     echoed = result.get("filters")
     if isinstance(echoed, str):
@@ -222,9 +284,7 @@ def _count(client: DataGovClient, resource_id: str, tozar: str, budget: _Budget)
             echoed = json.loads(echoed)
         except ValueError:
             echoed = None
-    if (not isinstance(total, int) or isinstance(total, bool) or total < 0
-            or result.get("total_was_estimated") not in (None, False)
-            or records not in (None, []) or echoed != {TOZAR_FIELD: tozar}):
+    if records not in (None, []) or echoed != {TOZAR_FIELD: tozar}:
         raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
     return total
 

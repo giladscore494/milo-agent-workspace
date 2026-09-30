@@ -411,7 +411,7 @@ def test_a_valid_operator_configuration_is_written_and_exported(tmp_path):
 
 WIF_GCLOUD = r'''#!/usr/bin/env python3
 """A gcloud stand-in with a tiny IAM world: describes answer what creates made."""
-import json, os, sys
+import json, os, re, sys
 args = sys.argv[1:]
 path = os.environ["OPS_TEST_WIF_STATE"]
 state = {"apis": [], "pools": [], "providers": {}, "accounts": [], "project_bindings": [],
@@ -447,8 +447,11 @@ if args[:3] == ["config", "get-value", "project"]:
 if args[:2] == ["projects", "describe"]:
     print("123456789"); sys.exit(0)
 if args[:2] == ["services", "list"]:
-    api = flag("--filter").split(":", 1)[1]
-    print(api if api in state["apis"] else ""); sys.exit(0)
+    # gcloud's filter: `config.name=X` is exact; `config.name:X` is not (it also
+    # answers every service containing X's first word, one per line).
+    exact, api = re.match(r"config\.name([=:])(.*)$", flag("--filter")).groups()
+    print("\n".join(a for a in state["apis"]
+                    if (a == api if exact == "=" else api.split(".")[0] in a))); sys.exit(0)
 if args[:2] == ["services", "enable"]:
     state["apis"].append(args[2]); save(); sys.exit(0)
 if args[:3] == ["iam", "workload-identity-pools", "describe"]:

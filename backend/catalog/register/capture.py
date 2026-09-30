@@ -293,7 +293,8 @@ def refresh_directory(repository: Any, *, client: DataGovClient,
     version = answer.get("version") or {}
     return {"decision": answer.get("decision"), "register_version": version.get("register_version"),
             "unit_count": len(directory.units), "total_rows": directory.total_rows,
-            "requests": directory.requests, "unfilterable_values": directory.unfilterable_values}
+            "requests": directory.requests, "unfilterable_values": directory.unfilterable_values,
+            "distinct_total": directory.distinct_total}
 
 
 __all__ = ["GroupReport", "REGISTER_CAPTURE_REASONS", "RegisterCaptureError", "UnitOutcome",

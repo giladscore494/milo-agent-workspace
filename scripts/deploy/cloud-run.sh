@@ -270,7 +270,7 @@ preflight() {
 
   for api in "${REQUIRED_APIS[@]}"; do
     local state
-    state=$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name:$api" --format='value(config.name)' 2>/dev/null || true)
+    state=$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name=$api" --format='value(config.name)' 2>/dev/null || true)
     [[ "$state" == "$api" ]] || fail "Required API '$api' is not enabled for project '$PROJECT_ID'."
   done
 

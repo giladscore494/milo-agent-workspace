@@ -37,7 +37,7 @@ from backend.catalog.register import coverage as coverage_module
 from backend.catalog.register import prune as prune_module
 from backend.catalog.register import retention
 from backend.catalog.register import service as register_service
-from backend.catalog.register.capture import capture_group
+from backend.catalog.register.capture import capture_group, refresh_directory
 from backend.catalog.scope import prepare_trigger as trig
 from backend.dependencies import get_capture_trigger, get_repository
 from backend.errors import AppError
@@ -205,25 +205,61 @@ def snapshot_by_key(repo: MemoryRepository, key: str) -> dict[str, Any]:
 # =============================================================================
 
 class DirectoryClient:
-    """The client seam the directory uses (`_request`), over a fake register."""
+    """The client seam the directory uses (`_request`), over a fake register.
 
-    def __init__(self, counts: Mapping[str | None, int], *, extra_fields: bool = False) -> None:
+    The register is a row list in `_id` order. ``distinct=true`` behaves the
+    way data.gov.il does (production probes A/B, 2026-09-30): its ``total``
+    counts the distinct values but its ``records`` are truncated -- ONE value
+    when sorted, 26 when not -- whatever the limit asked.
+    """
+
+    def __init__(self, counts: Mapping[str | None, int], *, extra_fields: bool = False,
+                 total_moves_on_page: int | None = None, short_page: int | None = None,
+                 miscount: str | None = None, estimated: bool = False,
+                 total_bias: int = 0, distinct_fails: bool = False) -> None:
         self.counts = dict(counts)
+        self.rows = [value for value, n in self.counts.items() for _ in range(n)]
         self.extra_fields = extra_fields
+        self.total_moves_on_page = total_moves_on_page
+        self.short_page = short_page
+        self.miscount = miscount
+        self.estimated = estimated
+        self.total_bias = total_bias
+        self.distinct_fails = distinct_fails
         self.calls: list[dict[str, str]] = []
+
+    @property
+    def scans(self) -> list[dict[str, str]]:
+        return [c for c in self.calls if "filters" not in c and c.get("distinct") != "true"]
 
     def _request(self, action: str, params: Mapping[str, str]):
         assert action == src.DATASTORE_SEARCH
         self.calls.append(dict(params))
         result: dict[str, Any] = {"resource_id": params["resource_id"]}
         if params.get("distinct") == "true":
+            if self.distinct_fails:
+                raise GovernmentSourceError("GOV_RESPONSE_NOT_JSON")
             values = sorted(self.counts, key=lambda v: ("" if v is None else v).encode("utf-8"))
-            offset, limit = int(params["offset"]), int(params["limit"])
-            page = values[offset:offset + limit]
-            result["records"] = [{"tozar": v, **({"degem": "x"} if self.extra_fields else {})} for v in page]
-        else:
+            served = 1 if "sort" in params else 26
+            result.update(total=len(values), records=[
+                {"tozar": v} for v in values[:min(served, int(params["limit"]))]])
+        elif "filters" in params:
             tozar = json.loads(params["filters"])["tozar"]
-            result.update(total=self.counts[tozar], records=[], filters=params["filters"])
+            total = self.counts[tozar] + (1 if tozar == self.miscount else 0)
+            result.update(total=total, records=[], filters=params["filters"])
+        else:
+            page = len(self.scans)  # 1 = the first scan page (this call included)
+            offset, limit = int(params["offset"]), int(params["limit"])
+            rows = self.rows[offset:offset + limit]
+            if page == self.short_page:
+                rows = rows[:-1]
+            total = len(self.rows) + self.total_bias
+            if self.total_moves_on_page is not None and page >= self.total_moves_on_page:
+                total += 1
+            result.update(total=total, records=[
+                {"tozar": v, **({"degem": "x"} if self.extra_fields else {})} for v in rows])
+            if self.estimated:
+                result["total_was_estimated"] = True
         return {"success": True, "result": result}, None, None
 
 
@@ -234,11 +270,84 @@ def test_the_directory_is_metadata_only_bounded_and_exact():
     found = discover_directory(fake, clock=lambda: 0.0)
     assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28), (LEXUS, 5000)]
     assert found.unfilterable_values == 3 and found.total_rows == 5028
-    # One distinct read, then one count per tozar -- limit=0, never a row.
-    distinct, *counts = fake.calls
-    assert distinct["fields"] == "tozar" and distinct["distinct"] == "true"
+    assert found.distinct_total == 5
+    # One distinct cross-check (limit=0), a tozar-only scan in _id order, then
+    # one count per tozar -- limit=0, never a row, never another field.
+    distinct, *rest = fake.calls
+    assert distinct == {"resource_id": src.WLTP_RESOURCE_ID, "fields": "tozar",
+                        "distinct": "true", "limit": "0"}
+    scans, counts = rest[:6], rest[6:]
+    assert [(c["fields"], c["sort"], c["limit"], c["offset"]) for c in scans] == [
+        ("tozar", "_id", "1000", str(offset)) for offset in range(0, 6000, 1000)]
+    assert all("distinct" not in c and "filters" not in c for c in scans)
     assert all(call["limit"] == "0" and "fields" not in call for call in counts)
-    assert found.requests == 3
+    assert len(counts) == 2 and found.requests == 9
+
+
+def test_the_directory_scans_past_a_truncating_distinct_read():
+    # Production, 2026-09-30: 137 tozars over 101,686 rows. A distinct read
+    # answers total=137 but ONE record with sort (26 without); the scan must
+    # still find every tozar with its exact count.
+    counts = {f"יצרן {i:03d}": 1 + (i * 7919) % 1480 for i in range(137)}
+    counts["יצרן 000"] += 101_686 - sum(counts.values())
+    fake = DirectoryClient(counts)
+    truncated, _, _ = fake._request(src.DATASTORE_SEARCH, {
+        "resource_id": src.WLTP_RESOURCE_ID, "fields": "tozar", "distinct": "true",
+        "sort": "tozar", "limit": "1000", "offset": "0"})
+    unsorted, _, _ = fake._request(src.DATASTORE_SEARCH, {
+        "resource_id": src.WLTP_RESOURCE_ID, "fields": "tozar", "distinct": "true",
+        "limit": "1000", "offset": "0"})
+    assert (len(truncated["result"]["records"]), truncated["result"]["total"]) == (1, 137)
+    assert (len(unsorted["result"]["records"]), unsorted["result"]["total"]) == (26, 137)
+    fake.calls.clear()
+    found = discover_directory(fake, clock=lambda: 0.0)
+    assert {u.tozar: u.expected_rows for u in found.units} == counts
+    assert len(found.units) == 137 and found.total_rows == 101_686
+    assert found.distinct_total == 137 and found.unfilterable_values == 0
+    # 1 cross-check + 102 scan pages + 137 counts: inside the default cap.
+    assert len(fake.scans) == 102 and found.requests == 240 < 6000
+    assert all(set(c) == {"resource_id", "fields", "sort", "limit", "offset"}
+               and c["fields"] == "tozar" for c in fake.scans)
+
+
+def test_an_unavailable_distinct_total_is_only_a_missing_cross_check():
+    found = discover_directory(DirectoryClient({TOYOTA: 28}, distinct_fails=True), clock=lambda: 0.0)
+    assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28)]
+    assert found.distinct_total is None
+
+
+@pytest.mark.parametrize(("fault", "reason", "scan_pages", "counts"), [
+    # the total moves on the 2nd scan page: the register changed mid-read
+    ({"total_moves_on_page": 2}, "GOV_DIRECTORY_REGISTER_CHANGED", 2, 0),
+    # the 1st page is one row short although the total needs more pages
+    ({"short_page": 1}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
+    # the scan is whole, but LEXUS's filtered count disagrees with it
+    ({"miscount": LEXUS}, "GOV_DIRECTORY_RESULT_INVALID", 4, 2),
+    # the rows counted fall short of / run past the scan's total
+    ({"total_bias": 1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
+    ({"total_bias": -1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
+    ({"estimated": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
+    # a scan row carrying any field but tozar is row payload
+    ({"extra_fields": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
+])
+def test_an_inconsistent_scan_writes_no_directory_version(fault, reason, scan_pages, counts):
+    repo = MemoryRepository()
+    fake = DirectoryClient({TOYOTA: 28, LEXUS: 3000}, **fault)
+    with pytest.raises(GovernmentSourceError) as refused:
+        refresh_directory(repo, client=fake, env={})
+    assert refused.value.reason_code == reason
+    # Refused at the intended check: no further page or count was requested.
+    assert len(fake.scans) == scan_pages
+    assert sum("filters" in call for call in fake.calls) == counts
+    assert repo.latest_register_directory() is None
+
+
+@pytest.mark.parametrize(("rows", "pages"), [(0, 1), (1000, 1), (1001, 2), (2000, 2)])
+def test_the_scan_stops_exactly_at_the_total(rows, pages):
+    fake = DirectoryClient({TOYOTA: rows} if rows else {})
+    found = discover_directory(fake, clock=lambda: 0.0)
+    assert len(fake.scans) == pages
+    assert [(u.tozar, u.expected_rows) for u in found.units] == ([(TOYOTA, rows)] if rows else [])
 
 
 def test_the_directory_refuses_past_its_request_or_time_cap():
@@ -250,12 +359,6 @@ def test_the_directory_refuses_past_its_request_or_time_cap():
     with pytest.raises(GovernmentSourceError) as late:
         discover_directory(DirectoryClient({TOYOTA: 28, LEXUS: 5000}), max_seconds=10, clock=lambda: next(ticks))
     assert late.value.reason_code == "GOV_DIRECTORY_TIME_BUDGET_EXCEEDED"
-
-
-def test_a_distinct_read_carrying_row_payload_is_refused():
-    with pytest.raises(GovernmentSourceError) as refused:
-        discover_directory(DirectoryClient({TOYOTA: 1}, extra_fields=True), clock=lambda: 0.0)
-    assert refused.value.reason_code == "GOV_DIRECTORY_RESULT_INVALID"
 
 
 def test_the_version_is_stable_and_changes_only_with_the_content():
