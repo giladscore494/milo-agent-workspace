@@ -15,8 +15,11 @@
 #      the remaining Stage P / Stage 2 API and worker flags; the contract's
 #      pinned-off flags re-asserted false on both (MILO_ENABLE_CATALOG_PROMOTION,
 #      MILO_ENABLE_WORK_SCOPE_PREPARATION, ...); the Government capture job's
-#      master flag and (PR-D3) its provider key, when that job exists; and the Vercel
-#      GATEWAY_ALLOW_EXECUTION_ROUTES and NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI.
+#      master flag, when that job exists; (PR-D3) the manufacturer
+#      normalisation job -- the only surface holding the provider key while
+#      that stage is on -- deleted, and the capture identity's accessor on the
+#      provider key and quota store revoked where held, both read back; and the
+#      Vercel GATEWAY_ALLOW_EXECUTION_ROUTES and NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI.
 #      Step 6 closes run cancellation and the website's execution routes too,
 #      so cancel runs that are still executing BEFORE it (or use
 #      --order-only, cancel, then --remaining-only).
@@ -36,8 +39,9 @@
 # the API service and worker job are read back and every flag is checked.
 # Exit 0 only when every step succeeded and every read-back value is closed.
 #
-# It never cancels an execution, never deletes anything, and changes nothing
-# but the flags and the worker's provider-key binding named above. Setting a
+# It never cancels an execution, deletes nothing but the normalisation job,
+# and changes nothing but the flags, the worker's provider-key binding and the
+# capture identity's secret access named above. Setting a
 # flag that is already false to false is a no-op, so re-running is safe.
 set -euo pipefail
 
@@ -116,6 +120,14 @@ WORKER_JOB="$(milo_op CLOUD_RUN_WORKER_JOB)"
 # Optional: the Government capture job exists only once an operator created it
 # (government-production-capture.sh --ensure-job).
 CAPTURE_JOB="$(milo_op CLOUD_RUN_CAPTURE_JOB)"
+# PR-D3: the normalisation job, and the capture identity when it is its own.
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
+CAPTURE_ONLY_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
+[[ "$CAPTURE_ONLY_SA" != "$(milo_op WORKER_SERVICE_ACCOUNT)" ]] || CAPTURE_ONLY_SA=""
+CAPTURE_DENIED_SECRETS=()
+for key in SECRET_PROVIDER_API_KEY SECRET_REDIS_URL SECRET_REDIS_TOKEN; do
+  [[ -z "$(milo_op "$key")" ]] || CAPTURE_DENIED_SECRETS+=("$(milo_op "$key")")
+done
 
 if [[ "$MODE" == "apply" ]]; then
   if [[ "${MILO_OPERATOR_ACK:-}" != "$ACK_VALUE" ]]; then
@@ -354,26 +366,32 @@ if [[ "$SCOPE" != "order" ]]; then
     printf '# if the capture job %s exists:\n' "$CAPTURE_JOB"
     show gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
       --update-env-vars "${CAPTURE_FLAG}=${CLOSED}"
-    # PR-D3: the provider key the normalisation stage bound on it.
-    printf '# if KIMI_API_KEY is bound on the capture job (manufacturer normalisation):\n'
-    show gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets KIMI_API_KEY
-  elif capture_json="$(describe_capture 2> /dev/null)"; then
+  elif describe_capture > /dev/null 2>&1; then
     CAPTURE_PRESENT=1
     run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
       --update-env-vars "${CAPTURE_FLAG}=${CLOSED}"
-    # PR-D3: the provider key the normalisation stage bound on it.
-    for key in "${PROVIDER_KEY_NAMES[@]}"; do
-      form="$(key_binding_form "$capture_json" "$key")" || form="unreadable"
-      case "$form" in
-        secret) run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets "$key" ;;
-        env) run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-env-vars "$key" ;;
-        "") ;;
-        *) printf 'STEP 6 FAILED: could not read how %s is bound on the capture job\n' "$key" >&2
-           FAILED_STEPS+=(6) ;;
-      esac
-    done
   else
     printf 'The capture job %s does not exist: nothing to close.\n' "$CAPTURE_JOB"
+  fi
+  # PR-D3: the only surface that holds the provider key while normalisation is on.
+  if [[ -n "$NORMALISATION_JOB" ]]; then
+    printf '# if the normalisation job %s exists:\n' "$NORMALISATION_JOB"
+    show gcloud run jobs delete "$NORMALISATION_JOB" --region "$REGION" --project "$PROJECT_ID" --quiet
+    if [[ "$MODE" == "apply" ]] && ! milo_remove_job "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID"; then
+      printf 'STEP 6 FAILED: the normalisation job %s is still there, or could not be listed\n' "$NORMALISATION_JOB" >&2
+      FAILED_STEPS+=(6)
+    fi
+  fi
+  if [[ -n "$CAPTURE_ONLY_SA" ]]; then
+    for secret in "${CAPTURE_DENIED_SECRETS[@]}"; do
+      printf '# if the capture identity holds an accessor on %s:\n' "$secret"
+      show gcloud secrets remove-iam-policy-binding "$secret" --project "$PROJECT_ID" \
+        --member "serviceAccount:${CAPTURE_ONLY_SA}" --role roles/secretmanager.secretAccessor
+      if [[ "$MODE" == "apply" ]] && ! milo_revoke_accessor "$secret" "serviceAccount:${CAPTURE_ONLY_SA}" "$PROJECT_ID"; then
+        printf 'STEP 6 FAILED: the capture identity may still read %s\n' "$secret" >&2
+        FAILED_STEPS+=(6)
+      fi
+    done
   fi
   for name in "${REMAINING_VERCEL_FLAGS[@]}"; do
     vercel_close 6 "$name"
@@ -466,11 +484,28 @@ else
 fi
 if [[ "$SCOPE" != "order" && "${CAPTURE_PRESENT:-0}" -eq 1 ]]; then
   if capture_json="$(describe_capture)"; then
-    verify_json "capture" "$capture_json" 0 1 "$CAPTURE_FLAG" || verified=0
+    verify_json "capture" "$capture_json" 0 0 "$CAPTURE_FLAG" || verified=0
   else
     printf 'READ-BACK FAILED: could not describe the capture job\n' >&2
     verified=0
   fi
+fi
+if [[ "$SCOPE" != "order" && -n "$NORMALISATION_JOB" ]]; then
+  if state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID")" && [[ "$state" == "absent" ]]; then
+    printf 'normalisation: the job %s is absent\n' "$NORMALISATION_JOB"
+  else
+    printf 'NOT CLOSED (normalisation): the job %s is %s\n' "$NORMALISATION_JOB" "${state:-unreadable}"
+    verified=0
+  fi
+fi
+if [[ "$SCOPE" != "order" && -n "$CAPTURE_ONLY_SA" ]]; then
+  for secret in "${CAPTURE_DENIED_SECRETS[@]}"; do
+    if ! policy="$(gcloud secrets get-iam-policy "$secret" --project "$PROJECT_ID" --format=json)" \
+       || milo_policy_has_member roles/secretmanager.secretAccessor "serviceAccount:${CAPTURE_ONLY_SA}" <<< "$policy"; then
+      printf 'NOT CLOSED (capture identity): it may read %s\n' "$secret"
+      verified=0
+    fi
+  done
 fi
 printf 'Vercel values cannot be read back by the CLI; confirm with\n'
 printf '  scripts/deploy/website-execution-check.sh --site-url <PRODUCTION_ORIGIN>\n'

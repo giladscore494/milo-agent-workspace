@@ -21,7 +21,7 @@ from backend.catalog.scope import service as work_scopes
 from backend.catalog.scope import web_preparation as work_scope_preparation
 from backend.config import get_settings
 from backend.auth import AuthenticatedUser, get_authenticated_user
-from backend.dependencies import get_capture_trigger, get_job_launcher, get_repository
+from backend.dependencies import get_capture_trigger, get_job_launcher, get_normalisation_trigger, get_repository
 from backend.execution_guard import ExecutionSurfaceGuardMiddleware, is_stage_enabled
 from backend.job_launcher import JobLauncher, JobLaunchUncertain
 from backend.errors import AppError, install_error_handlers
@@ -43,6 +43,7 @@ from backend.schemas import (
     RegisterCaptureRequest,
     RegisterDirectoryRequest,
     NormalisationApproval,
+    NormalisationRejection,
     NormalisationRequest,
     Run,
     RunCancelRequest,
@@ -826,15 +827,16 @@ def request_register_directory(project_id: UUID, request: RegisterDirectoryReque
 
 # PR-D3: manufacturer normalisation. The read (canonical names, pending
 # groups) and the owner's approval ride the Register page's flag; the ONE
-# guarded K3 call executes the capture job behind its own flag
+# guarded K3 call executes the normalisation job (CLOUD_RUN_NORMALISATION_JOB,
+# the only one holding the provider key) behind its own flag
 # (MILO_ENABLE_MANUFACTURER_NORMALISATION), never run creation or Arm.
 @app.get("/projects/{project_id}/register/normalisation")
-def get_normalisation(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+def get_normalisation(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_normalisation_trigger)) -> dict:
     return register_service.normalization_view(repo, user.user_id, project_id, trigger=trigger)
 
 
 @app.post("/projects/{project_id}/register/normalisation")
-def request_normalisation(project_id: UUID, request: NormalisationRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+def request_normalisation(project_id: UUID, request: NormalisationRequest, response: Response, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_normalisation_trigger)) -> dict:
     require_stage_enabled(register_service.REGISTER_FLAG, "manufacturer normalisation")
     require_stage_enabled(normalization.FLAG, "manufacturer normalisation")
     enforce_rate_limit("register_actions_user", str(user.user_id))
@@ -851,6 +853,14 @@ def approve_normalisation(project_id: UUID, request: NormalisationApproval, user
     return register_service.approve_normalization(
         repo, user.user_id, project_id, expected_version=request.expected_version,
         groups=[group.model_dump(exclude_none=True) for group in request.groups])
+
+
+@app.post("/projects/{project_id}/register/normalisation/rejections")
+def reject_normalisation(project_id: UUID, request: NormalisationRejection, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(register_service.REGISTER_FLAG, "manufacturer normalisation")
+    enforce_rate_limit("register_actions_user", str(user.user_id))
+    return register_service.reject_normalization(repo, user.user_id, project_id,
+                                                 group=request.group.model_dump(exclude_none=True))
 
 
 # PR-L1 (D2): the read-only discovery tree over the deterministic catalog

@@ -177,10 +177,11 @@ const EXECUTION_RULES: GatewayRule[] = [
   // API executes the capture job; nothing starts a run, so neither is a
   // run-start rule. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE).
   { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory)$`, 'i') },
-  // PR-D3: the ONE guarded model call (the capture job; not a run) and the
-  // owner's approval. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE,
-  // and MILO_ENABLE_MANUFACTURER_NORMALISATION for the call).
-  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/normalisation(/approvals)?$`, 'i') },
+  // PR-D3: the ONE guarded model call (its own job; not a run) and the
+  // owner's approval or rejection. The backend gates each again
+  // (MILO_ENABLE_REGISTER_CAPTURE, and MILO_ENABLE_MANUFACTURER_NORMALISATION
+  // for the call).
+  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/normalisation(/approvals|/rejections)?$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [

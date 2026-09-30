@@ -185,9 +185,11 @@ class CloudRunCaptureJobTrigger:
         return TriggerOutcome(TRIGGERED, execution_name_from(body))
 
 
-def build_capture_trigger(settings: Any, env: Mapping[str, str]) -> CaptureJobTrigger | None:
-    """The trigger this API is configured for, or None (it can prepare nothing)."""
-    job = str(getattr(settings, "cloud_run_capture_job", "") or "").strip()
+def build_capture_trigger(settings: Any, env: Mapping[str, str], *,
+                          job_setting: str = "cloud_run_capture_job") -> CaptureJobTrigger | None:
+    """The trigger this API is configured for, or None (it can prepare nothing).
+    PR-D3: job_setting="cloud_run_normalisation_job" is the normalisation job's."""
+    job = str(getattr(settings, job_setting, "") or "").strip()
     if not job:
         return None
     return CloudRunCaptureJobTrigger(

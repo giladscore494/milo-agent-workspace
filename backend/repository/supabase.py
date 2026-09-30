@@ -275,6 +275,8 @@ class Repository(Protocol):
     def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None: ...
     def record_manufacturer_normalization_proposal(self, run_id: UUID, proposal_id: str, status: str, groups: list[dict[str, Any]] | None, reason_code: str | None, model: str, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def approve_manufacturer_normalization(self, approved_by: UUID, expected_version: int, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def reject_manufacturer_normalization_group(self, rejected_by: UUID, group: dict[str, Any]) -> dict[str, Any]: ...
+    def manufacturer_normalization_rejections(self) -> list[dict[str, Any]]: ...
     def project_member_role(self, project_id: UUID, user_id: UUID) -> str | None: ...
     # PR-L1: catalog variants and the discovery tree.
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None: ...
@@ -2603,7 +2605,8 @@ class SupabaseRepository:
     # -- PR-D3: manufacturer normalisation (migration 20261003000100) -----
     _NORMALIZATION_REFUSALS = ("CATALOG_NORMALIZATION_REQUEST_INVALID", "CATALOG_NORMALIZATION_NOT_THIS_RUN",
                                "CATALOG_NORMALIZATION_ALREADY_RECORDED", "CATALOG_NORMALIZATION_OUTPUT_INVALID",
-                               "CATALOG_NORMALIZATION_APPROVAL_INVALID", "CATALOG_NORMALIZATION_VERSION_STALE")
+                               "CATALOG_NORMALIZATION_APPROVAL_INVALID", "CATALOG_NORMALIZATION_VERSION_STALE",
+                               "CATALOG_NORMALIZATION_REJECTION_INVALID")
 
     def manufacturer_normalization_current(self) -> dict[str, Any]:
         try:
@@ -2654,6 +2657,17 @@ class SupabaseRepository:
             "p_approved_by": str(approved_by), "p_expected_version": int(expected_version),
             "p_entries": list(entries)}, "manufacturer normalisation approval",
             refusals=self._NORMALIZATION_REFUSALS)
+
+    def reject_manufacturer_normalization_group(self, rejected_by: UUID, group: dict[str, Any]) -> dict[str, Any]:
+        return self._guarded_rpc("reject_manufacturer_normalization_group", {
+            "p_rejected_by": str(rejected_by), "p_group": dict(group)}, "manufacturer normalisation rejection",
+            refusals=self._NORMALIZATION_REFUSALS)
+
+    def manufacturer_normalization_rejections(self) -> list[dict[str, Any]]:
+        """Every rejected group (append-only; bounded by what was ever proposed)."""
+        return self._many(self.client.table("catalog_manufacturer_normalization_rejections")
+                          .select("canonical_name, members, rule_id, proposal_id")
+                          .order("rejected_at").order("id").limit(5000))
 
     def project_member_role(self, project_id: UUID, user_id: UUID) -> str | None:
         rows = self._many(self.client.table("project_members").select("role")

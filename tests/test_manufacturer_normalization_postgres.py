@@ -153,12 +153,38 @@ def test_approval_needs_exact_provenance_and_the_active_version(ndb, proposal):
             ndb.psql(f"delete from public.catalog_manufacturer_normalization_{table}")
 
 
+def test_a_rejection_is_exactly_a_pending_group_and_append_only(ndb, proposal):
+    if ndb.psql(f"select status from public.catalog_manufacturer_normalization_proposals "
+                f"where id = '{proposal['id']}'") == "requested":
+        _record(ndb, proposal, "proposed", GROUPS)
+    user = proposal["user"]
+
+    def reject(group: dict) -> str:
+        return _rpc_as_service(ndb, f"select public.reject_manufacturer_normalization_group('{user}', {_json(group)})")
+
+    for bad in ({"canonical": "Lexus Motors", "members": [LEXUS], "proposal_id": proposal["id"]},   # not as proposed
+                {"canonical": "Lexus", "members": [LEXUS, LEXUS], "proposal_id": proposal["id"]},  # twice
+                {"canonical": "Honda", "members": ["הונדה"], "rule_id": "R1_SPELLING"},            # not in the directory
+                {"canonical": "Toyota", "members": [TOYOTA], "rule_id": "R9_GUESS"},               # not a rule
+                {"canonical": "Lexus", "members": [LEXUS]}):                                      # no provenance
+        with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_REJECTION_INVALID"):
+            reject(bad)
+    first = json.loads(reject({"canonical": "Lexus", "members": [LEXUS], "proposal_id": proposal["id"]}))
+    again = json.loads(reject({"canonical": "Lexus", "members": [LEXUS], "proposal_id": proposal["id"]}))
+    assert first["id"] == again["id"] and first["members"] == [LEXUS]
+    ruled = json.loads(reject({"canonical": MERCEDES, "members": [MERCEDES_DASH, MERCEDES], "rule_id": "R1_SPELLING"}))
+    assert ruled["members"] == sorted([MERCEDES, MERCEDES_DASH]) and ruled["rule_id"] == "R1_SPELLING"
+    with pytest.raises(AssertionError, match="CATALOG_REGISTER_IMMUTABLE"):
+        ndb.psql("delete from public.catalog_manufacturer_normalization_rejections")
+
+
 def test_the_read_only_role_reads_and_writes_nothing(ndb, proposal):
     # The migration granted the production-shaped role its reads.
     ndb.psql(f"set role {RELEASE_RO}; select public.catalog_manufacturer_normalization_current(); "
              "select count(*) from public.catalog_manufacturer_normalization_entries; reset role")
     for sql in (f"select public.request_manufacturer_normalization('{proposal['user']}', 900, {_json(INPUT)})",
-                f"select public.approve_manufacturer_normalization('{proposal['user']}', 0, '[]'::jsonb)"):
+                f"select public.approve_manufacturer_normalization('{proposal['user']}', 0, '[]'::jsonb)",
+                f"select public.reject_manufacturer_normalization_group('{proposal['user']}', '{{}}'::jsonb)"):
         with pytest.raises(AssertionError, match="permission denied"):
             ndb.psql(f"set role {RELEASE_RO}; {sql}")
     for role in ("anon", "authenticated"):

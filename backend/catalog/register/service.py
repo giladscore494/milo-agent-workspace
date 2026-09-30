@@ -71,8 +71,9 @@ REQUEST_REASONS: Mapping[str, tuple[int, str]] = {
     # PR-D3.
     "CATALOG_NORMALIZATION_DISABLED": (404, "manufacturer normalisation is not enabled"),
     "CATALOG_NORMALIZATION_NOTHING_UNMAPPED": (409, "every source manufacturer name is already mapped"),
-    "CATALOG_NORMALIZATION_OWNER_ONLY": (403, "only a project owner starts or approves a normalisation"),
+    "CATALOG_NORMALIZATION_OWNER_ONLY": (403, "only a project owner starts, approves or rejects a normalisation"),
     "CATALOG_NORMALIZATION_APPROVAL_INVALID": (422, "that is not a pending group, or it must be approved alone"),
+    "CATALOG_NORMALIZATION_REJECTION_INVALID": (422, "that is not a pending group"),
     "CATALOG_NORMALIZATION_VERSION_STALE": (409, "the active normalisation changed; reload"),
 }
 
@@ -422,7 +423,13 @@ def _pending(repo: Any) -> dict[str, Any]:
              for group in (proposal or {}).get("groups") or []
              if any(active.get(m) != group["canonical"] for m in group["members"])
              ] if (proposal or {}).get("status") == "proposed" else []
-    pending = rules + model
+    # A group the owner rejected, exactly as it was proposed, is not pending.
+    rejected = {(row["canonical_name"], tuple(sorted(row["members"], key=str.encode)), row.get("rule_id"),
+                 str(row["proposal_id"]) if row.get("proposal_id") else None)
+                for row in repo.manufacturer_normalization_rejections()}
+    pending = [group for group in rules + model
+               if (group["canonical"], tuple(sorted(group["members"], key=str.encode)), group.get("rule_id"),
+                   group.get("proposal_id")) not in rejected]
     for group in pending:
         group["conflicting"] = normalization.conflicts(group, active, pending)
         group["bulk_approvable"] = group["confidence"] == "high" and not group["conflicting"]
@@ -524,16 +531,9 @@ def approve_normalization(repo: Any, user_id: UUID, project_id: UUID, *, expecte
         if repo.project_member_role(project_id, user_id) != "owner":
             raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")
         pending = _pending(repo)["pending"]
-
-        def same(asked: Mapping[str, Any], group: Mapping[str, Any]) -> bool:
-            return (asked.get("canonical") == group["canonical"]
-                    and list(asked.get("members") or []) == list(group["members"])
-                    and asked.get("rule_id") == group.get("rule_id")
-                    and asked.get("proposal_id") == group.get("proposal_id"))
-
         chosen = []
         for asked in groups:
-            match = next((group for group in pending if same(asked, group)), None)
+            match = next((group for group in pending if _same_group(asked, group)), None)
             if match is None or match in chosen:
                 raise _refusal("CATALOG_NORMALIZATION_APPROVAL_INVALID")
             chosen.append(match)
@@ -554,6 +554,41 @@ def approve_normalization(repo: Any, user_id: UUID, project_id: UUID, *, expecte
         raise
 
 
+def _same_group(asked: Mapping[str, Any], group: Mapping[str, Any]) -> bool:
+    """The group exactly as the server proposed it (provenance included)."""
+    return (asked.get("canonical") == group["canonical"]
+            and list(asked.get("members") or []) == list(group["members"])
+            and asked.get("rule_id") == group.get("rule_id")
+            and asked.get("proposal_id") == group.get("proposal_id"))
+
+
+def reject_normalization(repo: Any, user_id: UUID, project_id: UUID, *, group: Mapping[str, Any],
+                         env: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The owner rejects ONE pending group, exactly as proposed: an
+    append-only record; the group is no longer pending. Nothing is mapped."""
+    try:
+        require_enabled(env)
+        if not _supported(repo.get_project(project_id, user_id)):
+            raise _refusal("CATALOG_REGISTER_DISABLED")
+        if repo.project_member_role(project_id, user_id) != "owner":
+            raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")
+        match = next((pending for pending in _pending(repo)["pending"] if _same_group(group, pending)), None)
+        if match is None:
+            raise _refusal("CATALOG_NORMALIZATION_REJECTION_INVALID")
+        body = {"canonical": match["canonical"], "members": list(match["members"]),
+                **({"rule_id": match["rule_id"]} if match.get("rule_id") else {"proposal_id": match["proposal_id"]})}
+        try:
+            repo.reject_manufacturer_normalization_group(user_id, body)
+        except AppError as refused:
+            if refused.code in REQUEST_REASONS:
+                raise _refusal(refused.code) from None
+            raise
+        return {"rejected": True}
+    except AppError as refused:
+        _log_refusal(project_id, refused.code)
+        raise
+
+
 __all__ = ["CapacityRefusal", "REGISTER_FLAG", "REQUEST_REASONS", "START_GRACE_SECONDS", "register_enabled",
            "approve_normalization", "normalization_view", "register_view", "request_capture",
-           "request_directory_refresh", "request_normalization", "require_enabled", "server_can_capture"]
+           "request_directory_refresh", "request_normalization", "require_enabled", "server_can_capture", "reject_normalization"]

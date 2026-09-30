@@ -45,6 +45,7 @@ function fakeClient(body: unknown = view()) {
     read: vi.fn(async () => body),
     request: vi.fn(async () => ({ started: true })),
     approve: vi.fn(async () => ({ version: 3, entry_count: 4 })),
+    reject: vi.fn(async () => ({ rejected: true })),
   } satisfies NormalisationClient;
 }
 
@@ -86,12 +87,29 @@ describe('the approval screen', () => {
       { canonical: MERCEDES, members: [MERCEDES_DASH, MERCEDES], rule_id: 'R1_SPELLING' },
       { canonical: 'Honda', members: ['הונדה'], proposal_id: PROPOSAL },
     ]);
+    // Every group has its own Approve and Reject: the low one, alone.
     const alone = await screen.findAllByRole('button', { name: 'Approve' });
-    expect(alone).toHaveLength(1);
-    fireEvent.click(alone[0]);
+    expect(alone).toHaveLength(3);
+    fireEvent.click(alone[2]);
     await waitFor(() => expect(client.approve).toHaveBeenCalledTimes(2));
     expect(client.approve).toHaveBeenLastCalledWith(PROJECT, 2, [
       { canonical: 'Lexus', members: ['לקסוס'], proposal_id: PROPOSAL }]);
+  });
+
+  it('approves one high-confidence group alone, and rejects any group', async () => {
+    const client = fakeClient();
+    render(<NormalisationSection projectId={PROJECT} conversationId={CONVERSATION} client={client} />);
+    const approveButtons = await screen.findAllByRole('button', { name: 'Approve' });
+    fireEvent.click(approveButtons[1]);
+    await waitFor(() => expect(client.approve).toHaveBeenCalledTimes(1));
+    expect(client.approve).toHaveBeenCalledWith(PROJECT, 2, [
+      { canonical: 'Honda', members: ['הונדה'], proposal_id: PROPOSAL }]);
+    const rejectButtons = await screen.findAllByRole('button', { name: 'Reject' });
+    expect(rejectButtons).toHaveLength(3);
+    fireEvent.click(rejectButtons[0]);
+    await waitFor(() => expect(client.reject).toHaveBeenCalledTimes(1));
+    expect(client.reject).toHaveBeenCalledWith(
+      PROJECT, { canonical: MERCEDES, members: [MERCEDES_DASH, MERCEDES], rule_id: 'R1_SPELLING' });
   });
 
   it('starts the one model call, and offers no approval to a non-owner', async () => {
@@ -100,12 +118,13 @@ describe('the approval screen', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Normalise manufacturers' }));
     await waitFor(() => expect(client.request).toHaveBeenCalledWith(PROJECT, CONVERSATION));
     expect(screen.queryByRole('button', { name: /Approve/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Reject' })).toBeNull();
   });
 });
 
 describe('the gateway', () => {
   const read = `/projects/${PROJECT}/register/normalisation`;
-  const writes = [read, `${read}/approvals`];
+  const writes = [read, `${read}/approvals`, `${read}/rejections`];
   afterEach(() => {
     delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
   });

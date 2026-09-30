@@ -15,7 +15,9 @@
 --     tozeret_nm and up to three sample kinuy_mishari) and its validated
 --     output (groups: canonical name, members, confidence high|low, reason).
 --     A proposal is requested from the website (decision 14) and executed by
---     the EXISTING capture job under an operator capture run -- the lease and
+--     its OWN normalisation job (the capture job's definition, run as the
+--     worker identity, the only job holding the provider key) under an
+--     operator capture run -- the lease and
 --     budget anchor the gateway's per-run and daily caps need; never a product
 --     run. Its request / trigger / liveness record is a register capture
 --     group of the new kind 'normalisation' (one live at a time).
@@ -331,6 +333,91 @@ $$;
 -- Per captured tozar, the register's own evidence: its rows, its distinct
 -- manufacturer codes, up to three plant names and three commercial models
 -- (the served variant builds only).
+-- The owner may reject any pending group instead: an append-only record,
+-- keyed by the group exactly as it was proposed (its provenance, canonical
+-- name and members). A rejected group is no longer pending; a different group
+-- (a new proposal, a changed rule answer) is a new decision.
+create table if not exists public.catalog_manufacturer_normalization_rejections (
+  id uuid primary key default gen_random_uuid(),
+  group_key text not null unique check (group_key ~ '^[0-9a-f]{64}$'),
+  canonical_name text not null check (char_length(canonical_name) between 1 and 200),
+  members text[] not null check (cardinality(members) between 1 and 2000),
+  rule_id text check (rule_id is null or rule_id in ('R1_SPELLING', 'R2_TOZERET_CD')),
+  proposal_id uuid references public.catalog_manufacturer_normalization_proposals(id) on delete restrict,
+  rejected_by uuid not null,
+  rejected_at timestamptz not null default now(),
+  check ((rule_id is null) <> (proposal_id is null))
+);
+create index if not exists catalog_manufacturer_normalization_rejections_proposal_idx
+  on public.catalog_manufacturer_normalization_rejections (proposal_id);
+drop trigger if exists catalog_manufacturer_normalization_rejections_append_only
+  on public.catalog_manufacturer_normalization_rejections;
+create trigger catalog_manufacturer_normalization_rejections_append_only
+  before update or delete on public.catalog_manufacturer_normalization_rejections
+  for each row execute function public.forbid_catalog_register_rewrite();
+
+create or replace function public.reject_manufacturer_normalization_group(p_rejected_by uuid, p_group jsonb)
+returns jsonb
+language plpgsql
+set search_path = pg_catalog
+as $$
+declare
+  v_members text[];
+  v_rule text;
+  v_proposal uuid;
+  v_key text;
+  v_row public.catalog_manufacturer_normalization_rejections%rowtype;
+  v_directory uuid;
+begin
+  if p_rejected_by is null or jsonb_typeof(p_group) is distinct from 'object'
+     or jsonb_typeof(p_group->'canonical') is distinct from 'string'
+     or jsonb_typeof(p_group->'members') is distinct from 'array'
+     or jsonb_array_length(p_group->'members') not between 1 and 2000
+     or exists (select 1 from jsonb_array_elements(p_group->'members') m where jsonb_typeof(m) <> 'string')
+     or (p_group ? 'rule_id') = (p_group ? 'proposal_id') then
+    raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: invalid rejection' using errcode = '22023';
+  end if;
+  select array_agg(m order by m collate "C") into v_members
+    from (select distinct m #>> '{}' as m from jsonb_array_elements(p_group->'members') m) x;
+  if cardinality(v_members) <> jsonb_array_length(p_group->'members') then
+    raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: a name appears twice' using errcode = '22023';
+  end if;
+  v_rule := p_group->>'rule_id';
+  if p_group ? 'proposal_id' then
+    begin
+      v_proposal := (p_group->>'proposal_id')::uuid;
+    exception when others then
+      raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: invalid proposal' using errcode = '22023';
+    end;
+  end if;
+  select id into v_directory from public.catalog_register_directory_versions
+   order by created_at desc, id desc limit 1;
+  -- Exactly a group the server proposed: a code-owned rule over tozars of the
+  -- latest directory, or a group of a proposed model proposal, as it stands.
+  if (v_rule is not null and (v_rule not in ('R1_SPELLING', 'R2_TOZERET_CD')
+                              or exists (select 1 from unnest(v_members) m
+                                          where not exists (select 1 from public.catalog_register_directory_units u
+                                                             where u.version_id = v_directory and u.tozar = m))))
+     or (v_proposal is not null and not exists (
+           select 1 from public.catalog_manufacturer_normalization_proposals p, jsonb_array_elements(p.groups) g
+            where p.id = v_proposal and p.status = 'proposed' and g->>'canonical' = p_group->>'canonical'
+              and (select array_agg(m #>> '{}' order by m #>> '{}' collate "C")
+                     from jsonb_array_elements(g->'members') m) = v_members)) then
+    raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: the group is not a pending proposal'
+      using errcode = '22023';
+  end if;
+  v_key := encode(sha256(convert_to(jsonb_build_object(
+             'canonical', p_group->>'canonical', 'members', to_jsonb(v_members), 'rule_id', v_rule,
+             'proposal_id', v_proposal)::text, 'UTF8')), 'hex');
+  insert into public.catalog_manufacturer_normalization_rejections
+    (group_key, canonical_name, members, rule_id, proposal_id, rejected_by)
+  values (v_key, p_group->>'canonical', v_members, v_rule, v_proposal, p_rejected_by)
+  on conflict (group_key) do nothing;
+  select * into v_row from public.catalog_manufacturer_normalization_rejections where group_key = v_key;
+  return to_jsonb(v_row);
+end;
+$$;
+
 create or replace function public.catalog_manufacturer_evidence()
 returns jsonb
 language sql
@@ -355,6 +442,7 @@ $$;
 alter table public.catalog_manufacturer_normalization_proposals enable row level security;
 alter table public.catalog_manufacturer_normalization_versions enable row level security;
 alter table public.catalog_manufacturer_normalization_entries enable row level security;
+alter table public.catalog_manufacturer_normalization_rejections enable row level security;
 
 do $$
 declare
@@ -364,7 +452,8 @@ declare
   v_writes text[] := array[
     'public.request_manufacturer_normalization(uuid,integer,jsonb)',
     'public.record_manufacturer_normalization_proposal(uuid,text,integer,text,uuid,text,jsonb,text,text)',
-    'public.approve_manufacturer_normalization(uuid,integer,jsonb)'];
+    'public.approve_manufacturer_normalization(uuid,integer,jsonb)',
+    'public.reject_manufacturer_normalization_group(uuid,jsonb)'];
   v_reads text[] := array[
     'public.catalog_normalization_groups_valid(jsonb,jsonb)',
     'public.catalog_manufacturer_normalization_current()',
@@ -372,7 +461,8 @@ declare
   v_tables text[] := array[
     'public.catalog_manufacturer_normalization_proposals',
     'public.catalog_manufacturer_normalization_versions',
-    'public.catalog_manufacturer_normalization_entries'];
+    'public.catalog_manufacturer_normalization_entries',
+    'public.catalog_manufacturer_normalization_rejections'];
 begin
   foreach fn in array v_writes || v_reads loop
     execute format('revoke execute on function %s from public', fn);
@@ -400,6 +490,7 @@ begin
     execute 'grant select, insert, update on table public.catalog_manufacturer_normalization_proposals to service_role';
     execute 'grant select, insert on table public.catalog_manufacturer_normalization_versions to service_role';
     execute 'grant select, insert on table public.catalog_manufacturer_normalization_entries to service_role';
+    execute 'grant select, insert on table public.catalog_manufacturer_normalization_rejections to service_role';
     foreach tbl in array v_tables loop
       execute format('revoke delete, truncate on table %s from service_role', tbl);
     end loop;

@@ -269,6 +269,23 @@ if [[ -n "$CAPTURE_SA" ]]; then
   fi
 fi
 
+# PR-D3: the normalisation job is the only surface that holds the provider key
+# while that stage is on (it runs as the worker identity, never the capture
+# identity), so it exists exactly while the API flag is on: present + on PASS,
+# absent + off PASS, anything else BLOCKED.
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
+if [[ -n "$NORMALISATION_JOB" ]]; then
+  if normalisation_state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID")"; then
+    normalisation_flag="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+      --format=json 2> /dev/null | milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" || true)"
+    posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
+    record_check "${posture%% *}" "cloud-run:normalisation-job" "${NORMALISATION_JOB}: ${posture#* }"
+  else
+    record_check BLOCKED "cloud-run:normalisation-job" \
+      "the Cloud Run jobs could not be listed, so whether ${NORMALISATION_JOB} (which holds the provider key) exists is unknown"
+  fi
+fi
+
 # PR-D1: the register archive bucket and the capture identity's create-only
 # grant on it (scripts/ops/setup-register-archive.sh --check, read-only).
 # Until the operator sets it up this is a GAP (WARN): register capture refuses

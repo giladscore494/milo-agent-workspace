@@ -38,14 +38,21 @@
 #                           only, read back). GET only, $0: no run, no job,
 #                           no model; run creation stays off.
 #   --apply-manufacturer-normalisation PR-D3. The Register page's "Normalise
-#                           manufacturers" button: its API flag
-#                           (MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS),
-#                           and on the capture job
-#                           the provider key and the shared quota store (the
-#                           capture identity gets secretAccessor on exactly
-#                           those three secrets), each read back. Run creation
-#                           and paid execution read back OFF (decision 33).
+#                           manufacturers" button: its OWN small job
+#                           (CLOUD_RUN_NORMALISATION_JOB, run as the worker
+#                           identity) with the deployment's RuntimePolicy caps
+#                           and -- there only -- the provider key and the
+#                           quota store; then its API flag and job name
+#                           (MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS).
+#                           Read back: the job, the capture job and the
+#                           capture identity holding NO provider key, run
+#                           creation and paid execution OFF (decision 33).
 #                           Needs the register-capture stage first.
+#   --remove-manufacturer-normalisation PR-D3, off: the API flag off, the
+#                           normalisation job deleted, and any accessor the
+#                           capture identity holds on the provider key or the
+#                           quota store revoked, each read back. Run by the
+#                           kill switch and by every deploy's Stage A reset.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -107,7 +114,7 @@ WS_ARGS=()
 
 usage() {
   cat << 'EOF'
-Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-catalog-browser|--apply-manufacturer-normalisation|--apply-backend] [options]
+Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-catalog-browser|--apply-manufacturer-normalisation|--remove-manufacturer-normalisation|--apply-backend] [options]
 
 Default --plan changes nothing and prints both stages.
 
@@ -160,6 +167,7 @@ while [[ $# -gt 0 ]]; do
     --apply-register-capture) MODE="apply-register-capture"; shift ;;
     --apply-catalog-browser) MODE="apply-catalog-browser"; shift ;;
     --apply-manufacturer-normalisation) MODE="apply-manufacturer-normalisation"; shift ;;
+    --remove-manufacturer-normalisation) MODE="remove-manufacturer-normalisation"; shift ;;
     --apply-backend) MODE="apply-backend"; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
@@ -267,14 +275,18 @@ REGISTER_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB
 # PR-L1: the read-only catalog browser on the API, nothing else.
 BROWSER_API_VARS="$(pairs "$ENABLED" "${MILO_CATALOG_BROWSER_API_ENABLE_FLAGS[@]}")"
 
-# PR-D3: the "Normalise manufacturers" button on the API; the key and the
-# quota store on the capture job.
+# PR-D3: the "Normalise manufacturers" button on the API, and the SEPARATE
+# job it executes -- the only place the provider key is bound for it.
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
 NORMALISATION_API_VARS="$(pairs "$ENABLED" "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[@]}")"
-CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
-[[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"
+NORMALISATION_API_VARS+="${MILO_ENV_VAR_DELIMITER}${MILO_NORMALISATION_JOB_ENV_NAME}=${NORMALISATION_JOB}"
+NORMALISATION_API_OFF="$(pairs "$DISABLED" "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[@]}")"
+# The capture identity when it is its own (not the worker's): it must never
+# read the provider key, nor the quota store it has no use for.
+CAPTURE_ONLY_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
+[[ "$CAPTURE_ONLY_SA" != "$(milo_op WORKER_SERVICE_ACCOUNT)" ]] || CAPTURE_ONLY_SA=""
 REDIS_URL_SECRET="$(milo_op SECRET_REDIS_URL)"
 REDIS_TOKEN_SECRET="$(milo_op SECRET_REDIS_TOKEN)"
-NORMALISATION_JOB_SECRETS="KIMI_API_KEY=${PROVIDER_SECRET}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_URL=${REDIS_URL_SECRET}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_TOKEN=${REDIS_TOKEN_SECRET}:${MILO_SECRET_VERSION}"
 
 # Stage 2.
 S2_API_VARS="$(pairs "$ENABLED" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}")"
@@ -372,21 +384,80 @@ EOC
 
 print_manufacturer_normalisation_commands() {
   cat << EOC
-# --- PR-D3, capture identity: read exactly the three secrets the ONE model
-# call needs (the provider key and the shared quota store). <CAPTURE_SERVICE_ACCOUNT>
-# is the operator configuration's key: no address is printed.
-for secret in ${PROVIDER_SECRET} ${REDIS_URL_SECRET:-<SECRET_REDIS_URL>} ${REDIS_TOKEN_SECRET:-<SECRET_REDIS_TOKEN>}; do
-  gcloud secrets add-iam-policy-binding "\$secret" --project ${PROJECT_ID} \\
-    --member serviceAccount:<CAPTURE_SERVICE_ACCOUNT> --role roles/secretmanager.secretAccessor
-done
-# --- PR-D3, capture job: the key and the store, bound (never as plain env).
-gcloud run jobs update ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} --region ${REGION} --project ${PROJECT_ID} \\
-  --update-secrets '${NORMALISATION_JOB_SECRETS}'
-# --- PR-D3, API only: the button. Run creation and paid execution stay off.
+# --- PR-D3, its own job (${NORMALISATION_JOB:-<CLOUD_RUN_NORMALISATION_JOB>}), run as the worker identity:
+# the capture job's definition, the worker's RuntimePolicy caps, and ONLY here
+# the provider key and the quota store (secret references, never plain env).
+MILO_NORMALISATION_POLICY_VARS='<the worker's RuntimePolicy caps>' \\
+  bash scripts/catalog/government-production-capture.sh --operator-config <config> \\
+  --ensure-normalisation-job --enable-catalog-execution
+# --- PR-D3: the API identity reads that job and the worker job (the release
+# check), each bound only when absent, then read back.
+gcloud run jobs add-iam-policy-binding ${NORMALISATION_JOB:-<CLOUD_RUN_NORMALISATION_JOB>} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --member serviceAccount:<API_SERVICE_ACCOUNT> --role ${MILO_API_JOB_READ_ROLE}
+# --- PR-D3, API only: the button and the job it executes. Run creation and
+# paid execution stay off.
 gcloud run services update ${API_SERVICE} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${NORMALISATION_API_VARS}'
 EOC
+}
+
+# The worker's applied RuntimePolicy caps (the deployment's), as pairs; the
+# reviewed envelope --apply-runtime-policy binds when the worker has none.
+worker_policy_vars() {
+  local json
+  json="$(gcloud run jobs describe "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --format=json)" || return 1
+  python3 -c '
+import json, sys
+delim, reviewed = sys.argv[1], sys.argv[2]
+wanted = [pair.split("=", 1)[0] for pair in reviewed.split(delim)]
+def containers(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            return node["containers"]
+        for child in node.values():
+            found = containers(child)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for child in node:
+            found = containers(child)
+            if found:
+                return found
+    return []
+doc = json.load(sys.stdin)
+applied = {e["name"]: e.get("value") for e in (containers(doc)[0].get("env") or [])
+           if isinstance(e, dict) and "value" in e} if containers(doc) else {}
+if all(applied.get(name) for name in wanted):
+    print(delim.join("%s=%s" % (name, applied[name]) for name in wanted))
+else:
+    print(reviewed)
+' "$MILO_ENV_VAR_DELIMITER" "$POLICY_JOB_VARS" <<< "$json"
+}
+
+# The capture identity holds no accessor on the provider key or the quota
+# store: removed where it holds one, then read back. Nothing to do when the
+# capture identity is the worker's.
+revoke_capture_provider_access() {
+  local secret
+  [[ -n "$CAPTURE_ONLY_SA" ]] || return 0
+  for secret in "$PROVIDER_SECRET" "$REDIS_URL_SECRET" "$REDIS_TOKEN_SECRET"; do
+    [[ -z "$secret" ]] || milo_revoke_accessor "$secret" "serviceAccount:${CAPTURE_ONLY_SA}" "$PROJECT_ID" || return 1
+  done
+  printf 'The capture identity reads neither the provider key nor the quota store (read back).\n'
+}
+
+# A job binds no provider key, in either form.
+no_provider_key() {
+  local json name
+  json="$(gcloud run jobs describe "$1" --region "$REGION" --project "$PROJECT_ID" --format=json)" || return 1
+  for name in "${MILO_PROVIDER_KEY_ENV_NAMES[@]}"; do
+    if grep -q "\"name\": *\"${name}\"" <<< "$json"; then
+      printf 'MISMATCH %s: bound on %s\n' "$name" "$1"
+      return 1
+    fi
+  done
 }
 
 print_backend_commands() {
@@ -672,8 +743,9 @@ fi
 # --apply-manufacturer-normalisation (PR-D3)
 # ---------------------------------------------------------------------------
 if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
-  if [[ -z "$CAPTURE_JOB" || -z "$CAPTURE_SA" || -z "$REDIS_URL_SECRET" || -z "$REDIS_TOKEN_SECRET" ]]; then
-    printf 'FAIL: --apply-manufacturer-normalisation needs CLOUD_RUN_CAPTURE_JOB, CAPTURE_SERVICE_ACCOUNT (or WORKER_SERVICE_ACCOUNT), SECRET_REDIS_URL and SECRET_REDIS_TOKEN in %s.\n' "$CONFIG_PATH" >&2
+  if [[ -z "$CAPTURE_JOB" || -z "$NORMALISATION_JOB" || -z "$(milo_op WORKER_SERVICE_ACCOUNT)" || -z "$API_SA" \
+        || -z "$REDIS_URL_SECRET" || -z "$REDIS_TOKEN_SECRET" ]]; then
+    printf 'FAIL: --apply-manufacturer-normalisation needs CLOUD_RUN_CAPTURE_JOB, WORKER_SERVICE_ACCOUNT, API_SERVICE_ACCOUNT, SECRET_REDIS_URL and SECRET_REDIS_TOKEN in %s.\n' "$CONFIG_PATH" >&2
     exit 2
   fi
   printf '== Gate: the release is deployed and the database carries the exact migration set ==\n'
@@ -687,20 +759,37 @@ if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
     printf 'FAIL: the register-capture stage is not on (above); apply it first. Nothing was changed.\n' >&2
     exit 1
   fi
-  printf '\n== Applying manufacturer normalisation (capture job secrets, then the API) ==\n'
+  printf '\n== Applying manufacturer normalisation (its own job, then the API) ==\n'
   print_manufacturer_normalisation_commands
-  for secret in "$PROVIDER_SECRET" "$REDIS_URL_SECRET" "$REDIS_TOKEN_SECRET"; do
-    gcloud secrets add-iam-policy-binding "$secret" --project "$PROJECT_ID" \
-      --member "serviceAccount:${CAPTURE_SA}" --role roles/secretmanager.secretAccessor > /dev/null
-  done
-  gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
-    --update-secrets "$NORMALISATION_JOB_SECRETS"
-  if ! readback_secret job "$CAPTURE_JOB" KIMI_API_KEY "$PROVIDER_SECRET" \
-     || ! readback_secret job "$CAPTURE_JOB" UPSTASH_REDIS_REST_URL "$REDIS_URL_SECRET" \
-     || ! readback_secret job "$CAPTURE_JOB" UPSTASH_REDIS_REST_TOKEN "$REDIS_TOKEN_SECRET" \
-     || ! readback job "$CAPTURE_JOB" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
+  if ! policy_vars="$(worker_policy_vars)" || [[ -z "$policy_vars" ]]; then
+    printf 'FAIL: the worker job could not be read for its RuntimePolicy caps; nothing was changed.\n' >&2
+    exit 1
+  fi
+  if ! MILO_NORMALISATION_POLICY_VARS="$policy_vars" bash "${REPO_ROOT}/scripts/catalog/government-production-capture.sh" \
+       --operator-config "$CONFIG_PATH" --ensure-normalisation-job --enable-catalog-execution; then
+    printf 'FAIL: the normalisation job was not ensured (above); the API was not changed.\n' >&2
+    exit 1
+  fi
+  split_pairs "$policy_vars"
+  if ! readback_secret job "$NORMALISATION_JOB" KIMI_API_KEY "$PROVIDER_SECRET" \
+     || ! readback_secret job "$NORMALISATION_JOB" UPSTASH_REDIS_REST_URL "$REDIS_URL_SECRET" \
+     || ! readback_secret job "$NORMALISATION_JOB" UPSTASH_REDIS_REST_TOKEN "$REDIS_TOKEN_SECRET" \
+     || ! readback job "$NORMALISATION_JOB" "${SPLIT[@]}" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
           "${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=${DISABLED}"; then
-    printf 'FAIL: the capture job does not carry the normalisation posture (above). The API was not changed.\n' >&2
+    printf 'FAIL: the normalisation job does not carry its posture (above). The API was not changed.\n' >&2
+    exit 1
+  fi
+  # The key is the normalisation job's only: never the capture job's, never
+  # the capture identity's.
+  if ! no_provider_key "$CAPTURE_JOB" || ! revoke_capture_provider_access; then
+    printf 'FAIL: the capture job or the capture identity can reach the provider key (above). The API was not changed.\n' >&2
+    exit 1
+  fi
+  # The button READS the normalisation job and the worker job (the release
+  # check) before it executes anything: both read bindings, read back.
+  if ! ensure_job_binding "$NORMALISATION_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" \
+     || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}"; then
+    printf 'FAIL: the API identity cannot read both jobs (above); the API was NOT changed.\n' >&2
     exit 1
   fi
   gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
@@ -713,6 +802,31 @@ if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
     exit 1
   fi
   printf '\nManufacturer normalisation applied and read back. Run creation and paid execution are still OFF.\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --remove-manufacturer-normalisation (PR-D3, off)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "remove-manufacturer-normalisation" ]]; then
+  printf '== Removing manufacturer normalisation (the API flag, its job, the capture identity'"'"'s access) ==\n'
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${NORMALISATION_API_OFF}" > /dev/null
+  split_pairs "$NORMALISATION_API_OFF"
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}"; then
+    printf 'FAIL: the API still carries the normalisation flag (above).\n' >&2
+    exit 1
+  fi
+  if ! milo_remove_job "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID"; then
+    printf 'FAIL: the normalisation job %s is still there, or could not be listed.\n' "$NORMALISATION_JOB" >&2
+    exit 1
+  fi
+  printf 'The normalisation job %s is absent (read back).\n' "${NORMALISATION_JOB:-<none configured>}"
+  if ! revoke_capture_provider_access; then
+    printf 'FAIL: the capture identity'"'"'s provider access could not be revoked or read back.\n' >&2
+    exit 1
+  fi
+  printf '\nManufacturer normalisation removed and read back.\n'
   exit 0
 fi
 

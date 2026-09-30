@@ -27,7 +27,7 @@ class NormalizationMemoryMixin:
     def _norm_state(self) -> dict[str, Any]:
         state = getattr(self, "_normalization", None)
         if state is None:
-            state = {"proposals": {}, "versions": [], "roles": {}}
+            state = {"proposals": {}, "versions": [], "roles": {}, "rejections": []}
             self._normalization = state
         return state
 
@@ -119,6 +119,28 @@ class NormalizationMemoryMixin:
                 raise _refused("CATALOG_NORMALIZATION_OUTPUT_INVALID")
             proposal.update(status=status, groups=groups, reason_code=reason_code, model=model, updated_at=_now())
             return {k: v for k, v in proposal.items() if k != "input"}
+
+    def reject_manufacturer_normalization_group(self, rejected_by: UUID, group: dict[str, Any]) -> dict[str, Any]:
+        state = self._norm_state()
+        with self.lock:
+            members = sorted(group.get("members") or [], key=str.encode)
+            rule, proposal_id = group.get("rule_id"), group.get("proposal_id")
+            proposal = state["proposals"].get(str(proposal_id)) if proposal_id else None
+            tozars = {unit["tozar"] for unit in (self.latest_register_directory() or {"units": []})["units"]}
+            if not members or len(set(members)) != len(members) or bool(rule) == bool(proposal_id) or (
+                    rule and (rule not in normalization.RULES or not set(members) <= tozars)) or (
+                    proposal_id and (proposal is None or proposal["status"] != "proposed" or not any(
+                        g["canonical"] == group.get("canonical") and sorted(g["members"], key=str.encode) == members
+                        for g in proposal.get("groups") or []))):
+                raise _refused("CATALOG_NORMALIZATION_REJECTION_INVALID")
+            row = {"canonical_name": group["canonical"], "members": members, "rule_id": rule,
+                   "proposal_id": proposal_id, "rejected_by": str(rejected_by)}
+            if row not in state["rejections"]:
+                state["rejections"].append(row)
+            return dict(row)
+
+    def manufacturer_normalization_rejections(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._norm_state()["rejections"]]
 
     def approve_manufacturer_normalization(self, approved_by: UUID, expected_version: int,
                                            entries: list[dict[str, Any]]) -> dict[str, Any]:

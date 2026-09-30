@@ -515,18 +515,105 @@ MILO_CATALOG_BROWSER_API_ENABLE_FLAGS=(
 )
 
 # PR-D3 — manufacturer normalisation (decisions 14, 33). API: the "Normalise
-# manufacturers" button, which executes the EXISTING capture job with its own
-# per-execution switch (MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB) for ONE
-# guarded K3 call under the reviewed per-run and daily caps. The capture job
-# then carries the provider key and the shared provider-quota store while this
-# stage is on: bound by website-execution-activate.sh
-# --apply-manufacturer-normalisation (after the job is ensured), gone again on
-# every capture-job ensure (--set-secrets) and removed by the kill switch.
+# manufacturers" button, which executes its OWN small job (the API's
+# CLOUD_RUN_NORMALISATION_JOB) with its per-execution switch
+# (MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB) for ONE guarded K3 call under
+# the deployment's RuntimePolicy caps. That job -- and only that job -- binds
+# the provider key and the shared provider-quota store, running as the worker
+# identity: the capture job and the capture identity never hold the key
+# (website-execution-activate.sh --apply-manufacturer-normalisation, read back).
+# Off: --remove-manufacturer-normalisation (the kill switch and every deploy's
+# Stage A reset) deletes the job and revokes any capture-identity access.
 # Allowed while paid runs are off; run creation and paid execution stay off.
 MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS=(
   MILO_ENABLE_MANUFACTURER_NORMALISATION
 )
 MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME="MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
+MILO_NORMALISATION_JOB_ENV_NAME="CLOUD_RUN_NORMALISATION_JOB"
+
+# milo_normalisation_job_name — CLOUD_RUN_NORMALISATION_JOB, else
+# <CLOUD_RUN_CAPTURE_JOB>-normalisation ('' when neither is configured).
+milo_normalisation_job_name() {
+  local name capture
+  name="$(milo_op CLOUD_RUN_NORMALISATION_JOB)"
+  capture="$(milo_op CLOUD_RUN_CAPTURE_JOB)"
+  [[ -n "$name" || -z "$capture" ]] || name="${capture}-normalisation"
+  printf '%s' "$name"
+}
+
+# milo_job_state JOB REGION PROJECT — "present" or "absent", from a listing,
+# so a listing that fails is nonzero and never reads as "absent".
+milo_job_state() {
+  local listed
+  [[ -n "$1" ]] || { printf 'absent'; return 0; }
+  listed="$(gcloud run jobs list --region "$2" --project "$3" --filter="metadata.name=$1" \
+    --format='value(metadata.name)' 2> /dev/null)" || return 1
+  if [[ "$listed" == "$1" ]]; then printf 'present'; else printf 'absent'; fi
+}
+
+# milo_remove_job JOB REGION PROJECT — delete the job where it is, then read
+# back its absence; nonzero unless it reads back absent.
+milo_remove_job() {
+  local state
+  state="$(milo_job_state "$@")" || return 1
+  if [[ "$state" == "present" ]]; then
+    gcloud run jobs delete "$1" --region "$2" --project "$3" --quiet > /dev/null || return 1
+    state="$(milo_job_state "$@")" || return 1
+  fi
+  [[ "$state" == "absent" ]]
+}
+
+# milo_env_value NAME < DESCRIBE_JSON — the plain value NAME carries on the
+# described service or job ('' when unset, secret-backed or unreadable).
+milo_env_value() {
+  python3 -c '
+import json, sys
+try:
+    doc = json.loads(sys.stdin.read() or "{}")
+except ValueError:
+    doc = {}
+def containers(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            yield from node["containers"]
+        for value in node.values():
+            yield from containers(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from containers(value)
+for container in containers(doc):
+    for env in container.get("env") or []:
+        if isinstance(env, dict) and env.get("name") == sys.argv[1] and "value" in env:
+            print(env["value"])
+            sys.exit(0)
+' "$1"
+}
+
+# milo_normalisation_posture JOB_STATE API_FLAG_VALUE — "PASS <why>" or
+# "BLOCKED <why>". The job holds the provider key, so it exists exactly while
+# the stage is on.
+milo_normalisation_posture() {
+  local on=0
+  case "$(tr -d "[]'\" " <<< "$2" | tr '[:upper:]' '[:lower:]')" in 1 | true | yes | on) on=1 ;; esac
+  case "$1|$on" in
+    present\|1) printf 'PASS the normalisation job exists and the stage is on' ;;
+    absent\|0) printf 'PASS no normalisation job, and the stage is off' ;;
+    present\|0) printf 'BLOCKED the normalisation job (which holds the provider key) exists while the stage is off. Remediation: bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation' ;;
+    *) printf 'BLOCKED the stage is on but its normalisation job is absent. Remediation: bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation, or --apply-manufacturer-normalisation' ;;
+  esac
+}
+
+# milo_revoke_accessor SECRET MEMBER PROJECT — MEMBER holds no
+# secretAccessor on SECRET: removed where it holds one, then read back.
+milo_revoke_accessor() {
+  local policy
+  policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
+  milo_policy_has_member roles/secretmanager.secretAccessor "$2" <<< "$policy" || return 0
+  gcloud secrets remove-iam-policy-binding "$1" --project "$3" --member "$2" \
+    --role roles/secretmanager.secretAccessor > /dev/null || return 1
+  policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
+  ! milo_policy_has_member roles/secretmanager.secretAccessor "$2" <<< "$policy"
+}
 
 # Stage 2 (website execution), API service.
 #

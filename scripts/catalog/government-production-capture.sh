@@ -64,6 +64,14 @@ Modes (exactly one; default --plan):
                 queue and batches. Requires --run-id, the three --work-scope-*
                 values and --enable-work-scope-preparation. Starts no batch.
   --all         ensure-job, prepare, capture, verify — in order.
+  --ensure-normalisation-job
+                PR-D3: create or update the SEPARATE manufacturer-normalisation
+                job (CLOUD_RUN_NORMALISATION_JOB, default <capture job>-normalisation):
+                the capture job's image, entrypoint and pinned-off environment,
+                the RuntimePolicy caps handed over in MILO_NORMALISATION_POLICY_VARS,
+                and -- on this job only -- the provider key and the shared quota
+                store. It runs as the WORKER identity (the one allowed to read
+                the key); the capture job and the capture identity never hold it.
 
 Options:
   --enable-catalog-execution
@@ -109,6 +117,7 @@ while [[ $# -gt 0 ]]; do
     --capture) MODE="capture"; shift ;;
     --prepare-work-scope) MODE="prepare-work-scope"; shift ;;
     --all) MODE="all"; shift ;;
+    --ensure-normalisation-job) MODE="ensure-normalisation-job"; shift ;;
     --enable-catalog-execution) CATALOG_EXECUTION_VALUE="true"; shift ;;
     --enable-work-scope-preparation) WORK_SCOPE_PREPARATION_VALUE="true"; shift ;;
     --run-id) RUN_ID="${2:?}"; shift 2 ;;
@@ -137,6 +146,7 @@ CAPTURE_JOB="$(milo_op CLOUD_RUN_CAPTURE_JOB)"
 PROJECT_REF="$(milo_op SUPABASE_PROJECT_REF)"
 CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
 [[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
 RELEASE_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD)"
 WORKER_IMAGE="${REGION}-docker.pkg.dev/${PROJECT_ID}/$(milo_op ARTIFACT_REGISTRY_REPOSITORY)/${MILO_WORKER_IMAGE_REPO}:${RELEASE_SHA}"
 
@@ -263,6 +273,43 @@ ensure_job() {
   grant_api_run_with_overrides
 }
 
+# PR-D3: the manufacturer-normalisation job. The capture job's definition,
+# plus the caps and -- here only -- the provider key and the quota store, run
+# as the worker identity: the capture identity must never reach a provider
+# credential (production-preflight: iam:capture-cannot-read-provider-key).
+ensure_normalisation_job() {
+  require_worker_image
+  local worker_sa provider redis_url redis_token verb="create"
+  worker_sa="$(milo_op WORKER_SERVICE_ACCOUNT)"
+  provider="$(milo_op SECRET_PROVIDER_API_KEY)"
+  redis_url="$(milo_op SECRET_REDIS_URL)"
+  redis_token="$(milo_op SECRET_REDIS_TOKEN)"
+  if [[ -z "$worker_sa" || -z "$provider" || -z "$redis_url" || -z "$redis_token" ]]; then
+    fail "--ensure-normalisation-job needs WORKER_SERVICE_ACCOUNT, SECRET_PROVIDER_API_KEY, SECRET_REDIS_URL and SECRET_REDIS_TOKEN" 2
+  fi
+  if [[ -z "${MILO_NORMALISATION_POLICY_VARS:-}" ]]; then
+    fail "--ensure-normalisation-job needs the RuntimePolicy caps (MILO_NORMALISATION_POLICY_VARS): the ONE model call runs only under them" 2
+  fi
+  if gcloud run jobs describe "$NORMALISATION_JOB" --region "$REGION" --project "$PROJECT_ID" \
+       > /dev/null 2>&1; then
+    verb="update"
+  fi
+  printf 'Normalisation job: %s (%s)\n' "$NORMALISATION_JOB" "$verb"
+  gcloud run jobs "$verb" "$NORMALISATION_JOB" \
+    --image "$WORKER_IMAGE" \
+    --region "$REGION" \
+    --project "$PROJECT_ID" \
+    --service-account "$worker_sa" \
+    --command python \
+    --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}" \
+    --set-env-vars "$(build_env_args)${MILO_ENV_VAR_DELIMITER}${MILO_NORMALISATION_POLICY_VARS}" \
+    --set-secrets "$(build_secret_args),KIMI_API_KEY=${provider}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_URL=${redis_url}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_TOKEN=${redis_token}:${MILO_SECRET_VERSION}" \
+    --max-retries 0 \
+    --task-timeout "$TASK_TIMEOUT" \
+    --tasks 1
+  grant_api_run_with_overrides "$NORMALISATION_JOB"
+}
+
 # E': the API's Prepare route executes THIS job (the same invocation this
 # script's --prepare-work-scope uses, backend/capture_invocation.py). Its
 # identity gets exactly one right, on exactly this job: run it with overrides.
@@ -270,15 +317,15 @@ ensure_job() {
 # no-op. Skipped (said, not silent) when the configuration names no API
 # identity; the website then cannot prepare, which fails closed.
 grant_api_run_with_overrides() {
-  local api_sa
+  local api_sa job="${1:-$CAPTURE_JOB}"
   api_sa="$(milo_op API_SERVICE_ACCOUNT)"
   if [[ -z "$api_sa" ]]; then
-    printf 'NOTE: no API_SERVICE_ACCOUNT configured; the website cannot execute %s.\n' "$CAPTURE_JOB"
+    printf 'NOTE: no API_SERVICE_ACCOUNT configured; the website cannot execute %s.\n' "$job"
     return 0
   fi
-  gcloud run jobs add-iam-policy-binding "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+  gcloud run jobs add-iam-policy-binding "$job" --region "$REGION" --project "$PROJECT_ID" \
     --member "serviceAccount:${api_sa}" --role roles/run.jobsExecutorWithOverrides > /dev/null
-  printf 'API identity may run %s with overrides: %s\n' "$CAPTURE_JOB" "$api_sa"
+  printf 'API identity may run %s with overrides: %s\n' "$job" "$api_sa"
 }
 
 # A Cloud Run execution name: lowercase letters, digits and hyphens, starting
@@ -737,6 +784,7 @@ case "$MODE" in
     printf 'To execute:\n  %s --all --enable-catalog-execution\n' "$0"
     ;;
   ensure-job) ensure_job ;;
+  ensure-normalisation-job) ensure_normalisation_job ;;
   prepare) do_prepare ;;
   capture) do_capture; verify_snapshot "$CAPTURED_SNAPSHOT_KEY" ;;
   prepare-work-scope) do_prepare_work_scope ;;

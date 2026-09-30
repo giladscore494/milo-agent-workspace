@@ -1112,6 +1112,14 @@ class NormalisationGroup(BaseModel):
     proposal_id: str | None = Field(default=None, pattern=r"^[0-9a-f-]{36}$")
 
 
+class NormalisationRejection(BaseModel):
+    """The owner's rejection of ONE pending group."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group: NormalisationGroup
+
+
 class NormalisationApproval(BaseModel):
     """The owner's approval: several high-confidence groups, or one group."""
 

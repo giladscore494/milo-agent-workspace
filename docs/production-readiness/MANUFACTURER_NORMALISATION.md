@@ -11,8 +11,9 @@ plan** keeps using the exact tozar; the Mapping Plan contract is unchanged.
 | Piece | Where |
 |---|---|
 | Rules, output contract, the one call, view helpers | `backend/catalog/register/normalization.py` |
-| API: view, request, approval | `backend/catalog/register/service.py`, `backend/main.py` |
-| Capture job mode | `backend/catalog/operator_capture.py` (`--normalisation-proposal-id`), `backend/capture_invocation.py` |
+| API: view, request, approval, rejection | `backend/catalog/register/service.py`, `backend/main.py` |
+| Normalisation job mode | `backend/catalog/operator_capture.py` (`--normalisation-proposal-id`), `backend/capture_invocation.py` |
+| The job: create / remove, posture | `scripts/catalog/government-production-capture.sh --ensure-normalisation-job`, `scripts/deploy/website-execution-activate.sh`, `scripts/deploy/deployment-contract.sh` (`milo_normalisation_*`) |
 | Tables and RPCs | `supabase/migrations/20261003000100_catalog_manufacturer_normalization.sql` |
 | UI | `frontend/components/register/NormalisationSection.tsx`, `frontend/lib/normalisation.ts` |
 
@@ -56,11 +57,13 @@ The server validates the answer, in Python and again in the database (`catalog_n
 
 Anything else is recorded as a refused proposal with that code. A budget refusal is recorded as `NORMALIZATION_BUDGET_REFUSED`, any other failure as `NORMALIZATION_MODEL_FAILED`.
 
-**Where it runs.** The call runs in the **existing capture job**, under an operator capture run. That run is the lease and the budget anchor that the gateway's caps need. It is never a product run: no Commander, no run creation, no Arm.
+**Where it runs.** The call runs in its **own small job**, the normalisation job (`CLOUD_RUN_NORMALISATION_JOB`, default `<capture job>-normalisation`): the capture job's definition, run as the **worker identity**, and the only job that binds the provider key and the quota store. The capture job and the capture identity never hold the key (`iam:capture-cannot-read-provider-key` stays PASS). The call runs under an operator capture run, which is the lease and the budget anchor the gateway's caps need. It is never a product run: no Commander, no run creation, no Arm.
 
-**Cost.** The call goes through the same `ModelGateway`, `BudgetTracker` and provider authority a worker uses, bounded by the reviewed envelope:
-- $3.00 per run
-- the $10 daily user budget and the $10 daily project budget, reserved through `reserve_model_call_budget`
+**Cost.** The call goes through the same `ModelGateway`, `BudgetTracker` and provider authority a worker uses, bounded by **the deployment's RuntimePolicy caps** (`resolve_runtime_policy(paid=True)`: the worker's applied caps, copied onto the job; a missing cap refuses the call, `NORMALIZATION_POLICY_REFUSED`):
+- the per-run cap
+- the daily user and daily project budgets, checked in Python from the ledger before the call and reserved through `reserve_model_call_budget`
+
+**Names are data.** The prompt tells the model to treat every tozar, plant and model name as a string to group and to ignore any instruction inside one.
 
 **Kill switch (decision 33).** The budget's kill switch is the per-execution switch `MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB`, which only the API's invocation sets. It is not `MILO_ENABLE_PAID_EXECUTION`, so the call is allowed while paid runs are off.
 
@@ -79,6 +82,7 @@ A model group that the active mapping already holds is no longer pending.
   - a model entry must be a group of a `proposed` proposal
   - a rule entry must name a code-owned rule
   - every name must be a tozar of the latest directory
+- **Reject:** any pending group can be rejected (owner only, the same exact-match rule, `CATALOG_NORMALIZATION_REJECTION_INVALID` otherwise). A rejection is an append-only record; the group is no longer pending.
 - **Versioning:** an approval creates the next version, which is the whole active mapping. It is a compare-and-set on the active version number: `CATALOG_NORMALIZATION_VERSION_STALE` otherwise.
 
 ## The flag
@@ -86,12 +90,12 @@ A model group that the active mapping already holds is no longer pending.
 | Flag | Where | Scope |
 |---|---|---|
 | `MILO_ENABLE_MANUFACTURER_NORMALISATION` | API | Stage A pinned off. The button. The view and approvals ride the Register page's flag, `MILO_ENABLE_REGISTER_CAPTURE`. |
-| `MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB` | Capture job, per execution | Pinned off on the job. |
+| `MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB` | Normalisation job, per execution | Pinned off on the job. |
 
-While the stage is on, the capture job carries the provider key (`KIMI_API_KEY`) and the shared quota store (`UPSTASH_REDIS_REST_*`) as secret bindings. The capture identity has `roles/secretmanager.secretAccessor` on exactly those three secrets. That grant is a standing one: the capture identity falls back to the worker's, which needs the key. The job's bindings go away in three ways:
-- every capture-job ensure (`--set-secrets`) re-creates the job without them
-- a Stage A deploy
-- the kill switch, which removes `KIMI_API_KEY` from the capture job and reads it back
+The normalisation job exists exactly while the stage is on: it carries the provider key (`KIMI_API_KEY`) and the shared quota store (`UPSTASH_REDIS_REST_*`) as secret references, read by the worker identity. `production-preflight.sh` (`cloud-run:normalisation-job`) and `production-verify.sh` (`NORMALISATION_JOB`, part of `CODE_DEPLOYED`) report it: present with the flag on PASS, absent with the flag off PASS, anything else BLOCKED. It is deleted, and its absence read back, by:
+- `website-execution-activate.sh --remove-manufacturer-normalisation` (the API flag off first)
+- every Stage A deploy (`deploy.sh` step 6)
+- the kill switch (step 6), which also revokes any accessor the capture identity holds on the provider key or the quota store, and reads that back
 
 ## Operator steps
 
@@ -99,10 +103,13 @@ While the stage is on, the capture job carries the provider key (`KIMI_API_KEY`)
 2. **Turn it on:** Actions -> **Website stage** -> `stage = manufacturer-normalisation`, or `bash scripts/ops/website-stage.sh --stage manufacturer-normalisation`. It runs three steps:
    - it ensures the capture job
    - it re-applies the Register page (register-capture)
-   - it binds the key and the store on the capture job and sets the API flag, reading back that run creation and paid execution are OFF
+   - it creates the normalisation job as the worker identity with the worker's caps, the key and the store (read back), proves the capture job binds no key and the capture identity reads none, binds the API identity's read on the job, and sets the API flag, reading back that run creation and paid execution are OFF
+
+   The worker identity must already read the provider key and the quota store (as for Stage 2).
 
    It is never part of `all`: it binds a paid provider key, so it is always its own decision.
-3. **After a deploy:** dispatch **Deploy** with `restore_website_stage = manufacturer-normalisation`, or re-run step 2.
+3. **After a deploy:** a Stage A deploy deletes the job; dispatch **Deploy** with `restore_website_stage = manufacturer-normalisation`, or re-run step 2.
+5. **Turn it off:** `bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation` (or the kill switch).
 4. **Use it:** open **Register**, press **Normalise manufacturers**, reload after the job ends, and approve.
 
 A read-only role created after the migration gets no reads. Grant them the same way as PR-D1's roles:

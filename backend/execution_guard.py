@@ -66,7 +66,7 @@ SURFACE_RULES: tuple[tuple[str, str, re.Pattern[str], str], ...] = (
     ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/(captures|directory)/?$"), "register capture"),
     # PR-D3: the ONE guarded model call executes the capture job (its own flag);
     # an approval writes the normalisation (the Register page's flag).
-    ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/normalisation(/approvals)?/?$"), "manufacturer normalisation"),
+    ("POST", "MILO_ENABLE_REGISTER_CAPTURE", re.compile(rf"^/projects/{_SEGMENT}/register/normalisation(/approvals|/rejections)?/?$"), "manufacturer normalisation"),
     ("POST", "MILO_ENABLE_MANUFACTURER_NORMALISATION", re.compile(rf"^/projects/{_SEGMENT}/register/normalisation/?$"), "manufacturer normalisation"),
 )
 

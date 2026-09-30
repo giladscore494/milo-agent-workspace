@@ -28,7 +28,18 @@ from backend.catalog.register import service as register_service
 from backend.engines.swarm_v2 import model_gateway
 from backend.testing.memory_repository import MemoryRepository
 from tests.test_register_capture import (LEXUS, TOYOTA, USER, FakeTrigger, api_env, as_user,  # noqa: F401
-                                         claimed_lease, client, directory, no_sockets, world)
+                                         claimed_lease, directory, no_sockets, world)
+from tests.test_register_capture import client as register_client
+
+
+def client(repo, trigger):
+    """The Register page's client; the normalisation routes execute their own job."""
+    from backend.dependencies import get_normalisation_trigger
+    from backend.main import app
+
+    api = register_client(repo, FakeTrigger())
+    app.dependency_overrides[get_normalisation_trigger] = lambda: trigger
+    return api
 
 HONDA, HONDA_SPACED, HONDA_JP = "הונדה", "הונדה ", "הונדה יפן"
 MERCEDES, MERCEDES_DASH = "מרצדס בנץ", "מרצדס-בנץ"
@@ -194,8 +205,16 @@ def test_no_call_without_the_executions_own_switch_or_for_another_run():
     args = entrypoint.build_parser().parse_args(
         ["--execute", *ci.manufacturer_normalisation(project_ref="abc", run_id=lease.run_id,
                                                      proposal_id=proposal_id).entrypoint_args[1:]])
-    assert entrypoint._refusal(args, [], {}) in ("CAPTURE_NORMALISATION_DISABLED", "CAPTURE_PROJECT_REF_MISMATCH",
-                                                "CAPTURE_PROJECT_NOT_CONFIGURED")
+    from tests.test_catalog_operator_capture import capture_env
+
+    ready = capture_env()
+    args = entrypoint.build_parser().parse_args(
+        ["--execute", *ci.manufacturer_normalisation(project_ref=entrypoint.configured_project_ref(ready),
+                                                     run_id=lease.run_id, proposal_id=proposal_id).entrypoint_args[1:]])
+    assert entrypoint._refusal(args, [], ready) == "CAPTURE_NORMALISATION_DISABLED"
+    assert entrypoint._refusal(args, [], {**ready, norm.JOB_SWITCH: "true"}) == ""
+    assert entrypoint._refusal(args, [], {**ready, norm.JOB_SWITCH: "true",
+                                          "MILO_ENABLE_PAID_EXECUTION": "true"}) != ""
 
 
 # -- 4. the owner's approval, and the canonical names on the pages -----------------------
@@ -249,6 +268,38 @@ def test_high_confidence_groups_together_and_any_other_alone():
     assert units[TOYOTA]["canonical_manufacturer"] == "Toyota" and units[HONDA]["canonical_manufacturer"] is None
 
 
+def test_the_owner_rejects_a_pending_group_and_it_is_no_longer_pending():
+    repo, w, lease, proposal_id = world_with_proposal()
+    proposed(repo, lease, proposal_id, [
+        {"canonical": "Toyota", "members": [TOYOTA], "confidence": "high", "reason": "x"},
+        {"canonical": "Lexus", "members": [LEXUS], "confidence": "low", "reason": "y"}])
+    api = client(repo, FakeTrigger())
+    url = f"/projects/{w['project']}/register/normalisation"
+    pending = {g["canonical"]: g for g in api.get(url, headers=as_user()).json()["pending"]}
+
+    def reject(group: dict):
+        body = {"group": {k: group[k] for k in ("canonical", "members", "rule_id", "proposal_id") if group.get(k)}}
+        return api.post(f"{url}/rejections", headers=as_user(), json=body)
+
+    # Only a pending group, exactly as proposed.
+    refused = reject(dict(pending["Toyota"], canonical="Toyota Motor"))
+    assert refused.status_code == 422 and refused.json()["error"]["code"] == "CATALOG_NORMALIZATION_REJECTION_INVALID"
+    assert reject(pending["Toyota"]).json() == {"rejected": True}
+    after = {g["canonical"] for g in api.get(url, headers=as_user()).json()["pending"]}
+    assert "Toyota" not in after and "Lexus" in after
+    # A rejected group is not approved either, and nothing was mapped.
+    body = {"expected_version": 0, "groups": [{"canonical": "Toyota", "members": [TOYOTA], "proposal_id": proposal_id}]}
+    assert api.post(f"{url}/approvals", headers=as_user(), json=body).status_code == 422
+    assert repo.manufacturer_normalization_current()["version"] == 0
+    # A single HIGH-confidence group may be approved alone too.
+    assert api.post(f"{url}/approvals", headers=as_user(), json={"expected_version": 0, "groups": [
+        {"canonical": "Lexus", "members": [LEXUS], "proposal_id": proposal_id}]}).json()["version"] == 1
+    # Only an owner rejects.
+    repo._norm_state()["roles"][(w["project"], str(USER))] = "member"
+    denied = reject(pending["Lexus"])
+    assert denied.status_code == 403 and denied.json()["error"]["code"] == "CATALOG_NORMALIZATION_OWNER_ONLY"
+
+
 def test_only_an_owner_approves_and_the_button_needs_its_flag(monkeypatch):
     repo, w, lease, proposal_id = world_with_proposal()
     proposed(repo, lease, proposal_id, [{"canonical": "Toyota", "members": [TOYOTA], "confidence": "high",
@@ -292,3 +343,84 @@ def test_the_browser_shows_the_canonical_name_and_filters_keep_the_tozar(monkeyp
     assert models["total"] > 0
     assert api.get(f"/projects/{w['project']}/catalog/browser/models", params={"tozar": "Toyota"},
                    headers=as_user()).json()["total"] == 0
+
+
+# -- 3b. the real guarded gateway: the deployment's policy, the daily budget ------------
+
+class RecordedCompletions:
+    """The provider's chat completions, recorded: ONE valid answer each call."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        from tests.test_swarm_v2_smoke_offline import kimi_response
+
+        self.calls.append(kwargs)
+        return kimi_response(json.dumps({"groups": [VALID["groups"][0]]}))
+
+
+@pytest.fixture
+def recorded_provider(monkeypatch):
+    """guarded_gateway's own wiring, with the provider client replaced by a
+    recorded one (no socket): the SAME tracker, reservations and settlement."""
+    from backend import budget as budget_module
+    from tests.test_swarm_v2_smoke_offline import fake_kimi_client
+
+    completions = RecordedCompletions()
+    original = budget_module.build_guarded_client_factory
+    monkeypatch.setattr(budget_module, "build_guarded_client_factory", lambda tracker, **kw: original(
+        tracker, inner_factory=lambda *_a: fake_kimi_client(completions), **kw))
+    monkeypatch.setenv("KIMI_API_KEY", "offline-recorded-key")
+    return completions
+
+
+def deployment_policy(**overrides: str) -> dict[str, str]:
+    from backend.runtime_policy import reviewed_first_run_policy
+
+    return {**reviewed_first_run_policy().env_expectations(), norm.JOB_SWITCH: "true", **overrides}
+
+
+def test_the_guarded_gateway_reserves_and_settles_under_the_deployments_policy(recorded_provider):
+    repo, _w, lease, proposal_id = world_with_proposal()
+    outcome = norm.propose(repo, lease, proposal_id, env=deployment_policy())
+    assert outcome == {"status": "proposed", "reason_code": None, "groups": 1}
+    (call,) = recorded_provider.calls
+    assert call["model"] == "kimi-k3" and "tools" not in call
+    # The daily reservation was made and settled, and the usage recorded, under the run's lease.
+    rows = [r for r in repo.usage_ledger if r.get("run_id") == str(lease.run_id)]
+    assert [(r["call_seq"], r["status"]) for r in rows if r.get("status")] == [(1, "reserved"), (1, "settled")]
+    assert repo.get_run_usage_ledger(lease.run_id)["ledger"]["model_calls"] == 1
+
+
+def test_the_daily_pre_check_refuses_before_the_provider(recorded_provider, monkeypatch):
+    repo, _w, lease, proposal_id = world_with_proposal()
+    monkeypatch.setattr(repo, "sum_daily_ledger_cost", lambda **_kw: 1_000.0)
+    outcome = norm.propose(repo, lease, proposal_id, env=deployment_policy())
+    assert outcome == {"status": "refused", "reason_code": "NORMALIZATION_BUDGET_REFUSED", "groups": 0}
+    assert recorded_provider.calls == []
+
+
+def test_a_deployment_without_its_caps_refuses_the_call(recorded_provider):
+    repo, _w, lease, proposal_id = world_with_proposal()
+    outcome = norm.propose(repo, lease, proposal_id, env={norm.JOB_SWITCH: "true"})
+    assert outcome == {"status": "refused", "reason_code": "NORMALIZATION_POLICY_REFUSED", "groups": 0}
+    assert recorded_provider.calls == []
+
+
+def test_the_button_executes_the_normalisation_job_never_the_capture_job():
+    """The provider key lives on the normalisation job only: its routes are wired to a
+    trigger for CLOUD_RUN_NORMALISATION_JOB, and without one the API normalises nothing."""
+    from backend.catalog.scope.prepare_trigger import build_capture_trigger
+    from backend.dependencies import get_normalisation_trigger
+    from backend.main import get_normalisation, request_normalisation
+
+    settings = SimpleNamespace(gcp_project_id="p", gcp_region="r", cloud_run_worker_job="worker",
+                               cloud_run_capture_job="capture", cloud_run_normalisation_job="capture-normalisation")
+    trigger = build_capture_trigger(settings, {"MILO_RELEASE_SHA": "a" * 40},
+                                    job_setting="cloud_run_normalisation_job")
+    assert (trigger.capture_job, trigger.worker_job) == ("capture-normalisation", "worker")
+    assert build_capture_trigger(SimpleNamespace(**{**vars(settings), "cloud_run_normalisation_job": ""}), {},
+                                 job_setting="cloud_run_normalisation_job") is None
+    for route in (get_normalisation, request_normalisation):
+        assert route.__defaults__[-1].dependency is get_normalisation_trigger

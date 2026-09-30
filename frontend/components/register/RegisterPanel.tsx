@@ -26,6 +26,7 @@ const normalisationClient: NormalisationClient = {
   read: (projectId) => api.normalisation(projectId),
   request: (projectId, conversationId) => api.requestNormalisation(projectId, conversationId),
   approve: (projectId, version, groups) => api.approveNormalisation(projectId, version, groups),
+  reject: (projectId, group) => api.rejectNormalisation(projectId, group),
 };
 
 /** The three calls the page makes; injectable so tests need no network. */

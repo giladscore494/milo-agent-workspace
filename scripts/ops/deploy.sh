@@ -12,8 +12,9 @@
 #      (website-execution-check.sh, read-only)
 #   5. 0 live runs (the RUNS_QUIESCENT statement, read-only)
 #   6. Stage 2 reset -- unless permanent operating mode: the worker's provider
-#      key binding is removed (RUNBOOK A.6) and the deploy is FORCED, so API and
-#      worker come back at Stage A
+#      key binding is removed (RUNBOOK A.6), the manufacturer normalisation job
+#      (PR-D3, the only other holder of that key) is deleted and read back
+#      absent, and the deploy is FORCED, so API and worker come back at Stage A
 #   7. production-activate.sh --all (preflight, database gate, deploy,
 #      deployed gate); in permanent mode with --preserve-stage
 #   8. model env: the reviewed worker model names, set and read back
@@ -85,6 +86,7 @@ if [[ "$RESTORE_STAGE" == "manufacturer-normalisation" ]]; then
   milo_require_op SECRET_REDIS_URL SECRET_REDIS_TOKEN || exit 2
 fi
 CONFIG_ARG=(--operator-config "$CONFIG_PATH")
+NORMALISATION_JOB="$(milo_normalisation_job_name)"
 summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT}; restore website stage: ${RESTORE_STAGE})"
 
 # 1. The checkout is the release: every tool builds and tags `git rev-parse HEAD`.
@@ -186,7 +188,9 @@ elif [[ "$DRY_RUN" -eq 1 ]]; then
   for name in "${MILO_PROVIDER_KEY_ENV_NAMES[@]}"; do
     ops_run gcloud run jobs update "$WORKER_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets "$name"
   done
-  summary "6 stage2-reset" DRY-RUN "would remove any provider key from the worker and force a Stage A deploy"
+  [[ -z "$NORMALISATION_JOB" ]] \
+    || ops_run gcloud run jobs delete "$NORMALISATION_JOB" --region "$REGION" --project "$PROJECT_ID" --quiet
+  summary "6 stage2-reset" DRY-RUN "would remove any provider key from the worker, delete the normalisation job and force a Stage A deploy"
 else
   facts="$(ops_worker_json | ops_container_facts)" || ops_fail "the worker job could not be read" "6 stage2-reset"
   removed=()
@@ -199,7 +203,9 @@ else
       removed+=("$name")
     fi
   done
-  summary "6 stage2-reset" PASS "provider key binding(s) removed: ${removed[*]:-none}; the deploy returns both surfaces to Stage A"
+  milo_remove_job "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID" \
+    || ops_fail "the normalisation job ${NORMALISATION_JOB} is still there, or could not be listed" "6 stage2-reset"
+  summary "6 stage2-reset" PASS "provider key binding(s) removed: ${removed[*]:-none}; normalisation job ${NORMALISATION_JOB:-<none>} absent (read back); the deploy returns both surfaces to Stage A"
 fi
 
 # 7. The deploy itself, through the one orchestrator.

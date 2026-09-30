@@ -233,6 +233,20 @@ if args[:1] == ["run"] and args[2] == "update":
                 name, _, val = pair.partition("=")
                 env[name] = val
     json.dump(state, open(path, "w")); sys.exit(0)
+if args[:3] == ["run", "jobs", "list"] and args[3:7] == ["--region", "test-region", "--project", "test-project"] \
+        and len(args) == 9 and args[7].startswith("--filter=metadata.name=") \
+        and args[8] == "--format=value(metadata.name)":
+    if os.environ.get("OPS_TEST_JOBS_LIST_EXIT"):
+        sys.exit(int(os.environ["OPS_TEST_JOBS_LIST_EXIT"]))
+    name = args[7].split("=", 2)[2]
+    if name in state["jobs"]:
+        print(name)
+    sys.exit(0)
+if args[:3] == ["run", "jobs", "delete"] and args[4:] == ["--region", "test-region", "--project", "test-project",
+                                                          "--quiet"]:
+    if not os.environ.get("OPS_TEST_DELETE_IGNORED"):
+        state["jobs"].pop(args[3])
+    json.dump(state, open(path, "w")); sys.exit(0)
 sys.stderr.write("unmocked gcloud " + " ".join(args) + "\n"); sys.exit(2)
 '''
 
@@ -522,3 +536,57 @@ def test_setup_wif_covers_the_capture_job_identity_with_or_without_its_own_accou
     assert '[[ -n "$CAPTURE_SA" ]] && ACT_AS+=("$CAPTURE_SA")' in wif
     assert '"roles/run.admin"' in wif and '"roles/artifactregistry.reader"' in wif
 
+
+
+# =============================================================================
+# PR-D3: the Stage A reset deletes the normalisation job and reads it back
+# =============================================================================
+
+NORMALISATION_JOB = "test-capture-normalisation"
+
+
+def with_normalisation_job(tmp_path: Path) -> Path:
+    state = tmp_path / "gcloud.json"
+    state.write_text(json.dumps({"jobs": {"test-worker": {"MILO_CAPTURE_REPLAY": "false"},
+                                          NORMALISATION_JOB: {"MILO_ENABLE_PAID_EXECUTION": "false"}},
+                                 "services": {"test-api": {}}}))
+    return state
+
+
+def test_the_stage_a_reset_deletes_the_normalisation_job_and_reads_it_back(tmp_path, checks_api):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    state = with_normalisation_job(tmp_path)
+    result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none", extra_env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert NORMALISATION_JOB not in json.loads(state.read_text())["jobs"]
+    calls = tree.tool_calls()
+    listing = (f"gcloud run jobs list --region test-region --project test-project "
+               f"--filter=metadata.name={NORMALISATION_JOB} --format=value(metadata.name)")
+    delete = f"gcloud run jobs delete {NORMALISATION_JOB} --region test-region --project test-project --quiet"
+    assert calls.count(listing) == 2 and calls.index(listing) < calls.index(delete)
+    assert calls.index(delete) < calls.index(next(c for c in calls if c.startswith("stub production-activate.sh")))
+    assert f"normalisation job {NORMALISATION_JOB} absent (read back)" in result.stdout
+    # Absent already: read once, nothing deleted.
+    again = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none", extra_env=env)
+    assert again.returncode == 0 and tree.tool_calls().count(delete) == 1
+
+
+def test_a_normalisation_job_that_survives_the_reset_stops_the_deploy(tmp_path, checks_api):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    with_normalisation_job(tmp_path)
+    for extra in ({"OPS_TEST_DELETE_IGNORED": "1"}, {"OPS_TEST_JOBS_LIST_EXIT": "1"}):
+        result = tree.run("deploy.sh", "--sha", tree.sha, "--restore-website-stage", "none",
+                          extra_env={**env, **extra})
+        assert result.returncode == 1, result.stdout
+        assert "SUMMARY|6 stage2-reset|FAIL|the normalisation job test-capture-normalisation is still there" \
+            in result.stdout
+    assert not any(c.startswith("stub production-activate.sh") for c in tree.tool_calls())
+
+
+def test_permanent_mode_keeps_the_normalisation_job(tmp_path, checks_api):
+    tree, env = deploy_tree(tmp_path, checks_api)
+    state = with_normalisation_job(tmp_path)
+    result = tree.run("deploy.sh", "--sha", tree.sha, "--permanent-mode", "true", extra_env=env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert NORMALISATION_JOB in json.loads(state.read_text())["jobs"]
+    assert not any("jobs delete" in c or "jobs list" in c for c in tree.tool_calls())
