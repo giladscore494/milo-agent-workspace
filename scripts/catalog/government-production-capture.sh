@@ -348,7 +348,7 @@ grant_api_run_without_overrides() {
 # no-op. Skipped (said, not silent) when the configuration names no API
 # identity; the website then cannot prepare, which fails closed.
 grant_api_run_with_overrides() {
-  local api_sa job="${1:-$CAPTURE_JOB}"
+  local api_sa job="$CAPTURE_JOB"
   api_sa="$(milo_op API_SERVICE_ACCOUNT)"
   if [[ -z "$api_sa" ]]; then
     printf 'NOTE: no API_SERVICE_ACCOUNT configured; the website cannot execute %s.\n' "$job"
