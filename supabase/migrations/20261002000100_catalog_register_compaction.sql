@@ -237,8 +237,9 @@ begin
       using errcode = '22023';
   end if;
   if p_apply then
-    -- A prune, a build and another compaction wait (and are waited for).
-    lock table public.catalog_source_snapshots, public.catalog_raw_records, public.catalog_variant_builds,
+    -- A prune, a build and another compaction wait (and are waited for). Raw records first: a
+    -- raw-record writer inserts there before it updates its snapshot, so this order cannot deadlock it.
+    lock table public.catalog_raw_records, public.catalog_source_snapshots, public.catalog_variant_builds,
                public.catalog_variants, public.catalog_register_snapshot_compactions in share row exclusive mode;
   end if;
   select * into v_snapshot from public.catalog_source_snapshots

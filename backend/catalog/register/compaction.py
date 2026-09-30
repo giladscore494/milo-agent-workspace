@@ -210,8 +210,9 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None, archive_c
             return EXIT_OK
         # A Prepare snapshot has no archive yet: written from its stored rows first.
         archived = snapshot is not None and repo.register_snapshot_archive(str(snapshot["id"])) is not None
-        if snapshot is not None and not archived and args.apply:
-            archive_from_database(repo, snapshot, client)
+        if snapshot is not None and not archived and args.apply \
+                and compact(repo, key, apply=False).get("code") == "CATALOG_COMPACTION_ARCHIVE_MISSING":
+            archive_from_database(repo, snapshot, client)  # only once every other precondition holds
         answer = compact(repo, key, apply=bool(args.apply))
     except CompactionError as failure:
         print(f"FAILED {failure.code}: {key}")
