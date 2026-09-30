@@ -17,6 +17,8 @@ monkeypatched value always wins over this default.
 
 import pytest
 
+from backend.catalog.government import source as government_source
+
 _GATEWAY_AUTH_MODULES = {"tests.test_gateway_auth", "tests.test_corrective_blockers"}
 
 #: The one release the offline test runtime claims to be serving. A full
@@ -31,3 +33,14 @@ def explicit_insecure_dev_identity_for_legacy_unit_tests(monkeypatch, request):
         return
     monkeypatch.setenv("MILO_ALLOW_INSECURE_DEV_IDENTITY", "true")
     monkeypatch.setenv("ENVIRONMENT", "test")
+
+
+@pytest.fixture(autouse=True)
+def unpaced_government_client_by_default(monkeypatch):
+    """P51: every DataGovClient paces its sends (`MIN_REQUEST_INTERVAL_SECONDS`,
+    1 s in production) on the real clock. Offline, a fixture transport answers
+    at once, so the default pace is 0 here; the pacing tests construct their
+    clients with an explicit interval and a fake clock, and pin the production
+    constant from the source itself."""
+    monkeypatch.setattr(government_source, "MIN_REQUEST_INTERVAL_SECONDS", 0.0)
+    monkeypatch.delenv(government_source.MIN_REQUEST_INTERVAL_ENV, raising=False)

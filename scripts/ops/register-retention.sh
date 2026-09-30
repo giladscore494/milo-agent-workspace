@@ -157,21 +157,16 @@ while :; do
 done
 
 # The prune's own lines (PRUNED / REFUSED / FAILED ...), read back from the
-# execution's log: snapshot keys, counts and static codes only.
-outcome=""
-for _attempt in 1 2 3 4 5 6; do
-  outcome="$(gcloud logging read \
-    "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
-    --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null \
-    | grep -E '^(PRUNED|REFUSED|FAILED) ' | head -n 1 || true)"
-  [[ -n "$outcome" ]] && break
-  sleep "$poll_seconds"
-done
-printf '%s\n' "${outcome:-<no outcome line in the execution log>}"
+# execution's log: snapshot keys, counts and static codes only. Repeated for up
+# to MILO_RETENTION_LOG_WAIT_SECONDS (Cloud Logging lags the execution, P49);
+# no outcome line is a FAIL.
+log_wait="${MILO_RETENTION_LOG_WAIT_SECONDS:-120}" log_poll="${MILO_RETENTION_LOG_POLL_SECONDS:-5}"
+outcome="$(ops_execution_outcome "$execution" '^(PRUNED|REFUSED|FAILED) ' "$log_wait" "$log_poll" || true)"
+printf '%s\n' "${outcome:-<no outcome line in the execution log after ${log_wait}s>}"
 if [[ "$state" == "succeeded" && "$outcome" == PRUNED\ * ]]; then
   summary "register-retention apply" PASS "${outcome#PRUNED }"
   summary_note "Pruned exactly the list digest ${DIGEST}. Archive objects were not touched."
   exit 0
 fi
-summary "register-retention apply" FAIL "execution ${execution} ${state}: ${outcome:-no outcome line}"
+summary "register-retention apply" FAIL "execution ${execution} ${state}: ${outcome:-no outcome line in its log after ${log_wait}s}"
 exit 1

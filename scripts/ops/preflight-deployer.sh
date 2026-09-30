@@ -11,7 +11,8 @@
 #   * the read-only calls themselves (projects describe, services list,
 #     service-accounts / repositories / secrets / Cloud Run describes, the
 #     release images' exact-tag lookups, IAM policy reads, executions list,
-#     the Cloud Build source bucket list, builds list, logging read), each
+#     the Cloud Build source bucket list, builds list, logging read, the
+#     project IAM policy and the miloProjectIamPolicyReader role), each
 #     classified on failure as a DISABLED API, a MISSING PERMISSION (named
 #     when gcloud names it) or a MISSING RESOURCE;
 #   * testIamPermissions probes -- read-only by definition -- for what no
@@ -21,8 +22,9 @@
 #     a failed build's log, artifactregistry.tags.list to read its image's
 #     exact tag -- never Container Analysis), iam.serviceAccounts.actAs on the
 #     build identity and each runtime identity, uploads to the build source
-#     bucket, and that the deployer can NOT act as the Compute Engine default
-#     service account.
+#     bucket, the deploy preflight's project IAM reads
+#     (resourcemanager.projects.getIamPolicy, iam.roles.get: P48), and that
+#     the deployer can NOT act as the Compute Engine default service account.
 #
 # It never builds, deploys, binds, enables or changes anything, and reads no
 # secret value (secrets are described, never accessed). The access token the
@@ -361,6 +363,14 @@ check "build-logs-read" required \
   gcloud logging read "resource.type=build" --project "$PROJECT_ID" --order=desc --limit 1 --freshness 1d \
   --format='value(textPayload)'
 
+# The deploy preflight's project IAM check (production-preflight.sh,
+# iam:no-project-level-secret-access) reads the project policy and describes
+# the custom roles in it: the deployer holds both through the custom role
+# miloProjectIamPolicyReader (setup-wif.sh 3a), which is read here too.
+check "project-iam-policy" required gcloud projects get-iam-policy "$PROJECT_ID" --format=json
+check "custom-role:miloProjectIamPolicyReader" required \
+  gcloud iam roles describe miloProjectIamPolicyReader --project "$PROJECT_ID" --format='value(name)'
+
 # --- testIamPermissions: what no read-only call can prove ---------------------
 if [[ "$DRY_RUN" -eq 0 ]]; then
   TOKEN="$(gcloud auth print-access-token 2> /dev/null || true)"
@@ -373,6 +383,10 @@ probe "permissions:project" \
 probe "permissions:build-wait" \
   "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
   cloudbuild.builds.create cloudbuild.builds.get logging.logEntries.list artifactregistry.tags.list
+# P48: the two permissions of miloProjectIamPolicyReader, probed on the project.
+probe "permissions:project-iam-read" \
+  "https://cloudresourcemanager.googleapis.com/v1/projects/${PROJECT_ID}:testIamPermissions" POST held \
+  resourcemanager.projects.getIamPolicy iam.roles.get
 probe "act-as:${BUILD_SA%@*} (build identity)" \
   "https://iam.googleapis.com/v1/projects/-/serviceAccounts/${BUILD_SA}:testIamPermissions" POST held \
   iam.serviceAccounts.actAs

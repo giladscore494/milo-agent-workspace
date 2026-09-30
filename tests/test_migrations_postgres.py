@@ -3856,7 +3856,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20261001000100_catalog_variant_retention.sql",
         "20261002000100_catalog_register_compaction.sql",
         "20261002000200_catalog_register_compaction_decisions.sql",
-        "20261003000100_catalog_manufacturer_normalization.sql"]
+        "20261003000100_catalog_manufacturer_normalization.sql",
+        "20261004000100_catalog_maintenance_rpc_timeouts.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -8862,7 +8863,7 @@ SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100
 PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
                               "20260928000100", "20260929000100", "20260930000100",
                               "20260930000200", "20261001000100", "20261002000100",
-                              "20261002000200", "20261003000100")
+                              "20261002000200", "20261003000100", "20261004000100")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -9006,7 +9007,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 52
+        assert len(applied) == 41 and len(MIGRATIONS) == 53
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -9040,8 +9041,8 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/52" in state.stdout, state.stdout
-    assert "11 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/53" in state.stdout, state.stdout
+    assert "12 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
@@ -9062,7 +9063,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (52/52" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (53/53" in state.stdout, state.stdout
 
 
 

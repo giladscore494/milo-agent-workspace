@@ -52,8 +52,11 @@ inconsistent, over-limit or malformed capture is never returned as material.
 What may be retried, and what may not
 -------------------------------------
 
-`_request` retries a NETWORK failure, an HTTP 429 and a transient 5xx, a fixed
-number of times with fixed backoff, and nothing else. That is structural rather
+`_request` retries a NETWORK failure and a transient 5xx a fixed number of
+times with fixed backoff; data.gov.il's firewall answer -- HTTP 403 with an
+HTML body, or HTTP 429 -- on its own longer fixed schedule; and nothing else.
+Every send of one client, retries included, is PACED: at least
+`MIN_REQUEST_INTERVAL_SECONDS` after the previous one started (P51). That is structural rather
 than a matter of discipline: `_request` returns only after the status, the host,
 the media type, the size and the CKAN `success` envelope have passed, and every
 schema, identity, pagination and validation rule is applied by its CALLER,
@@ -65,6 +68,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -90,6 +94,10 @@ VERSION_FIELDS: tuple[tuple[str, str], ...] = (
 
 #: The domain-separated prefix of the field-schema fingerprint, and its version.
 SCHEMA_FINGERPRINT_PREFIX = "gov.schema.1"
+
+logger = logging.getLogger(__name__)
+#: A media type as it may be logged: a bounded token, nothing else of the header.
+_MEDIA_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,63}/[a-z0-9][a-z0-9!#$&^_.+-]{0,63}$")
 
 
 def _utc_now() -> str:
@@ -213,7 +221,10 @@ class DataGovClient:
                  read_timeout: float = src.READ_TIMEOUT_SECONDS,
                  max_attempts: int = src.MAX_ATTEMPTS_PER_REQUEST,
                  backoff_seconds: Sequence[float] = src.RETRY_BACKOFF_SECONDS,
+                 throttle_backoff_seconds: Sequence[float] = src.THROTTLE_BACKOFF_SECONDS,
+                 min_request_interval: float | None = None,
                  sleep_fn: Callable[[float], None] = time.sleep,
+                 monotonic_fn: Callable[[], float] = time.monotonic,
                  cancellation_checker: Callable[[], bool] | None = None,
                  clock: Callable[[], str] = _utc_now) -> None:
         if not 1 <= int(page_limit) <= src.MAX_PAGE_LIMIT:
@@ -230,6 +241,14 @@ class DataGovClient:
         self.read_timeout = float(read_timeout)
         self.max_attempts = int(max_attempts)
         self._backoff = tuple(float(value) for value in backoff_seconds)
+        self._throttle_backoff = tuple(float(value) for value in throttle_backoff_seconds)
+        #: P51: the least time between the starts of two sends of this client.
+        self.min_request_interval = (src.configured_min_request_interval() if min_request_interval is None
+                                     else max(0.0, float(min_request_interval)))
+        self._monotonic = monotonic_fn
+        self._last_send: float | None = None
+        #: Seconds this client itself waited (retry backoff) since its last send.
+        self._waited_since_send = 0.0
         self._sleep = sleep_fn
         self._cancellation_checker = cancellation_checker
         self._clock = clock
@@ -518,7 +537,8 @@ class DataGovClient:
 
     # --- one request ---------------------------------------------------------
 
-    def _request(self, action: str, params: Mapping[str, str]
+    def _request(self, action: str, params: Mapping[str, str], *,
+                 before_retry: Callable[[float], None] | None = None
                  ) -> tuple[Mapping[str, Any], HttpResponse, str]:
         """One allowlisted request, with the ONLY retry in this package.
 
@@ -527,12 +547,23 @@ class DataGovClient:
         envelope have all passed. Everything a caller checks afterwards --
         identity, echo, schema, pagination, bounds -- is therefore outside this
         loop and structurally unretryable.
+
+        Two fixed, finite schedules: a network failure or a transient 5xx is
+        sent at most `max_attempts` times (`backoff_seconds`); the firewall's
+        answer (403 with an HTML body, or 429) is sent again once per entry of
+        `throttle_backoff_seconds`. Every send is paced (`_pace`).
+        `before_retry(seconds)`, when given, is called before every retry's
+        wait: a caller with its own request or time cap (the register
+        directory) charges the retry there, and may refuse it by raising.
         """
         url = src.action_url(action)
         requested_url = src.canonical_request_url(action, params)
         failure: GovernmentSourceError | None = None
-        for attempt in range(1, self.max_attempts + 1):
+        attempt = transient = throttled = 0
+        while True:
+            attempt += 1
             self._check_cancelled()
+            self._pace()
             try:
                 response = self._transport.get(
                     url, params=dict(params), connect_timeout=self.connect_timeout,
@@ -541,22 +572,50 @@ class DataGovClient:
                 failure = GovernmentSourceError("GOV_TRANSPORT_FAILED", retryable=True)
             else:
                 try:
-                    document = self._validated_envelope(response)
+                    document = self._validated_envelope(response, action=action, attempt=attempt)
                 except GovernmentSourceError as refusal:
                     failure = refusal
                 else:
                     self.attempts.append((action, attempt, None))
                     return document, response, requested_url
             self.attempts.append((action, attempt, failure.reason_code))
-            if not failure.retryable or attempt >= self.max_attempts:
+            if not failure.retryable:
                 raise failure
-            # Finite, fixed backoff. The last configured value repeats if the
-            # attempt budget ever exceeds the backoff table.
-            self._sleep(self._backoff[min(attempt, len(self._backoff)) - 1]
-                        if self._backoff else 0.0)
-        raise failure if failure is not None else GovernmentSourceError("GOV_TRANSPORT_FAILED")
+            if failure.http_status in (403, 429):
+                # Only a retryable 403 gets here: the firewall's HTML answer.
+                if throttled >= len(self._throttle_backoff):
+                    raise failure
+                wait = self._throttle_backoff[throttled]
+                throttled += 1
+            else:
+                transient += 1
+                if transient >= self.max_attempts:
+                    raise failure
+                # Finite, fixed backoff. The last configured value repeats if
+                # the attempt budget ever exceeds the backoff table.
+                wait = self._backoff[min(transient, len(self._backoff)) - 1] if self._backoff else 0.0
+            if before_retry is not None:
+                before_retry(wait)
+            logger.warning("GOV_REQUEST_RETRY_WAIT http_status=%s attempt=%d wait_seconds=%g",
+                           failure.http_status if failure.http_status is not None else "none", attempt, wait)
+            self._sleep(wait)
+            self._waited_since_send += wait
 
-    def _validated_envelope(self, response: HttpResponse) -> Mapping[str, Any]:
+    def _pace(self) -> None:
+        """P51: wait until `min_request_interval` has passed since the previous
+        send of this client started -- every send, a retry's included, so no
+        reader can put a burst on data.gov.il's firewall. A retry's own backoff
+        counts as time passed (it is never paced twice)."""
+        now = self._monotonic()
+        if self._last_send is not None:
+            remaining = self._last_send + self.min_request_interval - now - self._waited_since_send
+            if remaining > 0:
+                self._sleep(remaining)
+                now = self._monotonic()
+        self._last_send, self._waited_since_send = now, 0.0
+
+    def _validated_envelope(self, response: HttpResponse, *, action: str = "",
+                            attempt: int = 0) -> Mapping[str, Any]:
         """Everything that must hold before a body is worth parsing."""
         if response.truncated or len(response.body) > self.max_response_bytes:
             raise GovernmentSourceError("GOV_RESPONSE_TOO_LARGE")
@@ -565,10 +624,16 @@ class DataGovClient:
             # from anywhere else is refused rather than read.
             raise GovernmentSourceError("GOV_REDIRECTED_OFF_HOST")
         if int(response.status) != 200:
+            status = int(response.status)
+            media = str(response.content_type).split(";", 1)[0].strip().lower()
+            _log_unexpected_status(action, attempt, status, media, response.body)
+            # The firewall's block page (403, HTML) and 429 wait and retry; a
+            # 403 in any other form (CKAN's own JSON refusal) is final.
+            throttled = status == 429 or (status == 403 and media in src.WAF_BLOCK_MEDIA_TYPES)
             raise GovernmentSourceError(
                 "GOV_HTTP_STATUS_UNEXPECTED",
-                retryable=int(response.status) in src.RETRYABLE_STATUS_CODES,
-                http_status=int(response.status))
+                retryable=status in src.RETRYABLE_STATUS_CODES or throttled,
+                http_status=status)
         media_type = str(response.content_type).split(";", 1)[0].strip().lower()
         if media_type not in src.JSON_CONTENT_TYPES:
             raise GovernmentSourceError("GOV_RESPONSE_NOT_JSON")
@@ -587,6 +652,25 @@ class DataGovClient:
     def _check_cancelled(self) -> None:
         if self._cancellation_checker is not None and self._cancellation_checker():
             raise CancellationRequested("RUN_CANCELLED")
+
+
+def _log_unexpected_status(action: str, attempt: int, status: int, media_type: str, body: bytes) -> None:
+    """What a non-200 answer WAS, without what it said: the numeric status,
+    the media type (a bounded token, else "other"), and two booleans -- the
+    body reads as HTML / as JSON. Never the body, another header or the URL;
+    the action is one of the two allowlisted names."""
+    if not _MEDIA_TYPE.match(media_type):
+        media_type = "other" if media_type else "none"
+    head = bytes(body[:1024]).lstrip().lower()
+    body_html = head.startswith((b"<!doctype html", b"<html")) or b"<html" in head
+    try:
+        body_json = isinstance(json.loads(bytes(body).decode("utf-8")), (dict, list))
+    except (UnicodeDecodeError, ValueError):
+        body_json = False
+    logger.warning("GOV_HTTP_STATUS_UNEXPECTED action=%s attempt=%d http_status=%d content_type=%s "
+                   "body_html=%s body_json=%s",
+                   action if action in (src.PACKAGE_SHOW, src.DATASTORE_SEARCH) else "other",
+                   attempt, status, media_type, str(body_html).lower(), str(body_json).lower())
 
 
 def _canonical_filters(filters: Mapping[str, Any]) -> str:

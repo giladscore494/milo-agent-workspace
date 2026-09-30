@@ -135,6 +135,39 @@ ops_require_zero_live_runs() {
   summary "$step" PASS "0 non-terminal runs"
 }
 
+# ops_execution_outcome EXECUTION PATTERN WAIT_SECONDS POLL_SECONDS — the
+# capture job execution's own outcome line (the newest line of its Cloud
+# Logging entries matching the extended regex PATTERN), on stdout.
+#
+# Cloud Logging makes an entry readable some time AFTER the execution reports
+# Completed, so a single read right after completion can find nothing. This
+# reads again every POLL_SECONDS until the line appears or WAIT_SECONDS have
+# been waited (a bounded wait; POLL_SECONDS 0 counts as 1 so it always ends).
+# Returns 1 with nothing on stdout when no outcome line appeared: the caller
+# FAILS its step on that, never passes. A read that itself failed is reported
+# on stderr by its gcloud exit status only (the entries are not printed).
+ops_execution_outcome() {
+  local execution="$1" pattern="$2" wait="$3" poll="$4" waited=0 entries status line
+  while :; do
+    status=0
+    entries="$(gcloud logging read \
+      "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
+      --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null)" || status=$?
+    if [[ "$status" -eq 0 ]]; then
+      line="$(grep -E "$pattern" <<< "$entries" | head -n 1 || true)"
+      if [[ -n "$line" ]]; then
+        printf '%s\n' "$line"
+        return 0
+      fi
+    else
+      printf 'gcloud logging read exited %s (after %ss)\n' "$status" "$waited" >&2
+    fi
+    (( waited < wait )) || return 1
+    sleep "$poll"
+    waited=$(( waited + (poll > 0 ? poll : 1) ))
+  done
+}
+
 # ops_worker_env_json — the worker job's container env as JSON (names, plain
 # values and secret REFERENCES; a secret value is never in a describe).
 ops_worker_json() {

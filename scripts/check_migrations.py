@@ -298,6 +298,15 @@ REQUIRED_PER_FILE["20261003000100_catalog_manufacturer_normalization.sql"] = [
     "enable row level security",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20261004000100_catalog_maintenance_rpc_timeouts.sql"] = [
+    # PR-OPS1 (P50): the whole-snapshot RPCs carry their own statement timeout
+    # (PostgREST hoists it before the call), the two table-locking ones a 5 s
+    # lock timeout; nothing role- or database-wide changes.
+    "alter function public.compact_register_snapshot(text, boolean, text, uuid)\n  set statement_timeout = '300s';",
+    "alter function public.compact_register_snapshot(text, boolean, text, uuid)\n  set lock_timeout = '5s';",
+    "alter function public.prune_register_snapshots(text[], text)\n  set lock_timeout = '5s';",
+    "alter function public.prepare_work_scope_queue(uuid, text, integer, text, jsonb)\n  set statement_timeout = '300s';",
+]
 REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
     # P27: the queue build leaves PR-U's placeholder records out (never
     # eligible, never queued), records each with its reason and counts them.

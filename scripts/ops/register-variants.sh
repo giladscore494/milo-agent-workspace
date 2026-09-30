@@ -107,20 +107,21 @@ while :; do
 done
 
 # The build's (or the compaction's) own line, read back from the execution's
-# log: the snapshot key, counts and static codes only.
-outcome=""
-for _attempt in 1 2 3 4 5 6; do
-  outcome="$(gcloud logging read \
-    "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
-    --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null \
-    | grep -E "$OUTCOME_PATTERN" | head -n 1 || true)"
-  [[ -n "$outcome" ]] && break
-  sleep "$poll_seconds"
-done
-printf '%s\n' "${outcome:-<no outcome line in the execution log>}"
+# log: the snapshot key, counts and static codes only. Cloud Logging makes it
+# readable some time after the execution completes, so the read is repeated
+# for up to MILO_VARIANTS_LOG_WAIT_SECONDS (P49). No outcome line is a FAIL,
+# whatever the execution's state.
+log_wait="${MILO_VARIANTS_LOG_WAIT_SECONDS:-120}" log_poll="${MILO_VARIANTS_LOG_POLL_SECONDS:-5}"
+outcome="$(ops_execution_outcome "$execution" "$OUTCOME_PATTERN" "$log_wait" "$log_poll" || true)"
+if [[ -z "$outcome" ]]; then
+  printf '<no outcome line in the execution log after %ss>\n' "$log_wait"
+  summary "register-variants" FAIL "execution ${execution} ${state}: no outcome line in its log after ${log_wait}s (Cloud Logging: resource.type=cloud_run_job, execution ${execution})"
+  exit 1
+fi
+printf '%s\n' "$outcome"
 if [[ "$state" == "succeeded" && "$outcome" =~ $PASS_PATTERN ]]; then
   summary "register-variants" PASS "${outcome#BUILT }"
   exit 0
 fi
-summary "register-variants" FAIL "execution ${execution} ${state}: ${outcome:-no outcome line}"
+summary "register-variants" FAIL "execution ${execution} ${state}: ${outcome}"
 exit 1

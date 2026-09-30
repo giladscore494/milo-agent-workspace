@@ -416,7 +416,7 @@ args = sys.argv[1:]
 path = os.environ["OPS_TEST_WIF_STATE"]
 state = {"apis": [], "pools": [], "providers": {}, "accounts": [], "project_bindings": [],
          "sa_bindings": {}, "buckets": [], "bucket_bindings": [], "repositories": ["test-repo"],
-         "repo_bindings": []}
+         "repo_bindings": [], "roles": {}}
 state.update(json.loads(os.environ.get("OPS_TEST_WIF_INITIAL") or "{}"))
 if os.path.exists(path):
     state = json.load(open(path))
@@ -509,6 +509,20 @@ if args[:3] == ["artifacts", "repositories", "get-iam-policy"]:
     policy(state["repo_bindings"])
 if args[:3] == ["artifacts", "repositories", "add-iam-policy-binding"]:
     state["repo_bindings"].append([flag("--role"), flag("--member")]); save(); sys.exit(0)
+# Custom project roles: {role id: {"includedPermissions": [...], "deleted": bool}}.
+if args[:3] == ["iam", "roles", "describe"]:
+    role = state.setdefault("roles", {}).get(args[3])
+    if role is None:
+        sys.stderr.write("ERROR: (gcloud.iam.roles.describe) NOT_FOUND: The role does not exist.\n"); sys.exit(1)
+    print(json.dumps({"name": "projects/" + flag("--project") + "/roles/" + args[3], **role})); sys.exit(0)
+if args[:3] == ["iam", "roles", "create"]:
+    state.setdefault("roles", {})[args[3]] = {"includedPermissions": flag("--permissions").split(","),
+                                              "stage": flag("--stage")}
+    save(); sys.exit(0)
+if args[:3] == ["iam", "roles", "update"]:
+    state["roles"][args[3]]["includedPermissions"] = flag("--permissions").split(","); save(); sys.exit(0)
+if args[:3] == ["iam", "roles", "undelete"]:
+    state["roles"][args[3]].pop("deleted", None); save(); sys.exit(0)
 sys.stderr.write("unmocked gcloud " + joined + "\n"); sys.exit(2)
 '''
 
@@ -519,6 +533,9 @@ DEPLOYER = "serviceAccount:milo-github-deployer@test-project.iam.gserviceaccount
 BUILD_SA = "milo-cloudbuild@test-project.iam.gserviceaccount.com"
 COMPUTE_SA = "123456789-compute@developer.gserviceaccount.com"
 CHANGE_LINE = re.compile(r"^(CREATE|UPDATE|BIND|UNBIND) ", re.M)
+#: P48: the deploy preflight's project IAM reads, in one custom role.
+IAM_READER_ROLE = "projects/test-project/roles/miloProjectIamPolicyReader"
+IAM_READER_PERMISSIONS = ["iam.roles.get", "resourcemanager.projects.getIamPolicy"]
 
 
 def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
@@ -560,7 +577,7 @@ def test_setup_wif_plans_applies_once_and_is_idempotent(tmp_path):
                               "roles/artifactregistry.reader", "roles/secretmanager.viewer",
                               "roles/iam.serviceAccountViewer",
                               "roles/serviceusage.serviceUsageConsumer", "roles/logging.viewer",
-                              "roles/storage.bucketViewer"}
+                              "roles/storage.bucketViewer", IAM_READER_ROLE}
     assert not {"roles/owner", "roles/editor", "roles/iam.serviceAccountUser"} & deployer_roles
     # The build identity: exactly three bindings, each on the narrowest resource.
     build = f"serviceAccount:{BUILD_SA}"

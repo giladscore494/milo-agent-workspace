@@ -28,13 +28,16 @@ the script prints every command and calls nothing.
   services list, service-account / repository / secret / Cloud Run
   describes, the release images' exact-tag lookup (`gcloud artifacts docker
   tags list`, the call the deploy makes after each build), the IAM policy reads, executions list, the Cloud Build source
-  bucket list, builds list, logging read);
+  bucket list, builds list, logging read, the project IAM policy and the
+  `miloProjectIamPolicyReader` custom role);
 - probes, with `testIamPermissions` (read-only), what no read-only call can
   prove: `cloudbuild.builds.create` and the other project permissions the
   deploy uses, the async build path's own (`cloudbuild.builds.get` to poll,
   `logging.logEntries.list` to read a failed build's log,
   `artifactregistry.tags.list` to read the built image's exact tag), `iam.serviceAccounts.actAs` on the build identity and on each
-  runtime identity, uploads to `gs://<project>_cloudbuild`, and that the
+  runtime identity, uploads to `gs://<project>_cloudbuild`,
+  `resourcemanager.projects.getIamPolicy` and `iam.roles.get` on the
+  project (the deploy preflight's project IAM check), and that the
   deployer can **not** act as the Compute Engine default service account;
 - reports **every** disabled API, missing permission and missing resource at
   once, then exits 1 if there is any (fix: `setup-wif.sh --plan`, `--apply`).
@@ -154,6 +157,7 @@ only then writes the provider condition), with these roles and nothing else:
 | `roles/serviceusage.serviceUsageConsumer` | project | builds submit / services list |
 | `roles/logging.viewer` | project | build log streaming, capture execution documents |
 | `roles/storage.bucketViewer` | project | `gcloud builds submit` proves the default source bucket belongs to the project (`storage.buckets.list`) |
+| `projects/<project>/roles/miloProjectIamPolicyReader` (custom: exactly `resourcemanager.projects.getIamPolicy`, `iam.roles.get`) | project | the deploy preflight's `iam:no-project-level-secret-access` reads the project IAM policy and describes the custom roles in it (P48). `setup-wif.sh` creates or updates it to exactly those two permissions, binds it and reads both back; never a predefined role that carries them |
 | `roles/storage.admin` | the `gs://<project>_cloudbuild` bucket only | Cloud Build source upload |
 | `roles/iam.serviceAccountUser` | the API, worker, capture **and build** service accounts only | deploying AS those identities; starting builds AS the build identity |
 | `roles/iam.workloadIdentityUser` | the deploy SA, for the `production` and `production-kill-switch` environment principalSets only (never repository-wide, never `production-backup`) | the keyless login |

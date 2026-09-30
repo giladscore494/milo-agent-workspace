@@ -246,7 +246,8 @@ class DirectoryClient:
     def scans(self) -> list[dict[str, str]]:
         return [c for c in self.calls if "filters" not in c and c.get("distinct") != "true"]
 
-    def _request(self, action: str, params: Mapping[str, str]):
+    def _request(self, action: str, params: Mapping[str, str], *, before_retry: Any = None):
+        # `before_retry`: the directory's cap hook (P51); this fake never retries.
         assert action == src.DATASTORE_SEARCH
         if self.drop_threshold:
             params = {k: v for k, v in params.items() if k != "total_estimation_threshold"}
@@ -283,10 +284,10 @@ class DirectoryClient:
 def test_the_directory_is_metadata_only_bounded_and_exact():
     # A padded value and one carrying a right-to-left mark are values no scoped
     # capture can filter on (CaptureScope refuses them): counted, never units.
-    fake = DirectoryClient({TOYOTA: 28, LEXUS: 5000, "טויוטה ": 3, "מאזדה\u200f": 2, None: 7})
+    fake = DirectoryClient({TOYOTA: 28, LEXUS: 50_000, "טויוטה ": 3, "מאזדה\u200f": 2, None: 7})
     found = discover_directory(fake, clock=lambda: 0.0)
-    assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28), (LEXUS, 5000)]
-    assert found.unfilterable_values == 3 and found.total_rows == 5028
+    assert [(u.tozar, u.expected_rows) for u in found.units] == [(TOYOTA, 28), (LEXUS, 50_000)]
+    assert found.unfilterable_values == 3 and found.total_rows == 50_028
     assert found.distinct_total == 5
     # One distinct cross-check (limit=0), a tozar-only scan in _id order, then
     # one count per tozar -- limit=0, never a row, never another field.
@@ -295,8 +296,8 @@ def test_the_directory_is_metadata_only_bounded_and_exact():
                         "distinct": "true", "limit": "0"}
     scans, counts = rest[:6], rest[6:]
     assert [(c["fields"], c["sort"], c["limit"], c["offset"], c["total_estimation_threshold"])
-            for c in scans] == [("tozar", "_id", "1000", str(offset), "10000000")
-                                for offset in range(0, 6000, 1000)]
+            for c in scans] == [("tozar", "_id", "10000", str(offset), "10000000")
+                                for offset in range(0, 60_000, 10_000)]
     assert all("distinct" not in c and "filters" not in c for c in scans)
     assert all(set(call) == {"resource_id", "limit", "filters"} and call["limit"] == "0"
                for call in counts)
@@ -323,18 +324,44 @@ def test_the_directory_scans_past_a_truncating_distinct_read():
     assert {u.tozar: u.expected_rows for u in found.units} == counts
     assert len(found.units) == 137 and found.total_rows == 101_686
     assert found.distinct_total == 137 and found.unfilterable_values == 0
-    # 1 cross-check + 102 scan pages + 137 counts: inside the default cap.
-    assert len(fake.scans) == 102 and found.requests == 240 < 6000
+    # 1 cross-check + 11 scan pages of 10,000 rows + 137 counts: inside the default cap.
+    assert len(fake.scans) == 11 and found.requests == 149 < 6000
+    assert [c["offset"] for c in fake.scans] == [str(o) for o in range(0, 110_000, 10_000)]
     assert all(set(c) == {"resource_id", "fields", "sort", "limit", "offset",
                           "total_estimation_threshold"}
                and c["fields"] == "tozar" for c in fake.scans)
+
+
+def test_the_scan_pages_carry_10000_rows_and_the_last_one_the_rest():
+    """P51: the tozar-only scan has its OWN page limit (data.gov.il answered
+    10,000-record pages of ~260 KB with the exact total, 2026-09-30); capture
+    pages keep MAX_PAGE_LIMIT = 1000. At the register's 101,691 rows: 10 full
+    pages and a last one of 1,691."""
+    from backend.catalog.government import directory as directory_module
+
+    assert directory_module.SCAN_PAGE_LIMIT == 10_000 and src.MAX_PAGE_LIMIT == entrypoint.CAPTURE_PAGE_LIMIT == 1000
+    fake = DirectoryClient({TOYOTA: 101_691})
+    served: list[int] = []
+    answer = fake._request
+
+    def recording(action, params, **kwargs):
+        document = answer(action, params, **kwargs)
+        if params in fake.scans[-1:] and "offset" in params:
+            served.append(len(document[0]["result"]["records"]))
+        return document
+    fake._request = recording
+    found = discover_directory(fake, clock=lambda: 0.0)
+    assert found.units == (DirectoryUnit(TOYOTA, 101_691),)
+    assert [c["limit"] for c in fake.scans] == ["10000"] * 11
+    assert served == [10_000] * 10 + [1_691]
+    assert found.requests == 1 + 11 + 1
 
 
 def test_every_scan_page_asks_for_an_exact_total():
     # Production, 2026-09-30 (milo-catalog-capture-9t9v5): an unfiltered scan
     # answers total_was_estimated=true, so #175's scan was refused on page 1.
     assert SCAN_TOTAL_ESTIMATION_THRESHOLD == 10_000_000
-    counts = {TOYOTA: 1500, LEXUS: 700}
+    counts = {TOYOTA: 15_000, LEXUS: 7_000}
     as_before = DirectoryClient(counts, drop_threshold=True)
     with pytest.raises(GovernmentSourceError) as refused:
         discover_directory(as_before, clock=lambda: 0.0)
@@ -373,7 +400,7 @@ def test_an_unavailable_distinct_total_is_only_a_missing_cross_check():
 ])
 def test_an_inconsistent_scan_writes_no_directory_version(fault, reason, scan_pages, counts):
     repo = MemoryRepository()
-    fake = DirectoryClient({TOYOTA: 28, LEXUS: 3000}, **fault)
+    fake = DirectoryClient({TOYOTA: 28, LEXUS: 30_000}, **fault)  # 4 scan pages of 10,000
     with pytest.raises(GovernmentSourceError) as refused:
         refresh_directory(repo, client=fake, env={})
     assert refused.value.reason_code == reason
@@ -402,10 +429,12 @@ class StatusTransport:
                             final_url=src.canonical_request_url(str(url).rsplit("/", 1)[-1], params))
 
 
-@pytest.mark.parametrize(("status", "attempts"), [(403, 1), (404, 1), (503, 3)])
+@pytest.mark.parametrize(("status", "attempts"), [(403, 4), (429, 4), (404, 1), (503, 3)])
 def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
-    # The retry policy is unchanged: only 429/5xx are retried (3 attempts).
-    assert src.RETRYABLE_STATUS_CODES == frozenset({429, 500, 502, 503, 504})
+    # The retry policy: a transient 5xx 3 sends; P51, the firewall's answer
+    # (this transport's HTML 403, or a 429) 4 sends; every other 4xx one.
+    assert src.RETRYABLE_STATUS_CODES == frozenset({500, 502, 503, 504})
+    assert src.THROTTLE_BACKOFF_SECONDS == (60.0, 180.0, 300.0)
     transport = StatusTransport(status)
     client = DataGovClient(transport, sleep_fn=lambda _s: None)
     with pytest.raises(GovernmentSourceError) as refused:
@@ -424,7 +453,8 @@ def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
 
 
 @pytest.mark.parametrize(("statuses", "reported", "calls"), [
-    ((503, 404), 404, 2), ((503, 502, 429), 429, 3), ((429, 200), None, 2)])
+    # P51: the firewall's 403/429 has its own schedule (1 + 3 sends) beside the transient one (3 sends).
+    ((503, 404), 404, 2), ((503, 502, 503), 503, 3), ((503, 502, 429), 429, 6), ((429, 200), None, 2)])
 def test_a_retried_request_reports_the_status_of_its_last_attempt(statuses, reported, calls):
     transport = StatusTransport(*statuses)
     client = DataGovClient(transport, sleep_fn=lambda _s: None)
@@ -450,6 +480,9 @@ def test_the_capture_job_logs_the_status_of_a_failed_directory_refresh(capsys, m
     run_id = args[args.index("--run-id") + 1]
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    # P51: the firewall's 403 is retried 60 s, 180 s and 300 s apart; not waited out here.
+    monkeypatch.setattr(entrypoint, "DataGovClient",
+                        lambda *a, **k: DataGovClient(*a, sleep_fn=lambda _s: None, **k))
     env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
     status = entrypoint.main(authorized_argv(run_id, **{"--register-directory": True}), env=env)
     out, err = capsys.readouterr()
@@ -478,7 +511,7 @@ def test_a_unit_failed_by_an_unexpected_status_reports_its_number():
     assert "http_status" not in captured.units[0].as_document()
 
 
-@pytest.mark.parametrize(("rows", "pages"), [(0, 1), (1000, 1), (1001, 2), (2000, 2)])
+@pytest.mark.parametrize(("rows", "pages"), [(0, 1), (10_000, 1), (10_001, 2), (20_000, 2)])
 def test_the_scan_stops_exactly_at_the_total(rows, pages):
     fake = DirectoryClient({TOYOTA: rows} if rows else {})
     found = discover_directory(fake, clock=lambda: 0.0)
@@ -778,6 +811,9 @@ def test_the_capture_job_logs_the_statuses_of_a_group_s_failed_units(capsys, mon
     run_id = args[args.index("--run-id") + 1]
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    # P51: the firewall's 403 is retried 60 s, 180 s and 300 s apart; not waited out here.
+    monkeypatch.setattr(entrypoint, "DataGovClient",
+                        lambda *a, **k: DataGovClient(*a, sleep_fn=lambda _s: None, **k))
     monkeypatch.setattr(entrypoint, "_open_archive_writer", lambda env: FakeWriter())
     env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
     status = entrypoint.main(authorized_argv(run_id, **{"--register-group-id": answer["group_id"]}), env=env)

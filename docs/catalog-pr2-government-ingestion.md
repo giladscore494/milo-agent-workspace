@@ -68,7 +68,8 @@ none is reachable from run input.
 | Paging | the client chooses its own offsets at a fixed page size (`DEFAULT_PAGE_LIMIT = 100`, hard ceiling `MAX_PAGE_LIMIT = 1000`); a caller may supply only `q` and/or `filters` |
 | Bounds per capture | `MAX_PAGES_PER_CAPTURE = 200`, `MAX_RECORDS_PER_CAPTURE = 120 000`, `MAX_RESPONSE_BYTES = 8 MiB`, one row bounded by the durable `MAX_RAW_PAYLOAD_CHARS = 16 384` |
 | Timeouts | `CONNECT_TIMEOUT_SECONDS = 10.0`, `READ_TIMEOUT_SECONDS = 30.0` — finite and separate |
-| Retry | `MAX_ATTEMPTS_PER_REQUEST = 3` total, backoff `(1.0, 4.0)`, only for a network failure, HTTP 429 and 500/502/503/504 |
+| Retry | `MAX_ATTEMPTS_PER_REQUEST = 3` total, backoff `(1.0, 4.0)`, only for a network failure and HTTP 500/502/503/504. P51: data.gov.il's firewall answer -- HTTP 403 with an HTML body, or HTTP 429 -- on its own schedule `THROTTLE_BACKOFF_SECONDS = (60.0, 180.0, 300.0)` (at most 4 sends), each wait logged as one line (status, attempt, seconds); a JSON 403 and every other 4xx are final |
+| Pacing | P51: every send of a client (retries included) starts at least `MIN_REQUEST_INTERVAL_SECONDS = 1.0` after its previous one (<= 60 requests a minute; `MILO_DATA_GOV_MIN_REQUEST_INTERVAL_SECONDS` overrides it within [0.5, 30]). A full register directory (~150 requests: 11 scan pages of 10,000 rows, 137 counts) takes ~2.5 minutes; the directory charges every retry to its request and time caps |
 | Redirects | never followed; a response whose final URL is not on the approved scheme, host and `/api/3/action/` path is refused |
 | Credentials | none exist on this path — no token, no cookie, no `Authorization` header, and `trust_env` is off on the session |
 | Provider/model calls | none anywhere in the package (asserted by test over every module) |

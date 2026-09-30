@@ -34,8 +34,13 @@ Every request goes through `DataGovClient._request` -- the same allowlisted
 host, action, envelope, size, redirect and retry rules as a capture -- and the
 whole discovery runs under two HARD caps: a request count
 (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`) and a wall-clock time
-(`MILO_REGISTER_DIRECTORY_MAX_SECONDS`). Exceeding either refuses the whole
-directory; nothing partial is ever recorded.
+(`MILO_REGISTER_DIRECTORY_MAX_SECONDS`). Every RETRY the client makes counts
+as a request, and its wait must end inside the time cap before it is taken
+(P51: the firewall's 403 is retried after 60 s, 180 s and 300 s). The
+client paces every send (`MIN_REQUEST_INTERVAL_SECONDS`, 1 s): a full
+directory of ~150 requests takes ~2.5 minutes, inside the 3000 s cap.
+Exceeding either cap refuses the whole directory; nothing partial is ever
+recorded.
 
 A unit is always capturable: a value `CaptureScope` would refuse (padded,
 over-long, a control or format character) is counted with the unfilterable
@@ -68,16 +73,24 @@ from backend.catalog.government.source import GovernmentSourceError
 
 DIRECTORY_CONTRACT = "gov.register.directory.1"
 TOZAR_FIELD = "tozar"
-#: Rows per tozar-column scan page (the client's own page ceiling).
-SCAN_PAGE_LIMIT = src.MAX_PAGE_LIMIT
+#: Rows per tozar-column scan page. Its OWN limit, above the capture's
+#: `MAX_PAGE_LIMIT` (1000, pages that carry full row payloads): a scan row is
+#: only `_id` and `tozar` (anything more is refused below), so a page is tiny.
+#: data.gov.il, read-only from Cloud Shell, 2026-09-30 (fields=tozar, sort=_id,
+#: offset 0, total_estimation_threshold): limit 5000 -> 5000 records,
+#: 128,429 bytes; 10000 -> 10000 records, 260,451 bytes; 32000 -> 32000
+#: records, 787,359 bytes -- each with the exact total 101,691. 10,000 keeps a
+#: page ~30x under MAX_RESPONSE_BYTES (8 MiB) and takes the scan from 102
+#: pages to 11 (P51: fewer requests against the firewall's rate limit).
+SCAN_PAGE_LIMIT = 10_000
 #: Sent with every scan page: CKAN counts exactly whenever its estimated total
 #: is below this, and the register (~101,691 rows) is two orders under it.
 SCAN_TOTAL_ESTIMATION_THRESHOLD = 10_000_000
 MAX_REQUESTS_ENV = "MILO_REGISTER_DIRECTORY_MAX_REQUESTS"
 MAX_SECONDS_ENV = "MILO_REGISTER_DIRECTORY_MAX_SECONDS"
-#: A full directory is one distinct cross-check, one scan page per 1000 rows
-#: and one count per tozar: ~102 pages and ~137 counts at the register's
-#: current size, far inside the cap.
+#: A full directory is one distinct cross-check, one scan page per 10,000
+#: rows and one count per tozar: ~11 pages and ~137 counts (~150 requests) at
+#: the register's current size, far inside the cap.
 DEFAULT_MAX_REQUESTS = 6000
 DEFAULT_MAX_SECONDS = 3000.0
 #: The database bounds a directory at 5000 units and a tozar at 200 chars.
@@ -161,6 +174,15 @@ class _Budget:
             raise GovernmentSourceError("GOV_DIRECTORY_TIME_BUDGET_EXCEEDED")
         self.used += 1
 
+    def retry(self, wait: float) -> None:
+        """A retry the client is about to make after `wait` seconds: one more
+        request, and its wait must end inside the time cap."""
+        if self.used >= self.max_requests:
+            raise GovernmentSourceError("GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED")
+        if self.clock() + wait - self.started > self.max_seconds:
+            raise GovernmentSourceError("GOV_DIRECTORY_TIME_BUDGET_EXCEEDED")
+        self.used += 1
+
 
 def discover_directory(client: DataGovClient, *, resource_id: str = src.WLTP_RESOURCE_ID,
                        max_requests: int | None = None, max_seconds: float | None = None,
@@ -187,11 +209,12 @@ def discover_directory(client: DataGovClient, *, resource_id: str = src.WLTP_RES
 
 def _search(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -> Mapping[str, Any]:
     budget.spend()
-    return _answer(client, params)
+    return _answer(client, params, budget)
 
 
-def _answer(client: DataGovClient, params: Mapping[str, str]) -> Mapping[str, Any]:
-    document, _response, _url = client._request(src.DATASTORE_SEARCH, params)  # noqa: SLF001 - same package seam
+def _answer(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -> Mapping[str, Any]:
+    document, _response, _url = client._request(  # noqa: SLF001 - same package seam
+        src.DATASTORE_SEARCH, params, before_retry=budget.retry)
     result = document["result"]
     if str(result.get("resource_id")) != str(params["resource_id"]):
         raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
@@ -213,7 +236,7 @@ def _distinct_total(client: DataGovClient, resource_id: str, budget: _Budget) ->
     budget.spend()
     try:
         result = _answer(client, {"resource_id": resource_id, "fields": TOZAR_FIELD,
-                                  "distinct": "true", "limit": "0"})
+                                  "distinct": "true", "limit": "0"}, budget)
         return _exact_total(result)
     except GovernmentSourceError:
         return None
@@ -306,7 +329,9 @@ def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLT
     ``limit=0`` request (one request, no row payload). Register capture takes
     it at the END of a capture to verify the stored rows independently of the
     capture's own reported total."""
-    budget = _Budget(max_requests=1, max_seconds=DEFAULT_MAX_SECONDS, clock=clock)
+    # The one count, and the retries the client may make for it.
+    budget = _Budget(max_requests=src.MAX_ATTEMPTS_PER_REQUEST + len(src.THROTTLE_BACKOFF_SECONDS),
+                     max_seconds=DEFAULT_MAX_SECONDS, clock=clock)
     return _count(client, src.require_allowed_resource(resource_id), tozar, budget)
 
 

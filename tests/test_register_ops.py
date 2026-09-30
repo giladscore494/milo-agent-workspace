@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -562,6 +563,86 @@ def test_the_compaction_runs_the_capture_job_dry_run_first(tmp_path):
     calls = len(tree.tool_calls())
     assert tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", "now").returncode == 2
     assert len(tree.tool_calls()) == calls
+
+
+# P49: Cloud Logging makes the execution's outcome line readable some time
+# after the execution completes. The read-back repeats, bounded; no line is a FAIL.
+LAGGING_GCLOUD = RETENTION_GCLOUD.replace(
+    '"logging read"*) echo "PRUNED snapshots=1 raw_records=5 candidates=3 (archive objects untouched)" ;;',
+    '"logging read"*)\n'
+    '    reads=$(( $(cat "$OPS_TEST_LOG_READS" 2> /dev/null || echo 0) + 1 )); echo "$reads" > "$OPS_TEST_LOG_READS"\n'
+    '    [ -n "${OPS_TEST_LOG_FAIL:-}" ] && { echo "ERROR: (gcloud.logging.read) PERMISSION_DENIED" >&2; exit 1; }\n'
+    '    echo "Starting capture job"\n'
+    '    if [ "$reads" -ge "${OPS_TEST_LOG_READY_AT:-1}" ]; then echo "$OPS_TEST_OUTCOME"; fi\n'
+    '    ;;')
+
+
+def lagging(tmp_path: Path, script: str, *args: str, **env: str) -> tuple[subprocess.CompletedProcess, int, OpsTree]:
+    tree = OpsTree(tmp_path)
+    tree.tool("gcloud", LAGGING_GCLOUD)
+    tree.tool("psql", RETENTION_PSQL)
+    reads = tmp_path / "log-reads"
+    result = tree.run(script, *args, extra_env={"OPS_TEST_LOG_READS": str(reads), **env})
+    return result, int(reads.read_text()) if reads.exists() else 0, tree
+
+
+def test_the_outcome_line_is_read_again_until_cloud_logging_has_it(tmp_path):
+    line = "READY snapshot_key=cs1.a mode=active raw_rows=5279 kept_rows=5279"
+    result, reads, tree = lagging(tmp_path, "register-variants.sh", "--snapshot-key", SNAPSHOT_KEY,
+                                  "--compact", "dry-run", MILO_VARIANTS_POLL_SECONDS="0",
+                                  MILO_VARIANTS_LOG_POLL_SECONDS="0", MILO_VARIANTS_LOG_WAIT_SECONDS="10",
+                                  OPS_TEST_LOG_READY_AT="4", OPS_TEST_OUTCOME=line)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert reads == 4, "read again until the line was there, then stopped"
+    assert line in result.stdout.splitlines()
+    assert f"SUMMARY|register-variants|PASS|{line}" in result.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text())
+
+
+def test_no_outcome_line_within_the_bounded_wait_fails_the_step(tmp_path):
+    result, reads, _tree = lagging(tmp_path, "register-variants.sh", "--snapshot-key", SNAPSHOT_KEY,
+                                   "--compact", "dry-run", MILO_VARIANTS_POLL_SECONDS="0",
+                                   MILO_VARIANTS_LOG_POLL_SECONDS="0", MILO_VARIANTS_LOG_WAIT_SECONDS="3",
+                                   OPS_TEST_LOG_READY_AT="999", OPS_TEST_OUTCOME="READY snapshot_key=cs1.a")
+    assert result.returncode == 1, "the execution succeeded, but without its line the step is not a PASS"
+    assert reads == 4, "bounded: the first read, then one per second of the 3 s wait"
+    assert "<no outcome line in the execution log after 3s>" in result.stdout
+    assert "gcloud logging read exited" not in result.stderr, "each read succeeded; the line was never there"
+    assert re.search(r"^SUMMARY\|register-variants\|FAIL\|execution milo-catalog-capture-abc12 succeeded: "
+                     r"no outcome line in its log after 3s", result.stdout, re.M)
+    assert "|PASS|" not in result.stdout
+
+
+def test_a_failing_log_read_is_reported_and_fails_the_step(tmp_path):
+    result, reads, _tree = lagging(tmp_path, "register-variants.sh", "--snapshot-key", SNAPSHOT_KEY,
+                                   MILO_VARIANTS_POLL_SECONDS="0", MILO_VARIANTS_LOG_POLL_SECONDS="0",
+                                   MILO_VARIANTS_LOG_WAIT_SECONDS="2", OPS_TEST_LOG_FAIL="1",
+                                   OPS_TEST_OUTCOME="BUILT snapshot_key=cs1.a status=built rows=5/5")
+    assert result.returncode == 1 and reads == 3
+    assert "gcloud logging read exited 1 (after 0s)" in result.stderr
+    assert "PERMISSION_DENIED" not in result.stdout + result.stderr, "the gcloud error text is not echoed"
+    assert "SUMMARY|register-variants|FAIL|" in result.stdout
+
+
+def test_the_bounded_wait_defaults_to_two_minutes_every_five_seconds():
+    for script, prefix in (("register-variants.sh", "MILO_VARIANTS"), ("register-retention.sh", "MILO_RETENTION")):
+        text = (OPS / script).read_text()
+        assert f'log_wait="${{{prefix}_LOG_WAIT_SECONDS:-120}}" log_poll="${{{prefix}_LOG_POLL_SECONDS:-5}}"' in text
+        assert "ops_execution_outcome " in text and "for _attempt in" not in text, script
+
+
+def test_the_prune_reads_its_outcome_again_and_fails_without_one(tmp_path):
+    args = ("register-retention.sh", "--apply", "--confirm", "PRUNE", "--digest", DIGEST)
+    env = {"OPS_TEST_DIGEST": DIGEST, "MILO_RETENTION_POLL_SECONDS": "0", "MILO_RETENTION_LOG_POLL_SECONDS": "0",
+           "MILO_RETENTION_LOG_WAIT_SECONDS": "3", "OPS_TEST_OUTCOME": "PRUNED snapshots=1 raw_records=5"}
+    result, reads, _tree = lagging(tmp_path / "late", *args, OPS_TEST_LOG_READY_AT="3", **env)
+    assert result.returncode == 0 and reads == 3, result.stdout + result.stderr
+    assert "SUMMARY|register-retention apply|PASS|snapshots=1 raw_records=5" in result.stdout
+    result, reads, _tree = lagging(tmp_path / "never", *args, OPS_TEST_LOG_READY_AT="999", **env)
+    assert result.returncode == 1 and reads == 4
+    assert "no outcome line in its log after 3s" in result.stdout
+    assert "register-retention apply|PASS|" not in result.stdout
+    assert "gcloud logging read exited" not in result.stderr, "each read succeeded; the line was never there"
 
 
 def test_the_variant_backfill_refuses_a_malformed_key(tmp_path):

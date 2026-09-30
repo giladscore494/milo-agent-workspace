@@ -34,8 +34,8 @@ import yaml
 
 from tests.test_cloud_run_deploy_apply_mock import Deployment
 from tests.test_ops_workflows import (
-    CHANGE_LINE, COMPUTE_SA, DEPLOYER, OPERATOR_ENV, SENTINEL_FRAGMENTS, WIF_GCLOUD, OpsTree, steps,
-    triggers, workflow)
+    CHANGE_LINE, COMPUTE_SA, DEPLOYER, IAM_READER_PERMISSIONS, IAM_READER_ROLE, OPERATOR_ENV, SENTINEL_FRAGMENTS,
+    WIF_GCLOUD, OpsTree, steps, triggers, workflow)
 from tests.test_scoped_rollout_contract import OPERATOR_ENV as ROLLOUT_ENV
 from tests.test_scoped_rollout_contract import _orchestrator
 
@@ -300,6 +300,112 @@ def test_setup_wif_apply_changes_nothing_without_the_image_repository(tmp_path):
     assert not (tmp_path / "wif.json").exists(), "no mutation was made"
 
 
+# -- 3b. P48: the deploy preflight's project IAM reads, one custom role ----------
+
+#: Predefined roles that carry resourcemanager.projects.getIamPolicy or
+#: iam.roles.get, each with far more: never granted to the deployer.
+BROAD_IAM_READ_ROLES = {"roles/viewer", "roles/browser", "roles/editor", "roles/owner",
+                        "roles/iam.securityReviewer", "roles/iam.roleViewer", "roles/iam.securityAdmin",
+                        "roles/resourcemanager.projectIamAdmin", "roles/iam.organizationRoleViewer"}
+
+
+def test_setup_wif_plans_creates_binds_and_reads_back_the_iam_reader_role(tmp_path):
+    tree, env = wif_tree(tmp_path)
+    plan = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert plan.returncode == 0, plan.stdout + plan.stderr
+    assert (f"CREATE custom role {IAM_READER_ROLE} (exactly: iam.roles.get resourcemanager.projects.getIamPolicy)"
+            in plan.stdout)
+    assert (f"BIND   project role {IAM_READER_ROLE} -> milo-github-deployer@test-project.iam.gserviceaccount.com "
+            "(project IAM policy read only)") in plan.stdout
+    # The role exists before it is bound.
+    assert plan.stdout.index(f"CREATE custom role {IAM_READER_ROLE}") < \
+        plan.stdout.index(f"BIND   project role {IAM_READER_ROLE}")
+    assert not (tmp_path / "wif.json").exists(), "--plan changed nothing"
+
+    applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert (f"PASS   custom role {IAM_READER_ROLE} read back: exactly iam.roles.get "
+            "resourcemanager.projects.getIamPolicy, bound to milo-github-deployer") in applied.stdout
+    state = json.loads((tmp_path / "wif.json").read_text())
+    assert sorted(state["roles"]["miloProjectIamPolicyReader"]["includedPermissions"]) == IAM_READER_PERMISSIONS
+    assert [IAM_READER_ROLE, DEPLOYER] in state["project_bindings"]
+    (create,) = [call for call in tree.tool_calls() if call.startswith("gcloud iam roles create")]
+    assert "--permissions iam.roles.get,resourcemanager.projects.getIamPolicy" in create
+    assert "--project test-project" in create and "--stage GA" in create
+    deployer_roles = {role for role, member in state["project_bindings"] if member == DEPLOYER}
+    assert not deployer_roles & BROAD_IAM_READ_ROLES, "never a broader predefined role"
+
+    tree.calls.write_text("", encoding="utf-8")
+    again = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert "PLAN: 0 change(s)" in again.stdout
+    assert (f"OK     custom role {IAM_READER_ROLE} holds exactly iam.roles.get "
+            "resourcemanager.projects.getIamPolicy") in again.stdout
+    assert f"OK     project role {IAM_READER_ROLE}" in again.stdout
+
+
+@pytest.mark.parametrize("existing,changes", [
+    # The operator's hand-made role, as it is in production: nothing to do.
+    ({"includedPermissions": ["resourcemanager.projects.getIamPolicy", "iam.roles.get"]}, []),
+    # A permission too many, or one missing: updated to exactly the two.
+    ({"includedPermissions": ["iam.roles.get", "iam.roles.list", "resourcemanager.projects.getIamPolicy"]},
+     ["UPDATE"]),
+    ({"includedPermissions": ["resourcemanager.projects.getIamPolicy"]}, ["UPDATE"]),
+    # Deleted (it stays listed for 7 days): undeleted and set to exactly the two.
+    ({"includedPermissions": ["resourcemanager.projects.getIamPolicy", "iam.roles.get"], "deleted": True},
+     ["UPDATE", "UPDATE"]),
+])
+def test_setup_wif_updates_an_existing_iam_reader_role_in_place(tmp_path, existing, changes):
+    tree, env = wif_tree(tmp_path)
+    assert tree.run("setup-wif.sh", "--apply", extra_env=env).returncode == 0
+    state_path = tmp_path / "wif.json"
+    state = json.loads(state_path.read_text())
+    state["roles"]["miloProjectIamPolicyReader"] = existing
+    state_path.write_text(json.dumps(state))
+    plan = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert CHANGE_LINE.findall(plan.stdout) == changes, plan.stdout
+    tree.calls.write_text("", encoding="utf-8")
+    applied = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    after = json.loads(state_path.read_text())["roles"]["miloProjectIamPolicyReader"]
+    assert sorted(after["includedPermissions"]) == IAM_READER_PERMISSIONS and not after.get("deleted")
+    assert not [call for call in tree.tool_calls() if call.startswith("gcloud iam roles create")]
+    assert "PASS   custom role" in applied.stdout
+
+
+def test_setup_wif_fails_when_the_iam_reader_role_does_not_read_back(tmp_path):
+    tree, env = wif_tree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        '"includedPermissions": flag("--permissions").split(","),',
+        '"includedPermissions": flag("--permissions").split(",") + ["iam.roles.list"],'))
+    result = tree.run("setup-wif.sh", "--apply", extra_env=env)
+    assert result.returncode == 1
+    assert f"FAIL   custom role {IAM_READER_ROLE} read back" in result.stderr
+    assert "PASS   custom role" not in result.stdout
+
+
+def test_setup_wif_stops_when_the_iam_reader_role_cannot_be_read(tmp_path):
+    tree, env = wif_tree(tmp_path)
+    tree.tool("gcloud", WIF_GCLOUD.replace(
+        'if args[:3] == ["iam", "roles", "describe"]:',
+        'if args[:3] == ["iam", "roles", "describe"]:\n'
+        '    sys.stderr.write("ERROR: PERMISSION_DENIED: iam.roles.get\\n"); sys.exit(1)\n'
+        'if False:'))
+    result = tree.run("setup-wif.sh", "--plan", extra_env=env)
+    assert result.returncode == 1
+    assert f"FAIL   custom role {IAM_READER_ROLE} could not be read (gcloud exit 1)" in result.stderr
+    assert not [call for call in tree.tool_calls() if IAM_READER_ROLE in call and "add-iam-policy-binding" in call]
+
+
+def test_setup_wif_grants_the_iam_reads_through_the_custom_role_only():
+    text = (REPO / "scripts" / "ops" / "setup-wif.sh").read_text(encoding="utf-8")
+    assert re.search(r'^IAM_READER_PERMISSIONS=\("iam\.roles\.get" "resourcemanager\.projects\.getIamPolicy"\)$',
+                     text, re.M)
+    assert 'IAM_READER_ROLE="projects/${PROJECT_ID}/roles/${IAM_READER_ROLE_ID}"' in text
+    code = re.sub(r"#[^\n]*", "", text)
+    for role in BROAD_IAM_READ_ROLES:
+        assert f'"{role}"' not in code and f"{role} " not in code, role
+
+
 # =============================================================================
 # 4. preflight_as_deployer: every read-only call, every gap at once, no change
 # =============================================================================
@@ -371,7 +477,8 @@ print("200", end="")
 '''
 
 READ_ONLY_CALL = re.compile(
-    r"^gcloud (auth list|auth print-access-token|config get-value|projects describe|services list"
+    r"^gcloud (auth list|auth print-access-token|config get-value|projects describe|projects get-iam-policy"
+    r"|iam roles describe|services list"
     r"|iam service-accounts describe|artifacts repositories describe|artifacts docker tags list"
     r"|secrets (describe|versions list|get-iam-policy)|run (services|jobs) (describe|get-iam-policy)"
     r"|run jobs executions list|storage buckets list|builds list|logging read) ")
@@ -525,6 +632,34 @@ def test_the_preflight_reports_every_gap_at_once(tmp_path):
     assert any(call.startswith("gcloud logging read") for call in calls)
     assert any("-compute@developer.gserviceaccount.com:testIamPermissions" in call for call in calls)
     assert_changed_nothing_and_leaked_nothing(tree, result)
+
+
+def test_the_preflight_reads_the_project_iam_policy_and_probes_both_permissions(tmp_path):
+    """P48: the deploy preflight's iam:no-project-level-secret-access needs the
+    project IAM policy and the custom roles in it."""
+    tree = preflight_tree(tmp_path)
+    result = run_preflight(tree)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = tree.tool_calls()
+    assert "gcloud projects get-iam-policy test-project --format=json" in calls
+    assert ("gcloud iam roles describe miloProjectIamPolicyReader --project test-project --format=value(name)"
+            in calls)
+    probe = [c for c in calls if "projects/test-project:testIamPermissions" in c and "iam.roles.get" in c]
+    assert len(probe) == 1 and "resourcemanager.projects.getIamPolicy" in probe[0]
+    assert ("SUMMARY|permissions:project-iam-read|PASS|holds resourcemanager.projects.getIamPolicy iam.roles.get"
+            in result.stdout)
+    assert_changed_nothing_and_leaked_nothing(tree, result)
+
+    denied = run_preflight(
+        tree, OPS_TEST_DENY={"projects/test-project:testIamPermissions": ["resourcemanager.projects.getIamPolicy"]},
+        OPS_TEST_FAIL={"projects get-iam-policy": [1, (
+            "ERROR: (gcloud.projects.get-iam-policy) [milo-github-deployer@test-project.iam.gserviceaccount.com] "
+            "does not have permission to access projects instance [test-project:getIamPolicy] (or it may not exist): "
+            "Permission 'resourcemanager.projects.getIamPolicy' denied on resource")]})
+    assert denied.returncode == 1
+    report = denied.stdout.split("== Preflight report ==", 1)[1]
+    assert "resourcemanager.projects.getIamPolicy (permissions:project-iam-read)" in report
+    assert "resourcemanager.projects.getIamPolicy (project-iam-policy)" in report
 
 
 def test_the_preflight_dry_run_calls_nothing(tmp_path):

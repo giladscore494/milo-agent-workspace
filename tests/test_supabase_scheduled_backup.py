@@ -324,7 +324,9 @@ def test_fetch_refuses_a_bundle_that_does_not_match_its_manifest(created, gcs, p
     assert _tool(env, "upload", "--dir", str(out), "--bucket", "milo-test-backups").returncode == 0
     for key in list(gcs.objects):
         if key[1].endswith(".tar.gz.enc"):
-            gcs.objects[key] = gcs.objects[key][:-1] + b"\x00"
+            # Flip the last byte: overwriting it with a constant is no change at
+            # all whenever the (random) ciphertext already ends in that value.
+            gcs.objects[key] = gcs.objects[key][:-1] + bytes([gcs.objects[key][-1] ^ 0xFF])
     result = _tool(env, "fetch-latest", "--bucket", "milo-test-backups", "--out", str(tmp_path / "f"))
     assert result.returncode == 1
     assert result.stdout.startswith("FAIL BUNDLE_MISMATCH")

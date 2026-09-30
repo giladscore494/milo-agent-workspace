@@ -759,7 +759,8 @@ def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
         with pytest.raises(AssertionError, match="permission denied"):
             cdb.psql(f"set role {role}; select count(*) from public.catalog_candidate_variants_resolved")
     assert cdb.psql("select prosecdef::text || '|' || array_to_string(proconfig, ',') from pg_proc "
-                    "where proname = 'compact_register_snapshot'") == "true|search_path=pg_catalog"
+                    "where proname = 'compact_register_snapshot'") == \
+        "true|search_path=pg_catalog,statement_timeout=300s,lock_timeout=5s"  # PR-OPS1 (20261004000100)
     # No MAINTAIN for the read-only roles (PostgreSQL 17 has the privilege; older servers have none).
     if int(cdb.psql("select current_setting('server_version_num')")) >= 170000:
         for role in (RELEASE_RO, RO_ROLE):
