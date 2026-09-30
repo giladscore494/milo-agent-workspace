@@ -117,7 +117,7 @@ def test_the_interval_is_code_owned_at_one_second_with_a_bounded_override(monkey
 
 def test_every_pair_of_requests_is_paced_directory_and_counts_alike():
     clock = Clock()
-    transport = RegisterTransport(clock, {TOYOTA: 28, LEXUS: 2500, "מאזדה": 700})
+    transport = RegisterTransport(clock, {TOYOTA: 28, LEXUS: 25_000, "מאזדה": 7_000})  # 4 scan pages
     found = discover_directory(paced_client(transport, clock), clock=clock)
     assert len(found.units) == 3
     kinds = ["distinct" if p.get("distinct") else "count" if "filters" in p else "scan" for _t, p in transport.sent]
@@ -243,14 +243,14 @@ def _register_like_production() -> dict[str, int]:
     return counts
 
 
-def test_a_full_directory_takes_about_four_minutes_well_inside_its_cap(capsys):
+def test_a_full_directory_takes_about_two_and_a_half_minutes_well_inside_its_cap(capsys):
     clock = Clock()
     transport = RegisterTransport(clock, _register_like_production())
     found = discover_directory(paced_client(transport, clock), clock=clock)
     assert found.total_rows == 101_691 and len(found.units) == 137
-    # 1 distinct + 102 scan pages + 137 counts.
-    assert found.requests == len(transport.sent) == 240
-    assert clock.now == pytest.approx(239 * 1.0 + LATENCY)
+    # 1 distinct + 11 scan pages of 10,000 rows + 137 counts.
+    assert found.requests == len(transport.sent) == 149
+    assert clock.now == pytest.approx(148 * 1.0 + LATENCY)
     assert clock.now < DEFAULT_MAX_SECONDS / 10, "the 3000 s cap covers it more than ten times over"
     with capsys.disabled():
         print(f"\nP51 directory: {found.requests} requests, {clock.now:.0f} s paced at 1 s "

@@ -38,7 +38,7 @@ whole discovery runs under two HARD caps: a request count
 as a request, and its wait must end inside the time cap before it is taken
 (P51: the firewall's 403 is retried after 60 s, 180 s and 300 s). The
 client paces every send (`MIN_REQUEST_INTERVAL_SECONDS`, 1 s): a full
-directory of ~240 requests takes >= ~4 minutes, inside the 3000 s cap.
+directory of ~150 requests takes ~2.5 minutes, inside the 3000 s cap.
 Exceeding either cap refuses the whole directory; nothing partial is ever
 recorded.
 
@@ -73,16 +73,24 @@ from backend.catalog.government.source import GovernmentSourceError
 
 DIRECTORY_CONTRACT = "gov.register.directory.1"
 TOZAR_FIELD = "tozar"
-#: Rows per tozar-column scan page (the client's own page ceiling).
-SCAN_PAGE_LIMIT = src.MAX_PAGE_LIMIT
+#: Rows per tozar-column scan page. Its OWN limit, above the capture's
+#: `MAX_PAGE_LIMIT` (1000, pages that carry full row payloads): a scan row is
+#: only `_id` and `tozar` (anything more is refused below), so a page is tiny.
+#: data.gov.il, read-only from Cloud Shell, 2026-09-30 (fields=tozar, sort=_id,
+#: offset 0, total_estimation_threshold): limit 5000 -> 5000 records,
+#: 128,429 bytes; 10000 -> 10000 records, 260,451 bytes; 32000 -> 32000
+#: records, 787,359 bytes -- each with the exact total 101,691. 10,000 keeps a
+#: page ~30x under MAX_RESPONSE_BYTES (8 MiB) and takes the scan from 102
+#: pages to 11 (P51: fewer requests against the firewall's rate limit).
+SCAN_PAGE_LIMIT = 10_000
 #: Sent with every scan page: CKAN counts exactly whenever its estimated total
 #: is below this, and the register (~101,691 rows) is two orders under it.
 SCAN_TOTAL_ESTIMATION_THRESHOLD = 10_000_000
 MAX_REQUESTS_ENV = "MILO_REGISTER_DIRECTORY_MAX_REQUESTS"
 MAX_SECONDS_ENV = "MILO_REGISTER_DIRECTORY_MAX_SECONDS"
-#: A full directory is one distinct cross-check, one scan page per 1000 rows
-#: and one count per tozar: ~102 pages and ~137 counts at the register's
-#: current size, far inside the cap.
+#: A full directory is one distinct cross-check, one scan page per 10,000
+#: rows and one count per tozar: ~11 pages and ~137 counts (~150 requests) at
+#: the register's current size, far inside the cap.
 DEFAULT_MAX_REQUESTS = 6000
 DEFAULT_MAX_SECONDS = 3000.0
 #: The database bounds a directory at 5000 units and a tozar at 200 chars.
