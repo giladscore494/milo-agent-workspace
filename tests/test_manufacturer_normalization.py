@@ -642,3 +642,39 @@ def test_an_unreadable_mapping_degrades_to_the_source_names(monkeypatch):
     page = api.get(f"/projects/{w['project']}/register", headers=as_user())
     assert page.status_code == 200, page.text
     assert all(unit["canonical_manufacturer"] is None for unit in page.json()["units"])
+
+
+def test_a_name_with_a_format_character_is_not_asked_about():
+    rows = norm.model_input({TOYOTA: 3, "Kia‏": 2, LEXUS: 1}, {})
+    assert [row["name"] for row in rows] == sorted([TOYOTA, LEXUS], key=str.encode)
+
+
+def test_a_failed_trigger_is_never_claimed_and_starts_no_cooldown():
+    from backend.catalog.scope import prepare_trigger as trig
+
+    repo, w = world()
+    directory(repo, names())
+    failed = FakeTrigger(state=trig.TRIGGER_FAILED)
+    from backend.errors import AppError
+
+    with pytest.raises(AppError):
+        _request(repo, w, failed)
+    # Nobody waits for it: a later execution never picks it up...
+    assert repo.requested_manufacturer_normalization() is None
+    # ...and pressing again right away starts a new request (no cooldown after a failure).
+    again = _request(repo, w)
+    assert again["started"] is True
+    assert repo.requested_manufacturer_normalization()["id"] == again["proposal_id"]
+
+
+def test_only_the_databases_answer_reads_as_claimed_elsewhere(capsys, monkeypatch):
+    repo, w = world()
+    directory(repo, names())
+    _request(repo, w)
+
+    def unreachable(*_a, **_k):
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(repo, "claim_manufacturer_normalization", unreachable)
+    assert _run_job(repo, monkeypatch, RecordedGateway("{}"), **{norm.JOB_SWITCH: "true"}) == entrypoint.EXIT_REFUSED
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "CAPTURE_RUN_UNAVAILABLE"

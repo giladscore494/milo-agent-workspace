@@ -170,6 +170,12 @@ def test_normalisation_off_is_its_own_stage_through_the_removal_path(tmp_path):
     (plan,) = [line for line in result.stdout.splitlines() if line.startswith("DRY-RUN:")]
     assert plan.endswith("--remove-manufacturer-normalisation")
     assert re.findall(r"^SUMMARY\|([^|]+)\|DRY-RUN\|", result.stdout, re.M) == ["1 normalisation-off"]
+    # Turning it OFF needs none of the values turning a stage ON does.
+    tree.config.write_text("".join(line + "\n" for line in tree.config.read_text().splitlines()
+                                   if not line.startswith(("MILO_WORKER_AUDIENCE", "MILO_GATEWAY_AUDIENCE",
+                                                           "PRODUCTION_ORIGIN", "SECRET_PROVIDER_API_KEY"))))
+    minimal = tree.run("website-stage.sh", "--stage", "normalisation-off", "--dry-run")
+    assert minimal.returncode == 0, minimal.stdout + minimal.stderr
 
 
 def test_website_stage_all_is_both_then_the_register_page_then_the_catalog_browser(tmp_path):
@@ -251,6 +257,13 @@ if args[:1] == ["run"] and args[2] == "update":
                 name, _, val = pair.partition("=")
                 env[name] = val
     json.dump(state, open(path, "w")); sys.exit(0)
+if args[:3] == ["run", "services", "list"] and args[3:7] == ["--region", "test-region", "--project", "test-project"]:
+    if os.environ.get("OPS_TEST_SERVICES_LIST_EXIT"):
+        sys.exit(int(os.environ["OPS_TEST_SERVICES_LIST_EXIT"]))
+    name = args[7].split("=", 2)[2]
+    if name in state["services"]:
+        print(name)
+    sys.exit(0)
 if args[:3] == ["run", "jobs", "list"] and args[3:7] == ["--region", "test-region", "--project", "test-project"] \
         and len(args) == 9 and args[7].startswith("--filter=metadata.name=") \
         and args[8] == "--format=value(metadata.name)":

@@ -35,7 +35,11 @@ ROLES = {
     "roles/run.developer": ["run.jobs.create", "run.jobs.run", "run.jobs.runWithOverrides"],
     "roles/editor": ["run.jobs.runWithOverrides", "secretmanager.versions.access"],
     "roles/logging.logWriter": ["logging.logEntries.create"],
+    # A custom role that cannot override but can REWRITE the job's definition.
+    "projects/test-project/roles/jobEditor": ["run.jobs.get", "run.jobs.run", "run.jobs.update"],
 }
+REWRITE = ("run.jobs.runWithOverrides", "run.jobs.update", "run.jobs.create", "run.jobs.replace",
+           "run.jobs.setIamPolicy")
 
 GCLOUD = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -200,7 +204,8 @@ def test_the_deployed_gate_reads_the_normalisation_job_against_its_flag(tmp_path
 
 @pytest.mark.parametrize(("role", "expected"), [("roles/run.jobsExecutor", "PASS"),
                                               ("roles/run.jobsExecutorWithOverrides", "BLOCKED"),
-                                              ("roles/run.developer", "BLOCKED")])
+                                              ("roles/run.developer", "BLOCKED"),
+                                              ("projects/test-project/roles/jobEditor", "BLOCKED")])
 def test_the_deployed_gate_refuses_an_api_that_can_override_the_job(tmp_path, role, expected):
     """BLOCKER 1: while the job holds the provider key, an API that may run it
     with overrides could run `python -c ...` with the key: not deployed."""
@@ -260,7 +265,8 @@ def doc(entry):
     env = [{"name": k, "value": v} for k, v in entry.get("env", {}).items()]
     env += [{"name": k, "valueFrom": {"secretKeyRef": {"name": v, "key": "latest"}}}
             for k, v in entry.get("secrets", {}).items()]
-    containers = [{"image": entry.get("image", ""), "env": env, "args": entry.get("args", [])}]
+    containers = [{"image": entry.get("image", ""), "env": env, "args": entry.get("args", []),
+                   **({"command": [entry["command"]]} if entry.get("command") else {})}]
     return {"spec": {"template": {"spec": {"serviceAccountName": entry.get("sa", ""),
                                            "template": {"spec": {"containers": containers}},
                                            "containers": containers}}}}
@@ -276,6 +282,11 @@ if a[:4] == ["artifacts", "docker", "tags", "list"]:
     tag = flag("--filter").split(":", 1)[1]
     package = a[4]
     print(f"{package}/tags/{tag}\t{package}/versions/sha256:" + "7" * 64); sys.exit(0)
+if a[:3] == ["run", "services", "list"]:
+    assert a[3:7] == region and a[8] == "--format=value(metadata.name)", a
+    if os.environ.get("T_SERVICES_LIST_FAIL"): sys.exit(1)
+    if a[7] == "--filter=metadata.name=test-api" and not os.environ.get("T_NO_API"): print("test-api")
+    sys.exit(0)
 if a[:2] == ["run", "services"]:
     assert a[3] == "test-api" and a[4:8] == region, a
     api = state["api"]
@@ -302,7 +313,7 @@ if a[:2] == ["run", "jobs"]:
         secrets = {k: v.split(":")[0] for k, v in pairs(flag("--set-secrets")).items()}
         jobs[name] = {"image": flag("--image"), "sa": flag("--service-account"),
                       "env": pairs(flag("--set-env-vars")), "secrets": secrets, "iam": [],
-                      "args": (flag("--args") or "").split(",")}
+                      "args": (flag("--args") or "").split(","), "command": flag("--command")}
         save(); sys.exit(0)
     if verb == "delete":
         assert a[4:] == region + ["--quiet"], a
@@ -316,7 +327,9 @@ if a[:2] == ["run", "jobs"]:
     if verb == "add-iam-policy-binding":
         entry = [flag("--role"), flag("--member")]
         # STRICT: nothing may let anyone run the key-holding job with overrides.
-        assert not (name.endswith("-normalisation") and "run.jobs.runWithOverrides" in ROLES[entry[0]]), a
+        assert not (name.endswith("-normalisation") and set(ROLES[entry[0]]) & {
+            "run.jobs.runWithOverrides", "run.jobs.update", "run.jobs.create", "run.jobs.replace",
+            "run.jobs.setIamPolicy"}), a
         if entry not in jobs[name]["iam"]: jobs[name]["iam"].append(entry)
         save(); sys.exit(0)
 if a[:2] == ["projects", "get-iam-policy"]:
@@ -400,7 +413,7 @@ def test_apply_binds_the_key_on_the_normalisation_job_only_as_the_worker(tmp_pat
     assert job["args"][-1] == "--normalisation-claim" and "--run-id" not in job["args"]
     assert ["roles/run.jobsExecutor", API_MEMBER] in job["iam"]
     assert ["roles/run.viewer", API_MEMBER] in job["iam"]
-    assert all("run.jobs.runWithOverrides" not in ROLES[role] for role, member in job["iam"] if member == API_MEMBER)
+    assert all(not set(ROLES[role]) & set(REWRITE) for role, member in job["iam"] if member == API_MEMBER)
     assert "API_MEMBER holds no role carrying run.jobs.runWithOverrides".replace("API_MEMBER", API_MEMBER) \
         in result.stdout
     # No other job holds the key, and the capture identity reads nothing.
@@ -419,7 +432,7 @@ def test_apply_unwinds_when_the_api_could_override_the_job_through_the_project(t
     path.write_text(json.dumps(state))
     result = _run(tree, env, "apply")
     assert result.returncode == 1, result.stdout + result.stderr
-    assert f"{role} (project)" in result.stdout and "could run the normalisation job with overrides" in result.stderr
+    assert f"{role} (project: " in result.stdout and "could run the normalisation job with overrides" in result.stderr
     after = json.loads(path.read_text())
     assert JOB not in after["jobs"] and after["api"]["env"].get(FLAG) != "true"
 
@@ -525,8 +538,10 @@ def test_an_unreadable_project_policy_is_blocked(tmp_path):
 @pytest.mark.parametrize(("state", "expected", "needle"), [
     ({}, "PASS", "holds no role carrying run.jobs.runWithOverrides"),
     ({"T_API_JOB_ROLE": "roles/run.jobsExecutorWithOverrides"}, "BLOCKED",
-     "roles/run.jobsExecutorWithOverrides (job)"),
-    ({"T_PROJECT_ROLES": "api:roles/run.developer"}, "BLOCKED", "roles/run.developer (project)"),
+     "roles/run.jobsExecutorWithOverrides (job: run.jobs.runWithOverrides)"),
+    ({"T_API_JOB_ROLE": "projects/test-project/roles/jobEditor"}, "BLOCKED",
+     "projects/test-project/roles/jobEditor (job: run.jobs.update)"),
+    ({"T_PROJECT_ROLES": "api:roles/run.developer"}, "BLOCKED", "roles/run.developer (project: "),
     ({"T_JOB_POLICY_FAIL": "1"}, "BLOCKED", "could not be read"),
     ({"T_ROLE_FAIL": "roles/run.jobsExecutor"}, "BLOCKED", "permissions of roles/run.jobsExecutor"),
 ])
@@ -543,3 +558,28 @@ def test_a_job_left_behind_points_the_operator_at_normalisation_off(tmp_path):
     assert check["status"] == "BLOCKED"
     assert "Website stage -> stage = normalisation-off" in check["detail"]
     assert "website-stage.sh --stage normalisation-off" in check["detail"]
+
+
+MINIMAL_DROP = ("MILO_WORKER_AUDIENCE", "MILO_GATEWAY_AUDIENCE", "MILO_APPROVED_GATEWAY_IDENTITIES",
+                "PRODUCTION_ORIGIN", "SECRET_PROVIDER_API_KEY")
+
+
+def test_the_removal_needs_no_activation_config_and_tolerates_no_api_service(tmp_path):
+    """Turning normalisation OFF (deploy step 6, the kill switch's path, the
+    normalisation-off stage) never fails for want of a gateway, worker or
+    policy value; a project with no API service has no flag to turn off; a
+    listing that fails is a failure."""
+    tree, env, path = activation(tmp_path)
+    assert _run(tree, env, "apply").returncode == 0
+    config = tree.config.read_text()
+    tree.config.write_text("".join(line + "\n" for line in config.splitlines()
+                                   if not line.startswith(MINIMAL_DROP)))
+    removed = _run(tree, env, "remove")
+    assert removed.returncode == 0, removed.stdout + removed.stderr
+    assert JOB not in json.loads(path.read_text())["jobs"]
+    assert json.loads(path.read_text())["api"]["env"][FLAG] == "false"
+    none = _run(tree, env, "remove", T_NO_API="1")
+    assert none.returncode == 0 and "No API service test-api" in none.stdout
+    unlisted = _run(tree, env, "remove", T_SERVICES_LIST_FAIL="1")
+    assert unlisted.returncode == 1 and "could not be listed, so the API flag is not proved off" in unlisted.stderr
+    assert "UNMOCKED" not in tree.tool_calls()

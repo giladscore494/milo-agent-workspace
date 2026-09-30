@@ -1585,8 +1585,13 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         try:
             claimed = repository.claim_manufacturer_normalization(
                 proposal_id, run_id, worker_id, lease_seconds=lease_seconds)
-        except Exception:
-            return EXIT_REFUSED, _envelope("refused", "CAPTURE_NORMALISATION_ALREADY_CLAIMED")
+        except Exception as failure:
+            # Only the database's own answer means "claimed elsewhere"; any
+            # other failure (a network error) is the repository being unavailable.
+            code = getattr(failure, "code", None)
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_NORMALISATION_ALREADY_CLAIMED" if code in (
+                "CATALOG_NORMALIZATION_ALREADY_CLAIMED", "CATALOG_NORMALIZATION_NOT_REQUESTED")
+                else "CAPTURE_RUN_UNAVAILABLE")
     else:
         try:
             claimed = repository.claim_run(run_id, worker_id, lease_seconds=lease_seconds)

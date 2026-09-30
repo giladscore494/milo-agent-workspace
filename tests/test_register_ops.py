@@ -705,3 +705,14 @@ def test_a_project_level_delete_capable_role_is_a_failure(tmp_path):
     check = tree.run("setup-register-archive.sh", "--check", extra_env=env)
     assert check.stdout.startswith("FAIL an application identity holds a delete-capable role on") \
         and "roles/editor" in check.stdout
+
+
+def test_the_read_only_url_maps_its_parameters_or_refuses(tmp_path):
+    """Every URL parameter libpq honours reaches its variable (never argv); one
+    it cannot map refuses instead of connecting differently."""
+    tree = vacuum_tree(tmp_path)
+    mapped = vacuum(tree, "--sizes", MILO_READONLY_DB_URL=POOLER_URL + "?sslmode=require&application_name=milo-vacuum")
+    assert mapped.returncode == 0, mapped.stdout + mapped.stderr
+    unknown = vacuum(tree, "--sizes", MILO_READONLY_DB_URL=POOLER_URL + "?host=elsewhere.example.com")
+    assert unknown.returncode == 1 and "the sizes could not be read (read-only role)" in unknown.stderr
+    no_secret(mapped.stdout, mapped.stderr, unknown.stdout, unknown.stderr, "\n".join(tree.tool_calls()))

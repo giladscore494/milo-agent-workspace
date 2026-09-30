@@ -534,6 +534,11 @@ MILO_NORMALISATION_JOB_ENV_NAME="CLOUD_RUN_NORMALISATION_JOB"
 # key): run.jobs.run and run.jobs.get, never run.jobs.runWithOverrides.
 MILO_API_NORMALISATION_RUN_ROLE="roles/run.jobsExecutor"
 MILO_RUN_WITH_OVERRIDES_PERMISSION="run.jobs.runWithOverrides"
+# Every permission that lets a holder make the job run something other than
+# its definition: an override, or rewriting / replacing / re-granting the job
+# and then running it with plain run.jobs.run.
+MILO_JOB_REWRITE_PERMISSIONS=(run.jobs.runWithOverrides run.jobs.update run.jobs.create run.jobs.replace
+  run.jobs.setIamPolicy)
 
 # milo_normalisation_job_name — CLOUD_RUN_NORMALISATION_JOB, else
 # <CLOUD_RUN_CAPTURE_JOB>-normalisation ('' when neither is configured).
@@ -651,7 +656,7 @@ print("\n".join(str(p) for p in permissions))
 # level (a project role reaches every job). Any unreadable policy or role is
 # BLOCKED, never a pass.
 milo_normalisation_override_posture() {
-  local job="$1" region="$2" project="$3" member="$4" policy roles role permissions where holders=""
+  local job="$1" region="$2" project="$3" member="$4" policy roles role permissions permission where holders=""
   for where in job project; do
     if [[ "$where" == "job" ]]; then
       policy="$(gcloud run jobs get-iam-policy "$job" --region "$region" --project "$project" --format=json 2> /dev/null)" \
@@ -667,16 +672,19 @@ milo_normalisation_override_posture() {
       role="${role% conditional}"
       permissions="$(milo_role_permissions "$role")" \
         || { printf 'BLOCKED the permissions of %s (held by %s) could not be read' "$role" "$member"; return 0; }
-      if grep -qx "$MILO_RUN_WITH_OVERRIDES_PERMISSION" <<< "$permissions"; then
-        holders+="${role} (${where}) "
-      fi
+      for permission in "${MILO_JOB_REWRITE_PERMISSIONS[@]}"; do
+        if grep -qx "$permission" <<< "$permissions"; then
+          holders+="${role} (${where}: ${permission}) "
+          break
+        fi
+      done
     done <<< "$roles"
   done
   if [[ -n "$holders" ]]; then
-    printf 'BLOCKED %s can run %s WITH overrides through %s-- an override would hand it the provider key. Remediation: gcloud run jobs remove-iam-policy-binding %s --region %s --project %s --member %s --role <that role> (or remove the project-level role), then grant %s only' \
+    printf 'BLOCKED %s can run %s with overrides, or rewrite it, through %s-- either would hand it the provider key. Remediation: gcloud run jobs remove-iam-policy-binding %s --region %s --project %s --member %s --role <that role> (or remove the project-level role), then grant %s only' \
       "$member" "$job" "$holders" "$job" "$region" "$project" "$member" "$MILO_API_NORMALISATION_RUN_ROLE"
   else
-    printf 'PASS %s holds no role carrying %s on %s or its project' "$member" "$MILO_RUN_WITH_OVERRIDES_PERMISSION" "$job"
+    printf 'PASS %s holds no role carrying %s on %s or its project' "$member" "$(IFS=/; printf '%s' "${MILO_JOB_REWRITE_PERMISSIONS[*]}")" "$job"
   fi
 }
 

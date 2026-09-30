@@ -310,14 +310,18 @@ def test_a_requested_proposal_cannot_be_forged_below_the_rpcs(fresh):
 
 
 def test_the_same_input_is_reused_and_new_requests_wait_out_the_cooldown(fresh):
-    db, user, _queued = fresh
-    # Every earlier request ended (a failed trigger is not live); the newest one
-    # a minute ago: a NEW question waits out the cooldown, told the seconds left.
+    db, user, queued_run = fresh
+    # Every earlier request ended; the newest one a minute ago, its run done (a
+    # completed request, not a failed trigger): a NEW question waits out the
+    # cooldown, told the seconds left.
     db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '1 day', "
             "trigger_state = 'trigger_failed' where kind = 'normalisation'")
-    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '60 seconds' "
-            "where id = (select id from public.catalog_register_capture_groups where kind = 'normalisation' "
-            "order by claimed_at desc, id desc limit 1)")
+    newest = db.psql("select id from public.catalog_register_capture_groups where kind = 'normalisation' "
+                     "order by claimed_at desc, id desc limit 1")
+    run_id = queued_run()
+    _finish(db, run_id)
+    db.psql(f"update public.catalog_register_capture_groups set claimed_at = now() - interval '60 seconds', "
+            f"run_id = '{run_id}', trigger_state = 'triggered' where id = '{newest}'")
     third = [dict(row, samples=["y"]) for row in INPUT]
     waiting = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
                                              f"{_json(third)})"))
@@ -347,3 +351,31 @@ def test_format_characters_and_unbounded_strings_are_refused(fresh):
     long_sample = [dict(INPUT[0], samples=["x" * 121])]
     with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_REQUEST_INVALID"):
         _rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, {_json(long_sample)})")
+
+
+def test_a_proposal_is_born_requested_and_a_failed_trigger_is_never_claimed(fresh):
+    db, user, queued_run = fresh
+    group = db.psql("select id from public.catalog_register_capture_groups where kind = 'normalisation' limit 1")
+    for status, groups, code in (("proposed", _json(GROUPS), "null"), ("refused", "null", "'X_FAILED'")):
+        with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_PROPOSAL_IMMUTABLE"):
+            _rpc_as_service(db, "insert into public.catalog_manufacturer_normalization_proposals (group_id, "
+                                "requested_by, input, input_sha256, status, groups, reason_code) values "
+                                f"('{group}', '{user}', {_json(INPUT)}, '{'b' * 64}', '{status}', {groups}, {code})")
+    # A request whose trigger failed: nobody waits for it, so no execution picks it
+    # up, and it starts no cooldown -- the next press starts a new request at once.
+    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '1 day', "
+            "trigger_state = 'trigger_failed' where kind = 'normalisation'")
+    fourth = [dict(row, samples=["z"]) for row in INPUT]
+    claim = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                           f"{_json(fourth)})"))
+    assert claim["decision"] == "claimed"
+    run_id = queued_run()
+    _rpc_as_service(db, f"select public.record_register_capture_trigger('{claim['group']['id']}', '{run_id}', "
+                        "'trigger_failed', null)")
+    assert _requested(db) is None
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_NOT_REQUESTED"):
+        _claim_job(db, claim["proposal"]["id"], run_id, "job-z")
+    fifth = [dict(row, samples=["w"]) for row in INPUT]
+    again = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                           f"{_json(fifth)})"))
+    assert again["decision"] == "claimed"

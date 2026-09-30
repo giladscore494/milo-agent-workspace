@@ -433,8 +433,9 @@ GATE_CHAIN: tuple[Gate, ...] = (
         current_default="false",
         required_for_first_run="NO — only for one manufacturer normalisation call",
         when_to_enable=(
-            "Never on a service or a job definition. The API's normalisation "
-            "invocation turns it on for ONE capture-job execution"),
+            "Only in the normalisation job's own definition (website-execution-activate.sh "
+            "--apply-manufacturer-normalisation): the API runs that job WITHOUT overrides, "
+            "so the switch is baked in, never sent. Pinned off on the capture job"),
         requires_redeploy=UPDATE_JOB,
         failure_behavior_when_off=(
             "The capture entrypoint refuses the normalisation mode "

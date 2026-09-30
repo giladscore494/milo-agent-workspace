@@ -99,7 +99,8 @@ esac
 ops_load_config
 # What each canonical tool refuses to run without, checked here so a dry run
 # already says so.
-if [[ "$STAGE" != "none" ]]; then
+# Turning normalisation OFF needs none of them (the removal path's own minimum).
+if [[ "$STAGE" != "none" && "$STAGE" != "normalisation-off" ]]; then
   milo_require_op SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
     PRODUCTION_ORIGIN MILO_WORKER_AUDIENCE || exit 2
 fi

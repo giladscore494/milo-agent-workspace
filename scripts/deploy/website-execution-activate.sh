@@ -190,9 +190,19 @@ fi
 
 CONFIG_PATH="$(milo_operator_config_path "$REPO_ROOT" "$MILO_OPERATOR_CONFIG_PATH")"
 milo_load_operator_config "$CONFIG_PATH" || exit 2
-milo_require_op GCP_PROJECT_ID GCP_REGION CLOUD_RUN_API_SERVICE CLOUD_RUN_WORKER_JOB \
-  SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
-  PRODUCTION_ORIGIN || exit 2
+# PR-D3: turning manufacturer normalisation OFF (the kill switch's path, every
+# Stage A deploy's step 6, the normalisation-off stage) needs nothing an
+# activation needs -- no gateway, worker or policy value -- so it never fails
+# for a configuration that has none of them.
+REMOVE_ONLY=0
+[[ "$MODE" != "remove-manufacturer-normalisation" ]] || REMOVE_ONLY=1
+if [[ "$REMOVE_ONLY" -eq 1 ]]; then
+  milo_require_op GCP_PROJECT_ID GCP_REGION CLOUD_RUN_API_SERVICE || exit 2
+else
+  milo_require_op GCP_PROJECT_ID GCP_REGION CLOUD_RUN_API_SERVICE CLOUD_RUN_WORKER_JOB \
+    SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
+    PRODUCTION_ORIGIN || exit 2
+fi
 
 PROJECT_ID="$(milo_op GCP_PROJECT_ID)"
 REGION="$(milo_op GCP_REGION)"
@@ -207,7 +217,7 @@ SITE="$(milo_op PRODUCTION_ORIGIN)"
 WORKER_AUDIENCE="$(milo_op MILO_WORKER_AUDIENCE)"
 APPROVED_WORKER_IDENTITIES="$(milo_op MILO_APPROVED_WORKER_IDENTITIES)"
 [[ -n "$APPROVED_WORKER_IDENTITIES" ]] || APPROVED_WORKER_IDENTITIES="$(milo_op WORKER_SERVICE_ACCOUNT)"
-if [[ -z "$WORKER_AUDIENCE" || -z "$APPROVED_WORKER_IDENTITIES" ]]; then
+if [[ "$REMOVE_ONLY" -eq 0 ]] && [[ -z "$WORKER_AUDIENCE" || -z "$APPROVED_WORKER_IDENTITIES" ]]; then
   printf 'FAIL: MILO_ENABLE_EXECUTION_CONTROL requires both MILO_WORKER_AUDIENCE and\n' >&2
   printf '      MILO_APPROVED_WORKER_IDENTITIES on the API, or backend/production_config.py\n' >&2
   printf '      refuses to start (WORKER_AUTH_AUDIENCE_MISSING / WORKER_ALLOWLIST_EMPTY).\n' >&2
@@ -253,8 +263,9 @@ env = reviewed_first_run_policy().env_expectations(prefixes=prefixes)
 print(sys.argv[1].join("%s=%s" % item for item in sorted(env.items())))
 ' "$MILO_ENV_VAR_DELIMITER" "$@")
 }
-if ! POLICY_JOB_VARS="$(policy_pairs)" || [[ -z "$POLICY_JOB_VARS" ]] \
-   || ! POLICY_API_VARS="$(policy_pairs MILO_MAX_ MILO_DAILY_ MILO_ESTIMATED_COST)" || [[ -z "$POLICY_API_VARS" ]]; then
+POLICY_JOB_VARS="" POLICY_API_VARS=""
+if [[ "$REMOVE_ONLY" -eq 0 ]] && { ! POLICY_JOB_VARS="$(policy_pairs)" || [[ -z "$POLICY_JOB_VARS" ]] \
+   || ! POLICY_API_VARS="$(policy_pairs MILO_MAX_ MILO_DAILY_ MILO_ESTIMATED_COST)" || [[ -z "$POLICY_API_VARS" ]]; }; then
   printf 'FAIL: the reviewed RuntimePolicy could not be read from backend/runtime_policy.py\n' >&2
   exit 2
 fi
@@ -464,9 +475,10 @@ def containers(node):
     elif isinstance(node, list):
         for value in node:
             yield from containers(value)
-found = [c.get("args") or [] for c in containers(json.load(sys.stdin))]
-ok = bool(found) and all(a[:2] == ["-m", sys.argv[1]] and a[-1] == "--normalisation-claim"
-                         and "--run-id" not in a for a in found)
+found = list(containers(json.load(sys.stdin)))
+ok = bool(found) and all((c.get("command") or []) == ["python"] and (c.get("args") or [])[:2] == ["-m", sys.argv[1]]
+                         and (c.get("args") or [""])[-1] == "--normalisation-claim"
+                         and "--run-id" not in (c.get("args") or []) for c in found)
 sys.exit(0 if ok else 1)
 ' "$MILO_CAPTURE_ENTRYPOINT_MODULE" <<< "$json"; then
     printf 'MISMATCH %s: its invocation is not the fixed --normalisation-claim one\n' "$1"
@@ -863,7 +875,15 @@ if [[ "$MODE" == "remove-manufacturer-normalisation" ]]; then
   # provider key is deleted whatever happened to the flag.
   removed=1
   split_pairs "$NORMALISATION_API_OFF"
-  if ! gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+  # No API service (a project not deployed yet): its flag cannot be on. A
+  # listing that fails is a failure, never "absent".
+  if ! api_listed="$(gcloud run services list --region "$REGION" --project "$PROJECT_ID" \
+         --filter="metadata.name=${API_SERVICE}" --format='value(metadata.name)')"; then
+    printf 'FAIL: the Cloud Run services could not be listed, so the API flag is not proved off.\n' >&2
+    removed=0
+  elif [[ "$api_listed" != "$API_SERVICE" ]]; then
+    printf 'No API service %s: its normalisation flag cannot be on.\n' "$API_SERVICE"
+  elif ! gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
        --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${NORMALISATION_API_OFF}" > /dev/null \
      || ! readback service "$API_SERVICE" "${SPLIT[@]}"; then
     printf 'FAIL: the API flag could not be turned off, or still reads on (above).\n' >&2

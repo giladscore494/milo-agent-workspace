@@ -231,7 +231,9 @@ begin
   if found and v_proposal.input_sha256 = v_sha then
     return jsonb_build_object('decision', 'reused', 'group', null, 'proposal', to_jsonb(v_proposal) - 'input');
   end if;
-  if v_group.id is not null and v_group.claimed_at > now() - make_interval(secs => v_cooldown) then
+  -- A failed trigger started nothing and spent nothing: no cooldown after it.
+  if v_group.id is not null and v_group.trigger_state <> 'trigger_failed'
+     and v_group.claimed_at > now() - make_interval(secs => v_cooldown) then
     select * into v_proposal from public.catalog_manufacturer_normalization_proposals where group_id = v_group.id;
     return jsonb_build_object('decision', 'cooldown', 'group', to_jsonb(v_group),
                               'proposal', to_jsonb(v_proposal) - 'input',
@@ -292,15 +294,23 @@ begin
 end;
 $$;
 
--- A proposal moves ONCE, and only forward: requested -> proposed (its groups
--- valid against its own input) or requested -> refused. Nothing else of it is
--- ever updated -- the validated groups cannot be rewritten below the RPCs.
+-- A proposal moves ONCE, and only forward: it is born `requested` with no
+-- outcome, then requested -> proposed (its groups valid against its own input)
+-- or requested -> refused. Nothing else of it is ever written -- the validated
+-- groups cannot be forged or rewritten below the RPCs.
 create or replace function public.catalog_normalization_proposal_transition()
 returns trigger
 language plpgsql
 set search_path = pg_catalog
 as $$
 begin
+  if tg_op = 'INSERT' then
+    if new.status <> 'requested' or new.groups is not null or new.reason_code is not null then
+      raise exception 'CATALOG_NORMALIZATION_PROPOSAL_IMMUTABLE: a proposal is born requested, with no outcome'
+        using errcode = '42501';
+    end if;
+    return new;
+  end if;
   if old.status <> 'requested' or new.status not in ('proposed', 'refused')
      or new.id is distinct from old.id or new.group_id is distinct from old.group_id
      or new.requested_by is distinct from old.requested_by or new.input is distinct from old.input
@@ -315,19 +325,20 @@ $$;
 drop trigger if exists catalog_manufacturer_normalization_proposals_transition
   on public.catalog_manufacturer_normalization_proposals;
 create trigger catalog_manufacturer_normalization_proposals_transition
-  before update on public.catalog_manufacturer_normalization_proposals
+  before insert or update on public.catalog_manufacturer_normalization_proposals
   for each row execute function public.catalog_normalization_proposal_transition();
 
 -- The normalisation job's work, read: the newest normalisation request, while
--- it is still `requested` and the API has recorded its run -- {id, run_id} --
--- else null (the job then starts nothing).
+-- it is still `requested`, the API has recorded its run and its trigger did
+-- not fail (a request nobody is waiting for is never picked up later) --
+-- {id, run_id} -- else null (the job then starts nothing).
 create or replace function public.requested_manufacturer_normalization()
 returns jsonb
 language sql
 stable
 set search_path = pg_catalog
 as $$
-  select case when p.status = 'requested' and g.run_id is not null
+  select case when p.status = 'requested' and g.run_id is not null and g.trigger_state <> 'trigger_failed'
               then jsonb_build_object('id', p.id, 'run_id', g.run_id) end
     from public.catalog_register_capture_groups g
     join public.catalog_manufacturer_normalization_proposals p on p.group_id = g.id
@@ -348,7 +359,7 @@ language plpgsql
 -- claim_run_lease (migration 012) pins no search_path and draws its lease token
 -- from pgcrypto's gen_random_bytes, which lives in `public` here and in
 -- `extensions` on Supabase: both are on this (security invoker) function's path.
-set search_path = pg_catalog, public, extensions
+set search_path = pg_catalog, extensions, public
 as $$
 declare
   v_run public.runs%rowtype;

@@ -178,8 +178,12 @@ def model_input(names: Mapping[str, int], evidence: Mapping[str, Mapping[str, An
                 mapped: Iterable[str] = ()) -> list[dict[str, Any]]:
     """Every source name still unmapped, with its evidence (bounded: at most
     MAX_SAMPLES strings of at most MAX_SAMPLE_CHARS each). More names than one
-    call may carry is refused -- never silently cut."""
-    unmapped = sorted(set(names) - set(mapped), key=lambda n: n.encode("utf-8"))
+    call may carry is refused -- never silently cut. A name carrying a format
+    character (`has_format_char`) is left out: the answer may not name it
+    (validate_groups refuses it), so asking would only spend a refused call;
+    R1 still joins it (its key drops the character) and the owner sees it."""
+    unmapped = sorted((n for n in set(names) - set(mapped) if not has_format_char(n)),
+                      key=lambda n: n.encode("utf-8"))
     if len(unmapped) > MAX_INPUT_NAMES:
         raise NormalizationRefused("NORMALIZATION_INPUT_TOO_LARGE")
     rows = []

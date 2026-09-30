@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -75,14 +76,15 @@ class NormalizationMemoryMixin:
             answered = self.latest_manufacturer_normalization_proposal("proposed")
             if answered is not None and answered["input_sha256"] == digest:
                 return {"decision": "reused", "group": None, "proposal": answered}
-            if latest is not None:
+            # A failed trigger started nothing and spent nothing: no cooldown after it.
+            if latest is not None and latest.get("trigger_state") != "trigger_failed":
                 ready_at = datetime.fromisoformat(str(latest["claimed_at"])) + timedelta(
                     seconds=normalization.REQUEST_COOLDOWN_SECONDS)
                 if ready_at > datetime.now(UTC):
                     proposal = next(p for p in state["proposals"].values() if p["group_id"] == latest["id"])
                     return {"decision": "cooldown", "group": dict(latest),
                             "proposal": {k: v for k, v in proposal.items() if k != "input"},
-                            "retry_after_seconds": int((ready_at - datetime.now(UTC)).total_seconds()) + 1}
+                            "retry_after_seconds": math.ceil((ready_at - datetime.now(UTC)).total_seconds())}
             group = {"id": str(uuid4()), "kind": "normalisation", "register_version": None,
                      "requested_by": str(requested_by), "expected_rows": 0, "run_id": None,
                      "trigger_state": "claimed", "execution_name": None, "claimed_at": _now(),
@@ -108,7 +110,7 @@ class NormalizationMemoryMixin:
 
     def requested_manufacturer_normalization(self) -> dict[str, Any] | None:
         group = self._latest_normalisation_group()
-        if group is None or group.get("run_id") is None:
+        if group is None or group.get("run_id") is None or group.get("trigger_state") == "trigger_failed":
             return None
         proposal = next(p for p in self._norm_state()["proposals"].values() if p["group_id"] == group["id"])
         return {"id": proposal["id"], "run_id": str(group["run_id"])} if proposal["status"] == "requested" else None
