@@ -39,6 +39,14 @@
 #                    --apply-manufacturer-normalisation), after the Register
 #                    page (register-capture) it lives on. Never part of `all`: it binds a
 #                    paid provider key, so it is always its own decision.
+#   normalisation-off
+#                    PR-D3, OFF on its own (no deploy, no kill switch): the
+#                    API flag off, the normalisation job deleted and the
+#                    capture identity's access to the provider key and the
+#                    quota store revoked, each read back
+#                    (website-execution-activate.sh
+#                    --remove-manufacturer-normalisation, the path the kill
+#                    switch and every deploy's Stage A reset take).
 #   all              `both`, then the Register page (the capture job is
 #                    ensured once), then the catalog browser
 #   none             nothing
@@ -60,7 +68,7 @@ source "${SCRIPT_DIR}/common.sh"
 STAGE="" STEP_PREFIX="" HEADER=1
 usage() {
   cat << 'EOF'
-Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|catalog-browser|manufacturer-normalisation|all|none [--dry-run]
+Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|catalog-browser|manufacturer-normalisation|normalisation-off|all|none [--dry-run]
                         [--operator-config <path>] [--step-prefix <n>] [--no-header]
 
 Turns the website's plan authoring (Stage P) and/or its Prepare button (E'),
@@ -81,8 +89,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$STAGE" in
-  plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all | none) ;;
-  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation, all or none\n' >&2; usage >&2; exit 2 ;;
+  plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation \
+    | normalisation-off | all | none) ;;
+  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation, normalisation-off, all or none\n' >&2; usage >&2; exit 2 ;;
 esac
 [[ -z "$STEP_PREFIX" || "$STEP_PREFIX" =~ ^[0-9]{1,2}$ ]] \
   || { printf 'FAIL: --step-prefix must be a step number\n' >&2; exit 2; }
@@ -188,11 +197,20 @@ if [[ "$STAGE" == "catalog-browser" || "$STAGE" == "all" ]]; then
     "${activate[@]}" --apply-catalog-browser
 fi
 
+if [[ "$STAGE" == "normalisation-off" ]]; then
+  run_step "$(step_name 1 a normalisation-off)" \
+    "PR-D3 off: MILO_ENABLE_MANUFACTURER_NORMALISATION off on the API, the normalisation job deleted and read back absent, the capture identity's access to the provider key and the quota store revoked and read back" \
+    "manufacturer normalisation is NOT fully removed (above); re-run this stage or use the kill switch" \
+    "${activate[@]}" --remove-manufacturer-normalisation
+fi
+
 # Inside a deploy (--no-header) the deploy writes the closing note.
 if [[ "$HEADER" -eq 0 ]]; then
   :
 elif [[ "$DRY_RUN" -eq 1 ]]; then
   summary_note "DRY RUN: nothing was called and nothing was changed."
+elif [[ "$STAGE" == "normalisation-off" ]]; then
+  summary_note "Manufacturer normalisation is off: nothing holds the provider key for it (read back)."
 else
   summary_note "The website's plan tools are on. Stage 2 was not touched: no run can start, nothing was prepared and no provider call was made."
 fi

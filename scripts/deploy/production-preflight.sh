@@ -259,13 +259,59 @@ if [[ -n "$CAPTURE_SA" ]]; then
         "capture SA lacks secretAccessor on ${secret}. Remediation: gcloud secrets add-iam-policy-binding ${secret} --member=serviceAccount:${CAPTURE_SA} --role=roles/secretmanager.secretAccessor --project=${PROJECT_ID}"
     fi
   done
-  provider_secret="$(milo_op SECRET_PROVIDER_API_KEY)"
-  if [[ -n "$provider_secret" ]] && gcloud secrets get-iam-policy "$provider_secret" \
-       --project "$PROJECT_ID" --format=json 2> /dev/null | grep -q "serviceAccount:${CAPTURE_SA}"; then
+  # The provider key AND the quota store (PR-D3: the normalisation job's two
+  # Upstash secrets): any role the capture identity holds on one -- a
+  # conditional binding included -- is BLOCKED, and so is a policy that cannot
+  # be read. Never a pass on what could not be seen.
+  capture_reads=() capture_unreadable=()
+  for secret_key in SECRET_PROVIDER_API_KEY SECRET_REDIS_URL SECRET_REDIS_TOKEN; do
+    secret="$(milo_op "$secret_key")"
+    [[ -n "$secret" ]] || continue
+    if ! policy="$(gcloud secrets get-iam-policy "$secret" --project "$PROJECT_ID" --format=json 2> /dev/null)" \
+       || ! roles="$(milo_policy_member_roles "serviceAccount:${CAPTURE_SA}" <<< "$policy")"; then
+      capture_unreadable+=("$secret")
+    elif [[ -n "$roles" ]]; then
+      capture_reads+=("${secret} ($(tr '\n' ' ' <<< "$roles" | sed 's/ $//'))")
+    fi
+  done
+  if [[ "${#capture_reads[@]}" -gt 0 ]]; then
     record_check BLOCKED "iam:capture-cannot-read-provider-key" \
-      "capture SA can read ${provider_secret}; a capture must never reach a provider credential. Remediation: gcloud secrets remove-iam-policy-binding ${provider_secret} --member=serviceAccount:${CAPTURE_SA} --role=roles/secretmanager.secretAccessor --project=${PROJECT_ID}"
+      "capture SA holds a role on ${capture_reads[*]}; a capture must never reach a provider credential or the quota store. Remediation: bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation (or Actions -> Website stage -> normalisation-off), which revokes and reads back"
+  elif [[ "${#capture_unreadable[@]}" -gt 0 ]]; then
+    record_check BLOCKED "iam:capture-cannot-read-provider-key" \
+      "the IAM policy of ${capture_unreadable[*]} could not be read, so whether the capture SA can read it is unknown"
   else
-    record_check PASS "iam:capture-cannot-read-provider-key" "capture identity holds no provider-key accessor"
+    record_check PASS "iam:capture-cannot-read-provider-key" \
+      "capture identity holds no role on the provider key or the quota store (read back)"
+  fi
+fi
+
+# No runtime identity reaches secrets through the PROJECT: a project-level
+# secretAccessor, secretmanager.admin, editor or owner would reach every
+# secret, the provider key included, whatever the secret-level policies say.
+project_policy=""
+if ! project_policy="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> /dev/null)" \
+   || ! milo_policy_member_roles "serviceAccount:probe" <<< "$project_policy" > /dev/null; then
+  record_check BLOCKED "iam:no-project-level-secret-access" \
+    "the project IAM policy of ${PROJECT_ID} could not be read, so whether a runtime identity reaches every secret is unknown"
+else
+  broad=()
+  for sa_key in CAPTURE_SERVICE_ACCOUNT API_SERVICE_ACCOUNT; do
+    sa="$(milo_op "$sa_key")"
+    [[ -n "$sa" ]] || continue
+    while IFS= read -r role; do
+      case "${role% conditional}" in
+        roles/secretmanager.secretAccessor | roles/secretmanager.admin | roles/editor | roles/owner)
+          broad+=("${sa} ${role}") ;;
+      esac
+    done < <(milo_policy_member_roles "serviceAccount:${sa}" <<< "$project_policy")
+  done
+  if [[ "${#broad[@]}" -gt 0 ]]; then
+    record_check BLOCKED "iam:no-project-level-secret-access" \
+      "project-level roles reach every secret: ${broad[*]}. Remediation: gcloud projects remove-iam-policy-binding ${PROJECT_ID} --member=serviceAccount:<that SA> --role=<that role>; grant secretAccessor per secret instead"
+  else
+    record_check PASS "iam:no-project-level-secret-access" \
+      "neither the capture nor the API identity holds secretAccessor, secretmanager.admin, editor or owner on ${PROJECT_ID}"
   fi
 fi
 
@@ -292,6 +338,21 @@ if [[ -n "$NORMALISATION_JOB" ]]; then
       posture="BLOCKED the stage is on but the capture job has no identity distinct from the worker's, which reads the provider key. Remediation: set CAPTURE_SERVICE_ACCOUNT, or bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation"
     fi
     record_check "${posture%% *}" "cloud-run:normalisation-job" "${NORMALISATION_JOB}: ${posture#* }"
+    # The job holds the provider key: the API runs it exactly as defined,
+    # never with overrides (an override is arbitrary code with the key).
+    if [[ "$normalisation_state" == "present" ]]; then
+      api_sa="$(milo_op API_SERVICE_ACCOUNT)"
+      if [[ -z "$api_sa" ]]; then
+        record_check BLOCKED "iam:api-cannot-override-normalisation-job" \
+          "no API_SERVICE_ACCOUNT is configured, so who may run ${NORMALISATION_JOB} with overrides is unknown"
+      else
+        override="$(milo_normalisation_override_posture "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID" \
+          "serviceAccount:${api_sa}")"
+        record_check "${override%% *}" "iam:api-cannot-override-normalisation-job" "${override#* }"
+      fi
+    else
+      record_check PASS "iam:api-cannot-override-normalisation-job" "no normalisation job: nothing holds the provider key"
+    fi
   fi
 fi
 

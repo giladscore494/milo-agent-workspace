@@ -75,6 +75,9 @@ REQUEST_REASONS: Mapping[str, tuple[int, str]] = {
     "CATALOG_NORMALIZATION_APPROVAL_INVALID": (422, "that is not a pending group, or it must be approved alone"),
     "CATALOG_NORMALIZATION_REJECTION_INVALID": (422, "that is not a pending group"),
     "CATALOG_NORMALIZATION_VERSION_STALE": (409, "the active normalisation changed; reload"),
+    "CATALOG_NORMALIZATION_COOLDOWN": (429, "a normalisation was requested moments ago; try again later"),
+    "CATALOG_NORMALIZATION_INPUT_TOO_LARGE":
+        (422, "more unmapped manufacturer names than one normalisation may carry"),
 }
 
 _TRIGGER_CODES = {trig.JOB_NOT_RELEASE: "CATALOG_REGISTER_JOB_NOT_RELEASE",
@@ -216,7 +219,8 @@ def register_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: Any,
                 continue
     rows: list[dict[str, Any]] = []
     captured_units = captured_rows = 0
-    canonical = normalization.current_map(repo) if directory is not None else {}
+    # A label beside the exact tozar: unreadable, the page shows the source names.
+    canonical = normalization.current_map_or_empty(repo) if directory is not None else {}
     if directory is not None:
         for entry in directory["units"]:
             view = {"tozar": entry["tozar"], "expected_rows": int(entry["expected_rows"]),
@@ -425,11 +429,13 @@ def _normalization_inputs(repo: Any) -> tuple[dict[str, int], dict[str, Any], di
 def _pending(repo: Any) -> dict[str, Any]:
     names, evidence, active = _normalization_inputs(repo)
     rules = normalization.deterministic_groups(names, evidence, active)
+    # The newest ANSWERED proposal: a later request, refused or still running,
+    # never hides the groups waiting for approval.
+    answered = repo.latest_manufacturer_normalization_proposal("proposed")
+    model = [dict(group, proposal_id=str(answered["id"]))
+             for group in (answered or {}).get("groups") or []
+             if any(active.get(m) != group["canonical"] for m in group["members"])]
     proposal = repo.latest_manufacturer_normalization_proposal()
-    model = [dict(group, proposal_id=str(proposal["id"]))
-             for group in (proposal or {}).get("groups") or []
-             if any(active.get(m) != group["canonical"] for m in group["members"])
-             ] if (proposal or {}).get("status") == "proposed" else []
     # A group the owner rejected, exactly as it was proposed, is not pending.
     rejected = {(row["canonical_name"], tuple(sorted(row["members"], key=str.encode)), row.get("rule_id"),
                  str(row["proposal_id"]) if row.get("proposal_id") else None)
@@ -439,7 +445,9 @@ def _pending(repo: Any) -> dict[str, Any]:
                    group.get("proposal_id")) not in rejected]
     for group in pending:
         group["conflicting"] = normalization.conflicts(group, active, pending)
-        group["bulk_approvable"] = group["confidence"] == "high" and not group["conflicting"]
+        # A single-member group re-names one source: always approved on its own.
+        group["bulk_approvable"] = (group["confidence"] == "high" and not group["conflicting"]
+                                    and len(group["members"]) >= 2)
     current = repo.manufacturer_normalization_current() or {}
     return {"version": int(current.get("version") or 0), "active": active, "pending": pending,
             "proposal": proposal, "unmapped": len(set(names) - set(active))}
@@ -489,13 +497,20 @@ def request_normalization(repo: Any, user_id: UUID, project_id: UUID, *, convers
             raise _refusal("CATALOG_REGISTER_UNAVAILABLE")
         _release_gate(trigger)
         names, evidence, active = _normalization_inputs(repo)
-        rows = normalization.model_input(names, evidence, active)
+        try:
+            rows = normalization.model_input(names, evidence, active)
+        except normalization.NormalizationRefused:
+            raise _refusal("CATALOG_NORMALIZATION_INPUT_TOO_LARGE") from None
         if not rows:
             raise _refusal("CATALOG_NORMALIZATION_NOTHING_UNMAPPED")
         claim = repo.request_manufacturer_normalization(user_id, rows, grace_seconds=START_GRACE_SECONDS)
         group, proposal = claim["group"], claim["proposal"]
+        if claim["decision"] == "cooldown":
+            raise _refusal("CATALOG_NORMALIZATION_COOLDOWN")
         if claim["decision"] != "claimed":
-            return {"started": False, "proposal_id": str(proposal["id"])}
+            # `existing` (one is live) or `reused` (this exact input already has
+            # an answer): nothing starts, nothing is spent.
+            return {"started": False, "proposal_id": str(proposal["id"]), "decision": claim["decision"]}
 
         def record(state: str, run_id: str | None, execution: str | None = None) -> None:
             repo.record_register_capture_trigger(group["id"], run_id=run_id, trigger_state=state,
@@ -506,15 +521,11 @@ def request_normalization(repo: Any, user_id: UUID, project_id: UUID, *, convers
         if run_id is None:
             record(trig.TRIGGER_FAILED, None)
             raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED")
+        # The run is recorded on the group BEFORE the job starts: the job
+        # claims this proposal and its run from the database, since it is
+        # executed exactly as defined (no overrides, no id passed).
         record("claimed", run_id)
-        try:
-            invocation = manufacturer_normalisation(
-                project_ref=str(environment.get("MILO_EXPECTED_SUPABASE_PROJECT_REF") or ""),
-                run_id=run_id, proposal_id=str(proposal["id"]))
-        except InvocationError:
-            record(trig.TRIGGER_FAILED, run_id)
-            raise _refusal("CATALOG_REGISTER_TRIGGER_FAILED") from None
-        outcome = trigger.run(invocation)
+        outcome = trigger.run(manufacturer_normalisation())
         if outcome.state not in (trig.TRIGGERED, trig.TRIGGER_FAILED, trig.TRIGGER_UNKNOWN):
             outcome = trig.TriggerOutcome(trig.TRIGGER_UNKNOWN)
         record(outcome.state, run_id, outcome.execution_name)

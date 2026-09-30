@@ -76,6 +76,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_variant_coverage_for_batch": {"p_batch_id", "p_level"},
     "catalog_variant_coverage_runs": {"p_after_finished_at", "p_after_run_id", "p_limit"},
     "catalog_variant_reservations_settling": {"p_limit"},
+    "claim_manufacturer_normalization": {"p_lease_seconds", "p_proposal_id", "p_run_id", "p_worker_id"},
     "claim_current_verdict_states": {"p_run_id"},
     "claim_run_lease": {"p_run_id", "p_worker_id"},
     "compact_register_snapshot": {"p_apply", "p_snapshot_key"},
@@ -185,6 +186,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     },
     "reject_manufacturer_normalization_group": {"p_group", "p_rejected_by"},
     "request_manufacturer_normalization": {"p_grace_seconds", "p_input", "p_requested_by"},
+    "requested_manufacturer_normalization": set(),
     "request_register_capture": {
         "p_bytes_per_row", "p_capacity_limit_bytes", "p_grace_seconds", "p_group_max_rows", "p_register_version", "p_requested_by", "p_tozars"
     },

@@ -146,22 +146,112 @@ def world_with_proposal(repo: MemoryRepository | None = None) -> tuple[MemoryRep
     return repo, w, lease, answer["proposal_id"]
 
 
-def test_the_api_starts_one_capture_job_execution_with_its_own_switch():
+def test_the_api_runs_the_normalisation_job_as_defined_with_no_overrides():
+    """BLOCKER 1: the job holds the provider key; an override (`python -c ...`)
+    would hand it to whoever controls the API. The API sends NOTHING: the
+    `jobs.run` body is empty, and the proposal and its run are in the database."""
+    from backend.catalog.scope.prepare_trigger import run_request_body
+
     repo, w = world()
     directory(repo, names())
     trigger = FakeTrigger()
     answer = register_service.request_normalization(repo, USER, UUID(w["project"]),
                                                     conversation_id=UUID(w["conversation"]), trigger=trigger)
     (invocation,) = trigger.calls
-    assert invocation.env_overrides == ((ci.NORMALISATION_SWITCH, "true"),)
-    assert invocation.entrypoint_args[-2:] == ("--normalisation-proposal-id", answer["proposal_id"])
+    assert invocation == ci.NO_OVERRIDES and run_request_body(invocation) == {}
+    # The run is recorded on the request BEFORE the job starts: the job finds it.
+    assert repo.requested_manufacturer_normalization() == {"id": answer["proposal_id"], "run_id": answer["run_id"]}
     proposal = repo.manufacturer_normalization_proposal(answer["proposal_id"])
     assert [row["name"] for row in proposal["input"]] == sorted(names(), key=str.encode)
     assert all(set(row) == {"name", "rows", "tozeret_nm", "samples"} for row in proposal["input"])
     # One live at a time: a second press starts nothing.
     again = register_service.request_normalization(repo, USER, UUID(w["project"]),
                                                    conversation_id=UUID(w["conversation"]), trigger=trigger)
-    assert again == {"started": False, "proposal_id": answer["proposal_id"]} and len(trigger.calls) == 1
+    assert again == {"started": False, "proposal_id": answer["proposal_id"], "decision": "existing"}
+    assert len(trigger.calls) == 1
+
+
+def test_the_job_definition_is_fixed_and_names_no_run():
+    arguments = ci.normalisation_job_arguments(project_ref="abcdefghijklmnopqrst")
+    assert arguments[0] == "--execute" and arguments[-1] == ci.NORMALISATION_CLAIM_FLAG
+    assert "--run-id" not in arguments and "--normalisation-proposal-id" not in arguments
+    # What the capture script bakes into the job, from the same definition.
+    import subprocess
+    import sys
+    printed = subprocess.run([sys.executable, ci.__file__, "normalisation-job-args", "--project-ref",
+                              "abcdefghijklmnopqrst"], capture_output=True, text=True, check=True).stdout.strip()
+    assert printed.split(",") == list(arguments)
+
+
+def _run_job(repo, monkeypatch, gateway=None, **env):
+    from tests.test_catalog_operator_capture import capture_env
+
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: pytest.fail("the normalisation opens no transport"))
+    if gateway is not None:
+        monkeypatch.setattr(norm, "guarded_gateway", lambda *_a: gateway)
+    ready = capture_env(MILO_RELEASE_SHA="84cd8696119c24662a954d0f0e23195268dab23f", **env)
+    argv = list(ci.normalisation_job_arguments(project_ref=entrypoint.configured_project_ref(ready)))
+    return entrypoint.main(argv, env=ready)
+
+
+def test_the_job_claims_the_requested_proposal_and_makes_its_one_call(capsys, monkeypatch):
+    repo, w = world()
+    directory(repo, names())
+    answer = register_service.request_normalization(repo, USER, UUID(w["project"]),
+                                                    conversation_id=UUID(w["conversation"]), trigger=FakeTrigger())
+    gateway = RecordedGateway(json.dumps({"groups": [VALID["groups"][0]]}))
+    status = _run_job(repo, monkeypatch, gateway, **{norm.JOB_SWITCH: "true"})
+    document = json.loads(capsys.readouterr().out)
+    assert status == entrypoint.EXIT_OK, document
+    assert document["normalisation"] == {"status": "proposed", "reason_code": None, "groups": 1}
+    assert len(gateway.calls) == 1 and repo.runs[answer["run_id"]]["status"] == "completed"
+    assert repo.manufacturer_normalization_proposal(answer["proposal_id"])["status"] == "proposed"
+    # Nothing is requested any more: a second execution refuses and calls nothing.
+    assert _run_job(repo, monkeypatch, gateway, **{norm.JOB_SWITCH: "true"}) == entrypoint.EXIT_REFUSED
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "CAPTURE_NORMALISATION_NOTHING_REQUESTED"
+    assert len(gateway.calls) == 1
+
+
+def test_the_job_refuses_to_start_when_nothing_is_requested(capsys, monkeypatch):
+    repo, _w = world()
+    directory(repo, names())
+    assert _run_job(repo, monkeypatch, RecordedGateway("{}"), **{norm.JOB_SWITCH: "true"}) == entrypoint.EXIT_REFUSED
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "CAPTURE_NORMALISATION_NOTHING_REQUESTED"
+    # Without its switch the mode is refused before anything is read.
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: pytest.fail("no repository"))
+    assert _run_job(repo, monkeypatch) == entrypoint.EXIT_REFUSED
+    assert json.loads(capsys.readouterr().out)["reason_code"] == "CAPTURE_NORMALISATION_DISABLED"
+
+
+def test_two_executions_cannot_both_claim_the_proposal():
+    repo, w = world()
+    directory(repo, names())
+    answer = register_service.request_normalization(repo, USER, UUID(w["project"]),
+                                                    conversation_id=UUID(w["conversation"]), trigger=FakeTrigger())
+    requested = repo.requested_manufacturer_normalization()
+    first = repo.claim_manufacturer_normalization(requested["id"], UUID(requested["run_id"]), "job-a")
+    assert first["worker_id"] == "job-a"
+    from backend.errors import AppError
+
+    with pytest.raises(AppError) as second:
+        repo.claim_manufacturer_normalization(requested["id"], UUID(requested["run_id"]), "job-b")
+    assert second.value.code == "CATALOG_NORMALIZATION_ALREADY_CLAIMED"
+    # A proposal that is not the requested one is never claimed.
+    with pytest.raises(AppError) as other:
+        repo.claim_manufacturer_normalization(str(UUID(int=1)), UUID(answer["run_id"]), "job-c")
+    assert other.value.code == "CATALOG_NORMALIZATION_NOT_REQUESTED"
+
+
+def test_the_entrypoint_refuses_a_run_id_or_another_mode_beside_the_claim():
+    from tests.test_catalog_operator_capture import capture_env
+
+    ready = {**capture_env(), norm.JOB_SWITCH: "true"}
+    base = list(ci.normalisation_job_arguments(project_ref=entrypoint.configured_project_ref(ready)))
+    assert entrypoint._refusal(entrypoint.build_parser().parse_args(base), [], ready) == ""
+    for extra in (["--run-id", str(UUID(int=2))], ["--register-directory"]):
+        args = entrypoint.build_parser().parse_args(base + extra)
+        assert entrypoint._refusal(args, [], ready) == "CAPTURE_NORMALISATION_ARGUMENTS_INVALID"
 
 
 def test_a_valid_recorded_answer_is_proposed_through_the_role_policy(monkeypatch):
@@ -201,16 +291,12 @@ def test_no_call_without_the_executions_own_switch_or_for_another_run():
         with pytest.raises(norm.NormalizationRefused):
             norm.propose(repo, lease, pid, env=env, gateway_factory=lambda *_a: gateway)
     assert gateway.calls == []
-    # The entrypoint refuses the mode without the switch, or beside another mode.
-    args = entrypoint.build_parser().parse_args(
-        ["--execute", *ci.manufacturer_normalisation(project_ref="abc", run_id=lease.run_id,
-                                                     proposal_id=proposal_id).entrypoint_args[1:]])
+    # The entrypoint refuses the mode without its switch, and under paid execution.
     from tests.test_catalog_operator_capture import capture_env
 
     ready = capture_env()
     args = entrypoint.build_parser().parse_args(
-        ["--execute", *ci.manufacturer_normalisation(project_ref=entrypoint.configured_project_ref(ready),
-                                                     run_id=lease.run_id, proposal_id=proposal_id).entrypoint_args[1:]])
+        list(ci.normalisation_job_arguments(project_ref=entrypoint.configured_project_ref(ready))))
     assert entrypoint._refusal(args, [], ready) == "CAPTURE_NORMALISATION_DISABLED"
     assert entrypoint._refusal(args, [], {**ready, norm.JOB_SWITCH: "true"}) == ""
     assert entrypoint._refusal(args, [], {**ready, norm.JOB_SWITCH: "true",
@@ -228,6 +314,7 @@ def test_high_confidence_groups_together_and_any_other_alone():
     repo, w, lease, proposal_id = world_with_proposal()
     proposed(repo, lease, proposal_id, [
         {"canonical": "Toyota", "members": [TOYOTA], "confidence": "high", "reason": "x"},
+        {"canonical": "Honda", "members": [HONDA, HONDA_JP], "confidence": "high", "reason": "w"},
         {"canonical": "Lexus", "members": [LEXUS], "confidence": "low", "reason": "y"},
         # Conflicts with the R1 group of the two Mercedes spellings.
         {"canonical": "Mercedes", "members": [MERCEDES], "confidence": "high", "reason": "z"}])
@@ -235,7 +322,9 @@ def test_high_confidence_groups_together_and_any_other_alone():
     view = api.get(f"/projects/{w['project']}/register/normalisation", headers=as_user()).json()
     pending = {(g["canonical"], g.get("rule_id")): g for g in view["pending"]}
     assert view["version"] == 0 and view["can_approve"] is True and view["unmapped"] == len(names())
-    assert pending[("Toyota", None)]["bulk_approvable"] is True
+    # High confidence, two names, no conflict: bulk. One name only: always alone.
+    assert pending[("Honda", None)]["bulk_approvable"] is True
+    assert pending[("Toyota", None)]["bulk_approvable"] is False
     assert pending[("Lexus", None)]["bulk_approvable"] is False
     assert pending[("Mercedes", None)]["conflicting"] is True
     assert pending[(MERCEDES, "R1_SPELLING")]["conflicting"] is True
@@ -245,8 +334,10 @@ def test_high_confidence_groups_together_and_any_other_alone():
             {k: g[k] for k in ("canonical", "members", "rule_id", "proposal_id") if g.get(k)} for g in groups]}
         return api.post(f"/projects/{w['project']}/register/normalisation/approvals", headers=as_user(), json=body)
 
-    # A low-confidence group may not ride with others; a conflicting one neither.
+    # A low-confidence group may not ride with others; a conflicting one neither;
+    # nor a single-name group.
     assert approve([pending[("Toyota", None)], pending[("Lexus", None)]]).status_code == 422
+    assert approve([pending[("Honda", None)], pending[("Toyota", None)]]).status_code == 422
     assert approve([pending[("Toyota", None)], pending[("Mercedes", None)]]).status_code == 422
     # Something the server did not propose is refused.
     assert approve([dict(pending[("Toyota", None)], canonical="Toyota Motor")]).status_code == 422
@@ -430,3 +521,124 @@ def test_the_button_executes_the_normalisation_job_never_the_capture_job():
                                  job_setting="cloud_run_normalisation_job") is None
     for route in (get_normalisation, request_normalisation):
         assert route.__defaults__[-1].dependency is get_normalisation_trigger
+
+
+# -- 5. repeated presses, the answered proposal, and the input bounds (review items) ------
+
+def _request(repo, w, trigger=None):
+    return register_service.request_normalization(repo, USER, UUID(w["project"]),
+                                                  conversation_id=UUID(w["conversation"]),
+                                                  trigger=trigger or FakeTrigger())
+
+
+def _answered(repo, w, monkeypatch, groups):
+    """A request, then the job's whole execution (so the run ends)."""
+    answer = _request(repo, w)
+    status = _run_job(repo, monkeypatch, RecordedGateway(json.dumps({"groups": groups})),
+                      **{norm.JOB_SWITCH: "true"})
+    assert status == entrypoint.EXIT_OK
+    return answer
+
+
+def _age_requests(repo, seconds: int) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    for group in repo._register_state()["groups"].values():
+        if group.get("kind") == "normalisation":
+            group["claimed_at"] = (datetime.fromisoformat(str(group["claimed_at"]))
+                                   - timedelta(seconds=seconds)).isoformat()
+
+
+def test_the_same_input_reuses_its_answer_and_calls_nothing(capsys, monkeypatch):
+    repo, w = world()
+    directory(repo, names())
+    first = _answered(repo, w, monkeypatch, [VALID["groups"][0]])
+    _age_requests(repo, norm.REQUEST_COOLDOWN_SECONDS + 1)
+    trigger = FakeTrigger()
+    again = _request(repo, w, trigger)
+    assert again == {"started": False, "proposal_id": first["proposal_id"], "decision": "reused"}
+    assert trigger.calls == [] and repo.requested_manufacturer_normalization() is None
+
+
+def test_a_new_request_waits_out_the_cooldown(capsys, monkeypatch):
+    from backend.errors import AppError
+
+    repo, w = world()
+    directory(repo, names())
+    _answered(repo, w, monkeypatch, [VALID["groups"][0]])
+    directory(repo, {**names(), "סובארו": 4})             # a new name: a different question
+    with pytest.raises(AppError) as waiting:
+        _request(repo, w)
+    assert (waiting.value.code, waiting.value.status_code) == ("CATALOG_NORMALIZATION_COOLDOWN", 429)
+    _age_requests(repo, norm.REQUEST_COOLDOWN_SECONDS + 1)
+    assert _request(repo, w)["started"] is True
+
+
+def test_a_later_refused_request_never_hides_the_answered_groups(capsys, monkeypatch):
+    repo, w = world()
+    directory(repo, names())
+    first = _answered(repo, w, monkeypatch,
+                      [{"canonical": "Honda", "members": [HONDA, HONDA_JP], "confidence": "high", "reason": "x"}])
+    _age_requests(repo, norm.REQUEST_COOLDOWN_SECONDS + 1)
+    directory(repo, {**names(), "סובארו": 4})
+    _request(repo, w)
+    assert _run_job(repo, monkeypatch, RecordedGateway("not json"), **{norm.JOB_SWITCH: "true"}) == entrypoint.EXIT_OK
+    assert repo.latest_manufacturer_normalization_proposal()["status"] == "refused"
+    pending = register_service._pending(repo)["pending"]
+    assert [(g["canonical"], g.get("proposal_id")) for g in pending if not g.get("rule_id")] == [
+        ("Honda", first["proposal_id"])]
+
+
+def test_format_characters_are_refused_in_a_proposed_name():
+    bidi, zero_width = "Toyota‮", "​Lexus"
+    for group in ({"canonical": bidi, "members": [TOYOTA], "confidence": "high", "reason": ""},
+                  {"canonical": "Lexus", "members": [zero_width], "confidence": "high", "reason": ""}):
+        with pytest.raises(norm.NormalizationRefused) as refused:
+            norm.validate_groups(json.dumps({"groups": [group]}), [*INPUT, zero_width])
+        assert refused.value.code == "NORMALIZATION_OUTPUT_SHAPE_INVALID"
+    # A rule group's canonical name is a member's without one.
+    (group,) = norm.deterministic_groups({"Kia​": 90, "KIA": 5}, {})
+    assert group["canonical"] == "KIA" and group["members"] == sorted(["Kia​", "KIA"], key=str.encode)
+
+
+def test_the_input_is_refused_when_too_large_and_bounded_per_string(monkeypatch):
+    from backend.errors import AppError
+
+    rows = norm.model_input({TOYOTA: 1}, {TOYOTA: {"samples": ["x" * 500], "tozeret_nm": ["y" * 121]}})
+    assert rows[0]["samples"] == ["x" * norm.MAX_SAMPLE_CHARS]
+    assert rows[0]["tozeret_nm"] == ["y" * norm.MAX_SAMPLE_CHARS]
+    monkeypatch.setattr(norm, "MAX_INPUT_NAMES", 3)
+    with pytest.raises(norm.NormalizationRefused) as refused:
+        norm.model_input(names(), {})
+    assert refused.value.code == "NORMALIZATION_INPUT_TOO_LARGE"
+    repo, w = world()
+    directory(repo, names())
+    with pytest.raises(AppError) as too_many:
+        _request(repo, w)
+    assert (too_many.value.code, too_many.value.status_code) == ("CATALOG_NORMALIZATION_INPUT_TOO_LARGE", 422)
+    # The database (and its mirror) refuses an unbounded string too.
+    with pytest.raises(AppError):
+        repo.request_manufacturer_normalization(USER, [{"name": TOYOTA, "rows": 1, "samples": ["x" * 121]}],
+                                                grace_seconds=600)
+
+
+def test_an_unreadable_mapping_degrades_to_the_source_names(monkeypatch):
+    from backend.catalog.register import browser
+    from backend.errors import AppError
+    from tests.test_catalog_variants import fixture_rows
+    from tests.test_register_capture import captured_world
+
+    monkeypatch.setenv(browser.BROWSER_FLAG, "true")
+    repo, w, _version, _report, _writer = captured_world(fixture_rows())
+
+    def unreadable():
+        raise AppError("REPOSITORY_ERROR", "the normalisation could not be read", 502)
+
+    monkeypatch.setattr(repo, "manufacturer_normalization_current", unreadable)
+    api = client(repo, FakeTrigger())
+    listed = api.get(f"/projects/{w['project']}/catalog/browser/manufacturers", headers=as_user())
+    assert listed.status_code == 200
+    assert listed.json()["items"] == [{"tozar": TOYOTA, "variants": 16, "canonical_manufacturer": None}]
+    page = api.get(f"/projects/{w['project']}/register", headers=as_user())
+    assert page.status_code == 200, page.text
+    assert all(unit["canonical_manufacturer"] is None for unit in page.json()["units"])

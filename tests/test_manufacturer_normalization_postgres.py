@@ -196,3 +196,154 @@ def test_the_read_only_role_reads_and_writes_nothing(ndb, proposal):
 
 def test_the_migration_is_rerun_safe(ndb):
     ndb.psql(file=MIGRATION)
+
+
+# -- The pre-merge review: the job's claim, the proposal's one transition, repeated
+#    presses, and the format-character / string bounds -- on a fresh database. ------
+
+FRESH_PORT = "54990"
+
+
+@pytest.fixture(scope="module")
+def fresh():
+    from tests.test_migrations_postgres import born_with_identity
+
+    server = EphemeralPostgres(_require_pg_bin(), port=FRESH_PORT)
+    server.start()
+    try:
+        server.create_database()
+        server.psql(file=BASELINE)
+        server.psql(sql=SEED_LEGACY_ROWS)
+        server.psql(sql=SUPABASE_AUTH_SHIM)
+        for migration in MIGRATIONS:
+            server.psql(file=migration)
+        units = json.dumps([{"tozar": t, "expected_rows": n} for t, n in
+                            ((TOYOTA, 28), (LEXUS, 5), (MERCEDES, 10), (MERCEDES_DASH, 3))], ensure_ascii=False)
+        _rpc_as_service(server, "select public.record_register_directory('142afde2-6228-49f9-8a29-9b6c3a0cbe40', "
+                                f"now(), $j${units}$j$::jsonb)")
+        user, _project, conversation = _ws_world(server)
+
+        def queued_run() -> str:
+            return server.psql(born_with_identity(
+                f"insert into public.runs (conversation_id, status, input, launch_state) values "
+                f"('{conversation}', 'queued', "
+                f"""'{{"metadata": {{"milo_operation": "catalog.government.capture"}}}}'::jsonb, """
+                f"'none') returning id", workflow_key="operator_capture"))
+
+        yield server, user, queued_run
+    finally:
+        server.stop()
+
+
+def _requested(db) -> dict | None:
+    value = _rpc_as_service(db, "select public.requested_manufacturer_normalization()")
+    return json.loads(value) if value else None
+
+
+def _claim_job(db, proposal_id: str, run_id: str, worker: str) -> str:
+    return _rpc_as_service(db, f"select id, worker_id from public.claim_manufacturer_normalization("
+                               f"'{proposal_id}', '{run_id}', '{worker}', 300)")
+
+
+def _finish(db, run_id: str) -> None:
+    db.psql(f"update public.runs set status = 'completed', worker_id = null, lease_expires_at = null "
+            f"where id = '{run_id}'")
+
+
+def test_the_job_claims_the_requested_proposal_exactly_once(fresh):
+    db, user, queued_run = fresh
+    assert _requested(db) is None                                     # nothing requested: the job starts nothing
+    claim = _claim(db, user)
+    proposal_id = claim["proposal"]["id"]
+    assert _requested(db) is None                                     # no run recorded yet
+    run_id = queued_run()
+    _rpc_as_service(db, f"select public.record_register_capture_trigger('{claim['group']['id']}', '{run_id}', "
+                        "'triggered', 'exec-1')")
+    assert _requested(db) == {"id": proposal_id, "run_id": run_id}
+    assert _claim_job(db, proposal_id, run_id, "job-a") == f"{run_id}|job-a"
+    # A second execution: the lease is held (the existing CAS), so it cannot claim.
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_ALREADY_CLAIMED"):
+        _claim_job(db, proposal_id, run_id, "job-b")
+    # A proposal or run that is not the requested one: refused.
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_NOT_REQUESTED"):
+        _claim_job(db, str(uuid.uuid4()), run_id, "job-c")
+    # Answered, it is no longer requested: nothing to claim.
+    attempt, token = db.psql(f"select attempt, lease_token from public.runs where id = '{run_id}'").split("|")
+    _rpc_as_service(db, f"select public.record_manufacturer_normalization_proposal('{run_id}', 'job-a', {attempt}, "
+                        f"'{token}', '{proposal_id}', 'proposed', {_json(GROUPS)}, null, 'kimi-k3')")
+    assert _requested(db) is None
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_NOT_REQUESTED"):
+        _claim_job(db, proposal_id, run_id, "job-a")
+    _finish(db, run_id)
+    db.fresh_state = {"proposal_id": proposal_id}
+
+
+def test_a_proposed_proposal_is_never_rewritten(fresh):
+    db, _user, _queued = fresh
+    proposal_id = db.fresh_state["proposal_id"]
+    forged = [dict(GROUPS[0], canonical="Forged")]
+    for sql in (f"update public.catalog_manufacturer_normalization_proposals set groups = {_json(forged)} "
+                f"where id = '{proposal_id}'",
+                f"update public.catalog_manufacturer_normalization_proposals set status = 'refused', groups = null, "
+                f"reason_code = 'NORMALIZATION_MODEL_FAILED' where id = '{proposal_id}'",
+                f"update public.catalog_manufacturer_normalization_proposals set input = '[]'::jsonb "
+                f"where id = '{proposal_id}'"):
+        with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_PROPOSAL_IMMUTABLE"):
+            _rpc_as_service(db, sql)
+    groups = json.loads(db.psql(f"select groups from public.catalog_manufacturer_normalization_proposals "
+                                f"where id = '{proposal_id}'"))
+    assert groups == GROUPS
+
+
+def test_a_requested_proposal_cannot_be_forged_below_the_rpcs(fresh):
+    db, user, _queued = fresh
+    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '1 day' "
+            "where kind = 'normalisation'")
+    other = [dict(row, samples=["x"]) for row in INPUT]                  # a different question
+    claim = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                           f"{_json(other)})"))
+    assert claim["decision"] == "claimed"
+    invented = [dict(GROUPS[0], members=[MERCEDES, "מרצדס"])]
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_PROPOSAL_IMMUTABLE"):
+        _rpc_as_service(db, f"update public.catalog_manufacturer_normalization_proposals set status = 'proposed', "
+                            f"groups = {_json(invented)} where id = '{claim['proposal']['id']}'")
+
+
+def test_the_same_input_is_reused_and_new_requests_wait_out_the_cooldown(fresh):
+    db, user, _queued = fresh
+    # Every earlier request ended (a failed trigger is not live); the newest one
+    # a minute ago: a NEW question waits out the cooldown, told the seconds left.
+    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '1 day', "
+            "trigger_state = 'trigger_failed' where kind = 'normalisation'")
+    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '60 seconds' "
+            "where id = (select id from public.catalog_register_capture_groups where kind = 'normalisation' "
+            "order by claimed_at desc, id desc limit 1)")
+    third = [dict(row, samples=["y"]) for row in INPUT]
+    waiting = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                             f"{_json(third)})"))
+    assert waiting["decision"] == "cooldown" and 530 <= waiting["retry_after_seconds"] <= 541
+    # The SAME input as the newest answered proposal: reused -- nothing is written, no call.
+    db.psql("update public.catalog_register_capture_groups set claimed_at = now() - interval '1 day' "
+            "where kind = 'normalisation'")
+    before = db.psql("select count(*) from public.catalog_manufacturer_normalization_proposals")
+    reused = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                            f"{_json(INPUT)})"))
+    assert reused["decision"] == "reused" and reused["proposal"]["id"] == db.fresh_state["proposal_id"]
+    assert db.psql("select count(*) from public.catalog_manufacturer_normalization_proposals") == before
+    # A different question after the cooldown starts a new request.
+    started = json.loads(_rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, "
+                                             f"{_json(third)})"))
+    assert started["decision"] == "claimed"
+
+
+def test_format_characters_and_unbounded_strings_are_refused(fresh):
+    db, user, _queued = fresh
+    for text, expected in (("Toyota", "f"), ("Toyota‮", "t"), ("​Lexus", "t"), ("a⁦b", "t"),
+                           ("Kia﻿", "t"), ("x\U000e0041", "t"), ("מרצדס בנץ", "f"), ("a­b", "t")):
+        assert db.psql(f"select public.catalog_normalization_has_format_char($t${text}$t$)") == expected, text
+    bidi = [dict(GROUPS[0], canonical="Mercedes‮")]
+    assert db.psql(f"select public.catalog_normalization_groups_valid({_json(bidi)}, {_json(INPUT)})") == "f"
+    assert db.psql(f"select public.catalog_normalization_groups_valid({_json(GROUPS)}, {_json(INPUT)})") == "t"
+    long_sample = [dict(INPUT[0], samples=["x" * 121])]
+    with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_REQUEST_INVALID"):
+        _rpc_as_service(db, f"select public.request_manufacturer_normalization('{user}', 900, {_json(long_sample)})")

@@ -448,6 +448,32 @@ revoke_capture_provider_access() {
   printf 'The capture identity reads neither the provider key nor the quota store (read back).\n'
 }
 
+# The normalisation job's invocation is its definition: the entrypoint module,
+# the claim flag, and no run id (an execution names none).
+fixed_invocation() {
+  local json
+  json="$(gcloud run jobs describe "$1" --region "$REGION" --project "$PROJECT_ID" --format=json)" || return 1
+  if ! python3 -c '
+import json, sys
+def containers(node):
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            yield from node["containers"]
+        for value in node.values():
+            yield from containers(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from containers(value)
+found = [c.get("args") or [] for c in containers(json.load(sys.stdin))]
+ok = bool(found) and all(a[:2] == ["-m", sys.argv[1]] and a[-1] == "--normalisation-claim"
+                         and "--run-id" not in a for a in found)
+sys.exit(0 if ok else 1)
+' "$MILO_CAPTURE_ENTRYPOINT_MODULE" <<< "$json"; then
+    printf 'MISMATCH %s: its invocation is not the fixed --normalisation-claim one\n' "$1"
+    return 1
+  fi
+}
+
 # A job binds no provider key, in either form.
 no_provider_key() {
   local json name
@@ -793,7 +819,8 @@ if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
      || ! readback_secret job "$NORMALISATION_JOB" UPSTASH_REDIS_REST_URL "$REDIS_URL_SECRET" \
      || ! readback_secret job "$NORMALISATION_JOB" UPSTASH_REDIS_REST_TOKEN "$REDIS_TOKEN_SECRET" \
      || ! readback job "$NORMALISATION_JOB" "${SPLIT[@]}" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
-          "${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=${DISABLED}"; then
+          "${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=${ENABLED}" \
+     || ! fixed_invocation "$NORMALISATION_JOB"; then
     unwind "the normalisation job does not carry its posture (above). The API was not changed."
   fi
   # The key is the normalisation job's only: never the capture job's, never
@@ -806,6 +833,14 @@ if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
   if ! ensure_job_binding "$NORMALISATION_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}" \
      || ! ensure_job_binding "$WORKER_JOB" "$MILO_API_JOB_READ_ROLE" "serviceAccount:${API_SA}"; then
     unwind "the API identity cannot read both jobs (above); the API was NOT changed."
+  fi
+  # The API runs that job exactly as defined: no role it holds there (or on
+  # the project) may carry run.jobs.runWithOverrides, read from IAM itself.
+  override_posture="$(milo_normalisation_override_posture "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID" \
+    "serviceAccount:${API_SA}")"
+  printf '%s\n' "$override_posture"
+  if [[ "${override_posture%% *}" != "PASS" ]]; then
+    unwind "the API identity could run the normalisation job with overrides (above); the API was NOT changed."
   fi
   split_pairs "$NORMALISATION_API_VARS"
   # Decision 33: allowed while paid runs are off -- and they stay off.

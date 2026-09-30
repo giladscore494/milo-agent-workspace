@@ -103,7 +103,11 @@ def release_refusal_for(capture_job: Any, worker_job: Any, release_sha: str) -> 
 
 
 def run_request_body(invocation: Invocation) -> dict[str, Any]:
-    """The `jobs.run` body for one invocation: args REPLACE the job's own."""
+    """The `jobs.run` body for one invocation: args REPLACE the job's own.
+    An invocation with neither (PR-D3's normalisation job) sends NO overrides
+    at all: the job runs exactly as defined (run.jobs.run, not runWithOverrides)."""
+    if not invocation.entrypoint_args and not invocation.env_overrides:
+        return {}
     return {"overrides": {"containerOverrides": [{
         "args": list(invocation.container_args),
         "env": [{"name": name, "value": value} for name, value in invocation.env_overrides],

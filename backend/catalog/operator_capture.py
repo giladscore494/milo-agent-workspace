@@ -288,8 +288,11 @@ WORK_SCOPE_PREPARATION_FLAG = "MILO_ENABLE_WORK_SCOPE_PREPARATION"
 #: API's invocation, backend/capture_invocation.py REGISTER_SWITCH).
 REGISTER_CAPTURE_JOB_FLAG = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
 #: The register modes' arguments: one of the two, never both.
+#: PR-D3: the normalisation job's one mode flag. The job is executed exactly
+#: as defined (no overrides): it claims the single requested proposal and its
+#: run from the database, so it takes no run id and no proposal id.
 NORMALISATION_ARGUMENTS: tuple[tuple[str, str], ...] = (
-    ("normalisation_proposal_id", "--normalisation-proposal-id"),
+    ("normalisation_claim", "--normalisation-claim"),
 )
 REGISTER_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("register_group_id", "--register-group-id"),
@@ -408,7 +411,11 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "register capture is not enabled for this execution",
     # PR-D3: the manufacturer normalisation mode (one guarded model call).
     "CAPTURE_NORMALISATION_ARGUMENTS_INVALID":
-        "manufacturer normalisation needs exactly one proposal id (a UUID) and no other mode",
+        "manufacturer normalisation takes no run id and no other mode (it claims its proposal)",
+    "CAPTURE_NORMALISATION_NOTHING_REQUESTED":
+        "no manufacturer normalisation is requested: the job starts nothing",
+    "CAPTURE_NORMALISATION_ALREADY_CLAIMED":
+        "the requested manufacturer normalisation is already claimed by another execution",
     "CAPTURE_NORMALISATION_DISABLED":
         "manufacturer normalisation is not enabled for this execution",
     "CAPTURE_NORMALISATION_FAILED": "the manufacturer normalisation did not record its outcome",
@@ -558,8 +565,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--execute only: capture this register capture group (PR-D1)")
     parser.add_argument("--register-directory", action="store_true", default=None,
                         help="--execute only: refresh the register directory (PR-D1)")
-    parser.add_argument("--normalisation-proposal-id", default=None,
-                        help="--execute only: the ONE guarded model call of this proposal (PR-D3)")
+    parser.add_argument("--normalisation-claim", action="store_true", default=None,
+                        help="--execute only: claim the requested normalisation and make its ONE "
+                             "guarded model call (PR-D3; the normalisation job's fixed mode)")
     parser.add_argument("--report-path", default=None,
                         help="optional path for the sanitized report; the only file written")
     return parser
@@ -704,10 +712,19 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
     shared = _shared_refusal(args, env)
     if shared:
         return shared
-    try:
-        UUID(str(args.run_id))
-    except (AttributeError, TypeError, ValueError):
-        return "CAPTURE_RUN_IDENTITY_INVALID"
+    if _supplied(args, NORMALISATION_ARGUMENTS):
+        # PR-D3: the run comes from the database's claim, never from an
+        # argument; nothing else may ride along.
+        if _supplied(args, WORK_SCOPE_ARGUMENTS) or _supplied(args, REGISTER_ARGUMENTS) \
+                or getattr(args, "run_id", None) is not None:
+            return "CAPTURE_NORMALISATION_ARGUMENTS_INVALID"
+        if (env.get(normalization.JOB_SWITCH) or "").strip().lower() not in TRUE_VALUES:
+            return "CAPTURE_NORMALISATION_DISABLED"
+    else:
+        try:
+            UUID(str(args.run_id))
+        except (AttributeError, TypeError, ValueError):
+            return "CAPTURE_RUN_IDENTITY_INVALID"
     if args.package_id != src.CKAN_PACKAGE_ID:
         return "CAPTURE_PACKAGE_NOT_SUPPORTED"
     if args.resource_id != src.WLTP_RESOURCE_ID:
@@ -734,20 +751,7 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
             return "CAPTURE_REGISTER_ARGUMENTS_INVALID"
         if (env.get(REGISTER_CAPTURE_JOB_FLAG) or "").strip().lower() not in TRUE_VALUES:
             return "CAPTURE_REGISTER_CAPTURE_DISABLED"
-    if _supplied(args, NORMALISATION_ARGUMENTS):
-        if _supplied(args, WORK_SCOPE_ARGUMENTS) or _supplied(args, REGISTER_ARGUMENTS) \
-                or _normalisation_request(args) is None:
-            return "CAPTURE_NORMALISATION_ARGUMENTS_INVALID"
-        if (env.get(normalization.JOB_SWITCH) or "").strip().lower() not in TRUE_VALUES:
-            return "CAPTURE_NORMALISATION_DISABLED"
     return ""
-
-
-def _normalisation_request(args: argparse.Namespace) -> str | None:
-    try:
-        return str(UUID(str(getattr(args, "normalisation_proposal_id", None))))
-    except (TypeError, ValueError):
-        return None
 
 
 def _register_request(args: argparse.Namespace) -> tuple[str, str] | None:
@@ -1523,7 +1527,8 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     """The authorized path. Every prerequisite has already passed."""
     # Already validated by `_refusal`, which every caller evaluates first.
     lease_seconds, interval = _lease_settings(env)
-    run_id = UUID(str(args.run_id))
+    normalise = bool(_supplied(args, NORMALISATION_ARGUMENTS))
+    run_id = None if normalise else UUID(str(args.run_id))
 
     # The project identity is verified a SECOND time, against `os.environ` --
     # the mapping the repository itself will read. `env` is a seam for tests
@@ -1534,6 +1539,23 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_PROJECT_MISMATCH")
 
     repository = _open_repository()
+
+    # PR-D3: the normalisation job names no run. It reads the single requested
+    # proposal (and the run the API prepared for it); none requested, it
+    # refuses and starts nothing. The claim below is the exclusivity.
+    proposal_id: str | None = None
+    if normalise:
+        try:
+            requested = repository.requested_manufacturer_normalization()
+        except Exception:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_UNAVAILABLE")
+        if not requested:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_NORMALISATION_NOTHING_REQUESTED")
+        try:
+            run_id = UUID(str(requested["run_id"]))
+            proposal_id = str(UUID(str(requested["id"])))
+        except (KeyError, TypeError, ValueError):
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_NORMALISATION_NOTHING_REQUESTED")
 
     # The run gate, server-side and BEFORE the claim: a mistyped identity
     # refuses instead of taking somebody else's lease.
@@ -1556,8 +1578,21 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_IDENTITY_MISMATCH")
 
     worker_id = f"operator-capture-{uuid4()}"
+    if normalise:
+        # PR-D3: ONE statement under the proposal lock -- still the requested
+        # proposal, and its run's lease through the same CAS below: a second
+        # execution cannot claim it.
+        try:
+            claimed = repository.claim_manufacturer_normalization(
+                proposal_id, run_id, worker_id, lease_seconds=lease_seconds)
+        except Exception:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_NORMALISATION_ALREADY_CLAIMED")
+    else:
+        try:
+            claimed = repository.claim_run(run_id, worker_id, lease_seconds=lease_seconds)
+        except Exception:
+            return EXIT_REFUSED, _envelope("refused", "CAPTURE_RUN_UNAVAILABLE")
     try:
-        claimed = repository.claim_run(run_id, worker_id, lease_seconds=lease_seconds)
         lease = WorkerLease(run_id=run_id, worker_id=worker_id,
                             attempt=int(claimed.get("attempt") or 0),
                             lease_token=str(claimed.get("lease_token") or ""))
@@ -1603,12 +1638,11 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     register = _register_request(args) if _supplied(args, REGISTER_ARGUMENTS) else None
     preparation: WorkScopePreparation | None = None
     register_document: dict[str, Any] | None = None
-    normalise = _normalisation_request(args) if _supplied(args, NORMALISATION_ARGUMENTS) else None
     supervisor.start()
-    if normalise is not None:
+    if normalise:
         # PR-D3: ONE guarded model call; no Government request, no client.
         try:
-            outcome = normalization.propose(repository, lease, normalise, env=env)
+            outcome = normalization.propose(repository, lease, proposal_id, env=env)
         except Exception:  # noqa: BLE001 - reduced to a static code
             supervisor.stop()
             _finalize(repository, lease, document={}, reason_code="CAPTURE_NORMALISATION_FAILED",

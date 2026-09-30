@@ -212,6 +212,18 @@ else
   posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
   printf 'NORMALISATION_JOB=%s (%s: %s)\n' "${posture%% *}" "$NORMALISATION_JOB" "${posture#* }"
   [[ "${posture%% *}" == "PASS" ]] || fact CODE_DEPLOYED NO "NORMALISATION_JOB: ${posture#* }"
+  # While it exists (it holds the provider key) the API runs it only as
+  # defined: no role carrying run.jobs.runWithOverrides, read from IAM.
+  if [[ "$normalisation_state" == "present" ]]; then
+    if [[ -z "$(milo_op API_SERVICE_ACCOUNT)" ]]; then
+      override="BLOCKED no API_SERVICE_ACCOUNT is configured, so who may override the job is unknown"
+    else
+      override="$(milo_normalisation_override_posture "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID" \
+        "serviceAccount:$(milo_op API_SERVICE_ACCOUNT)")"
+    fi
+    printf 'NORMALISATION_JOB_OVERRIDES=%s (%s)\n' "${override%% *}" "${override#* }"
+    [[ "${override%% *}" == "PASS" ]] || fact CODE_DEPLOYED NO "NORMALISATION_JOB_OVERRIDES: ${override#* }"
+  fi
 fi
 
 # --- DATABASE_READY: the EXACT migration set, then the path's schema ------

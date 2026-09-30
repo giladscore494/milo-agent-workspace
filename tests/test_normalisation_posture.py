@@ -23,8 +23,23 @@ FLAG = "MILO_ENABLE_MANUFACTURER_NORMALISATION"
 
 #: Answers every read the preflight makes; the job listing, the API's env and
 #: the secrets' IAM from the test's state. It never mutates anything.
+#: The permission sets the mocks answer `gcloud iam roles describe` with (the
+#: Cloud Run and basic roles, as IAM documents them; abridged to what matters).
+ROLES = {
+    "roles/run.jobsExecutor": ["run.executions.get", "run.executions.list", "run.jobs.get", "run.jobs.list",
+                               "run.jobs.run", "run.operations.get"],
+    "roles/run.jobsExecutorWithOverrides": ["run.executions.get", "run.jobs.get", "run.jobs.run",
+                                            "run.jobs.runWithOverrides"],
+    "roles/run.invoker": ["run.jobs.run", "run.routes.invoke"],
+    "roles/run.viewer": ["run.jobs.get", "run.jobs.list", "run.services.get"],
+    "roles/run.developer": ["run.jobs.create", "run.jobs.run", "run.jobs.runWithOverrides"],
+    "roles/editor": ["run.jobs.runWithOverrides", "secretmanager.versions.access"],
+    "roles/logging.logWriter": ["logging.logEntries.create"],
+}
+
 GCLOUD = r'''#!/usr/bin/env python3
 import json, os, sys
+ROLES = ''' + repr(ROLES) + r'''
 a = sys.argv[1:]
 if a[:2] == ["auth", "list"]: print("operator@example.test"); sys.exit(0)
 if a[:3] == ["config", "get-value", "project"]: print("test-project"); sys.exit(0)
@@ -39,12 +54,39 @@ if a[:3] == ["run", "services", "describe"] and "--format=json" in a:
     env = [{"name": "MILO_ENABLE_MANUFACTURER_NORMALISATION", "value": os.environ.get("T_FLAG", "false")}]
     print(json.dumps({"spec": {"template": {"spec": {"containers": [{"env": env}]}}}})); sys.exit(0)
 if a[:2] == ["secrets", "get-iam-policy"]:
-    members = ["serviceAccount:worker@test.iam.gserviceaccount.com"]
-    # The capture identity reads the Supabase pair; the provider key only when a test says so.
-    if a[2] != "TEST_PROVIDER_KEY" or os.environ.get("T_CAPTURE_READS_KEY"):
-        members.append("serviceAccount:capture@test.iam.gserviceaccount.com")
-    print(json.dumps({"bindings": [{"role": "roles/secretmanager.secretAccessor", "members": members}]}))
+    if a[2] in os.environ.get("T_POLICY_FAIL", "").split(","): sys.exit(1)
+    capture = "serviceAccount:capture@test.iam.gserviceaccount.com"
+    bindings = [{"role": "roles/secretmanager.secretAccessor",
+                 "members": ["serviceAccount:worker@test.iam.gserviceaccount.com"]}]
+    # The capture identity reads the Supabase pair; anything else only when a test says so.
+    if a[2] in ("TEST_SUPABASE_URL", "TEST_SUPABASE_KEY") \
+            or (a[2] == "TEST_PROVIDER_KEY" and os.environ.get("T_CAPTURE_READS_KEY")):
+        bindings[0]["members"].append(capture)
+    if a[2] in os.environ.get("T_CAPTURE_CONDITIONAL", "").split(","):
+        bindings.append({"role": "roles/secretmanager.secretAccessor", "members": [capture],
+                         "condition": {"title": "until-friday", "expression": "request.time < timestamp('2099-01-01T00:00:00Z')"}})
+    print(json.dumps({"bindings": bindings}))
     sys.exit(0)
+if a[:2] == ["projects", "get-iam-policy"]:
+    assert a[2] == "test-project", a
+    if os.environ.get("T_PROJECT_FAIL"): sys.exit(1)
+    bindings = [{"role": "roles/logging.logWriter", "members": ["serviceAccount:api@test.iam.gserviceaccount.com",
+                                                                "serviceAccount:capture@test.iam.gserviceaccount.com"]}]
+    for pair in filter(None, os.environ.get("T_PROJECT_ROLES", "").split(",")):
+        who, role = pair.split(":", 1)
+        bindings.append({"role": role, "members": [f"serviceAccount:{who}@test.iam.gserviceaccount.com"]})
+    print(json.dumps({"bindings": bindings})); sys.exit(0)
+if a[:3] == ["run", "jobs", "get-iam-policy"]:
+    assert a[4:8] == ["--region", "test-region", "--project", "test-project"], a
+    if os.environ.get("T_JOB_POLICY_FAIL"): sys.exit(1)
+    role = os.environ.get("T_API_JOB_ROLE", "roles/run.jobsExecutor")
+    print(json.dumps({"bindings": [{"role": role, "members": ["serviceAccount:api@test.iam.gserviceaccount.com"]},
+                                   {"role": "roles/run.viewer",
+                                    "members": ["serviceAccount:api@test.iam.gserviceaccount.com"]}]}))
+    sys.exit(0)
+if a[:3] == ["iam", "roles", "describe"]:
+    if a[3] in os.environ.get("T_ROLE_FAIL", "").split(","): sys.exit(1)
+    print(json.dumps({"name": a[3], "includedPermissions": ROLES[a[3]]})); sys.exit(0)
 for verb in ("create", "update", "delete", "add-iam-policy-binding", "remove-iam-policy-binding", "execute"):
     assert verb not in a, "the preflight is read-only: " + " ".join(a)
 sys.exit(0)
@@ -123,17 +165,27 @@ def test_the_stage_on_without_a_distinct_capture_identity_is_blocked(tmp_path):
     assert off["status"] == "PASS"
 
 
-def _verify(tmp_path: Path, job: str, flag: str, list_fails: bool = False):
+def _verify(tmp_path: Path, job: str, flag: str, list_fails: bool = False,
+            api_job_role: str = "roles/run.jobsExecutor"):
     tree = _verify_tree(tmp_path, readiness=READY, website=SITE_OFF, migration_detail=DB_OK)
     listing = "exit 1" if list_fails else (f"echo {JOB}" if job == "1" else "exit 0")
     described = json.dumps({"spec": {"template": {"spec": {"containers": [{"env": [
         {"name": FLAG, "value": flag}]}]}}}})
+    api = "serviceAccount:api@test.iam.gserviceaccount.com"
+    job_policy = json.dumps({"bindings": [{"role": api_job_role, "members": [api]}]})
+    roles = "".join(f"  \"iam roles describe {role} --format=json\") printf '%s\\n' "
+                    f"'{json.dumps({'includedPermissions': permissions})}' ;;\n"
+                    for role, permissions in ROLES.items())
     source = tree.bin.joinpath("gcloud").read_text().replace(
         'case "$*" in\n',
         'case "$*" in\n'
         f'  "run jobs list --region test-region --project test-project --filter=metadata.name={JOB} '
         f'--format=value(metadata.name)") {listing} ;;\n'
-        f"  *\"services describe\"*--format=json*) printf '%s\\n' '{described}' ;;\n", 1)
+        f"  *\"services describe\"*--format=json*) printf '%s\\n' '{described}' ;;\n"
+        f'  "run jobs get-iam-policy {JOB} --region test-region --project test-project --format=json") '
+        f"printf '%s\\n' '{job_policy}' ;;\n"
+        f"  \"projects get-iam-policy test-project --format=json\") printf '%s\\n' '{{\"bindings\": []}}' ;;\n"
+        + roles, 1)
     tree.tool("gcloud", source)
     return tree.run("production-verify.sh", "--gate", "deployed")
 
@@ -144,6 +196,17 @@ def test_the_deployed_gate_reads_the_normalisation_job_against_its_flag(tmp_path
     assert f"NORMALISATION_JOB={expected} ({JOB}: " in result.stdout, result.stdout
     assert _verdict(result.stdout)["CODE_DEPLOYED"] == ("VERIFIED" if expected == "PASS" else "NO")
     assert result.returncode == (0 if expected == "PASS" else 1)
+
+
+@pytest.mark.parametrize(("role", "expected"), [("roles/run.jobsExecutor", "PASS"),
+                                              ("roles/run.jobsExecutorWithOverrides", "BLOCKED"),
+                                              ("roles/run.developer", "BLOCKED")])
+def test_the_deployed_gate_refuses_an_api_that_can_override_the_job(tmp_path, role, expected):
+    """BLOCKER 1: while the job holds the provider key, an API that may run it
+    with overrides could run `python -c ...` with the key: not deployed."""
+    result = _verify(tmp_path, "1", "true", api_job_role=role)
+    assert f"NORMALISATION_JOB_OVERRIDES={expected} (" in result.stdout, result.stdout
+    assert _verdict(result.stdout)["CODE_DEPLOYED"] == ("VERIFIED" if expected == "PASS" else "NO")
 
 
 def test_the_deployed_gate_cannot_prove_an_unlisted_job(tmp_path):
@@ -180,6 +243,7 @@ ACTIVATE_GCLOUD = r'''#!/usr/bin/env python3
 """gcloud with one project's Cloud Run jobs, API service and secret IAM,
 remembered in $T_STATE. Anything it does not know fails loudly."""
 import json, os, sys
+ROLES = ''' + repr(ROLES) + r'''
 a = sys.argv[1:]
 with open(os.environ["OPS_TEST_CALLS"], "a") as log:
     log.write("gcloud " + " ".join(a) + "\n")
@@ -196,7 +260,7 @@ def doc(entry):
     env = [{"name": k, "value": v} for k, v in entry.get("env", {}).items()]
     env += [{"name": k, "valueFrom": {"secretKeyRef": {"name": v, "key": "latest"}}}
             for k, v in entry.get("secrets", {}).items()]
-    containers = [{"image": entry.get("image", ""), "env": env}]
+    containers = [{"image": entry.get("image", ""), "env": env, "args": entry.get("args", [])}]
     return {"spec": {"template": {"spec": {"serviceAccountName": entry.get("sa", ""),
                                            "template": {"spec": {"containers": containers}},
                                            "containers": containers}}}}
@@ -237,7 +301,8 @@ if a[:2] == ["run", "jobs"]:
         assert (verb == "create") == (name not in jobs), a
         secrets = {k: v.split(":")[0] for k, v in pairs(flag("--set-secrets")).items()}
         jobs[name] = {"image": flag("--image"), "sa": flag("--service-account"),
-                      "env": pairs(flag("--set-env-vars")), "secrets": secrets, "iam": []}
+                      "env": pairs(flag("--set-env-vars")), "secrets": secrets, "iam": [],
+                      "args": (flag("--args") or "").split(",")}
         save(); sys.exit(0)
     if verb == "delete":
         assert a[4:] == region + ["--quiet"], a
@@ -250,8 +315,17 @@ if a[:2] == ["run", "jobs"]:
         print(json.dumps({"bindings": [{"role": r, "members": m} for r, m in bindings.items()]})); sys.exit(0)
     if verb == "add-iam-policy-binding":
         entry = [flag("--role"), flag("--member")]
+        # STRICT: nothing may let anyone run the key-holding job with overrides.
+        assert not (name.endswith("-normalisation") and "run.jobs.runWithOverrides" in ROLES[entry[0]]), a
         if entry not in jobs[name]["iam"]: jobs[name]["iam"].append(entry)
         save(); sys.exit(0)
+if a[:2] == ["projects", "get-iam-policy"]:
+    assert a[2:] == ["test-project", "--format=json"], a
+    bindings = [{"role": r, "members": [m]} for r, m in state.get("project_iam", [])]
+    print(json.dumps({"bindings": bindings})); sys.exit(0)
+if a[:3] == ["iam", "roles", "describe"]:
+    assert a[4:] == ["--format=json"], a
+    print(json.dumps({"name": a[3], "includedPermissions": ROLES[a[3]]})); sys.exit(0)
 if a[:3] == ["secrets", "versions", "list"]:
     sys.exit(0)  # an optional secret (SENTRY_DSN) with no version: unbound
 if a[:2] == ["secrets", "get-iam-policy"]:
@@ -319,14 +393,35 @@ def test_apply_binds_the_key_on_the_normalisation_job_only_as_the_worker(tmp_pat
     # The RuntimePolicy caps the one call runs under (the reviewed envelope: this worker has none).
     assert job["env"]["MILO_MAX_COST_PER_RUN"] == "3.00" and job["env"]["MILO_DAILY_USER_BUDGET"] == "10.00"
     assert job["env"]["MILO_ENABLE_PAID_EXECUTION"] == "false"
-    assert job["env"]["MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"] == "false"
+    # BLOCKER 1: the job's invocation is its definition -- the claim mode, its
+    # switch baked on, no run id -- and the API may run it but never override it.
+    assert job["env"]["MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"] == "true"
+    assert job["args"][:2] == ["-m", "backend.catalog.operator_capture"]
+    assert job["args"][-1] == "--normalisation-claim" and "--run-id" not in job["args"]
+    assert ["roles/run.jobsExecutor", API_MEMBER] in job["iam"]
     assert ["roles/run.viewer", API_MEMBER] in job["iam"]
+    assert all("run.jobs.runWithOverrides" not in ROLES[role] for role, member in job["iam"] if member == API_MEMBER)
+    assert "API_MEMBER holds no role carrying run.jobs.runWithOverrides".replace("API_MEMBER", API_MEMBER) \
+        in result.stdout
     # No other job holds the key, and the capture identity reads nothing.
     assert "KIMI_API_KEY" not in state["jobs"]["test-capture"]["secrets"]
     assert [b for b in state["secret_iam"]["KIMI_API_KEY"] if b[1] == CAPTURE_MEMBER] == []
     assert state["api"]["env"][FLAG] == "true" and state["api"]["env"]["CLOUD_RUN_NORMALISATION_JOB"] == JOB
     assert state["api"]["env"]["MILO_ENABLE_PAID_EXECUTION"] == "false"
     assert "UNMOCKED" not in tree.tool_calls()
+
+
+@pytest.mark.parametrize("role", ["roles/run.developer", "roles/editor"])
+def test_apply_unwinds_when_the_api_could_override_the_job_through_the_project(tmp_path, role):
+    tree, env, path = activation(tmp_path)
+    state = json.loads(path.read_text())
+    state["project_iam"] = [[role, API_MEMBER]]
+    path.write_text(json.dumps(state))
+    result = _run(tree, env, "apply")
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert f"{role} (project)" in result.stdout and "could run the normalisation job with overrides" in result.stderr
+    after = json.loads(path.read_text())
+    assert JOB not in after["jobs"] and after["api"]["env"].get(FLAG) != "true"
 
 
 def test_apply_refuses_a_capture_identity_that_is_the_workers(tmp_path):
@@ -376,3 +471,75 @@ def test_remove_fails_while_the_job_survives_or_cannot_be_listed(tmp_path):
         result = _run(tree, env, "remove", **extra)
         assert result.returncode == 1 and "is still there, or could not be listed" in result.stderr
     assert "UNMOCKED" not in tree.tool_calls()
+
+
+# =============================================================================
+# The pre-merge review: the capture identity's check fails CLOSED, covers the
+# quota store too, and no runtime identity reaches secrets through the project;
+# the API never holds run.jobs.runWithOverrides on the key-holding job.
+# =============================================================================
+
+CAPTURE_CHECK = "iam:capture-cannot-read-provider-key"
+
+
+@pytest.mark.parametrize("secret", ["TEST_PROVIDER_KEY", "TEST_REDIS_URL", "TEST_REDIS_TOKEN"])
+def test_an_unreadable_secret_policy_is_blocked_never_a_pass(tmp_path, secret):
+    check = preflight(tmp_path, T_JOB="0", T_FLAG="false", T_POLICY_FAIL=secret)[CAPTURE_CHECK]
+    assert check["status"] == "BLOCKED" and "could not be read" in check["detail"] and secret in check["detail"]
+
+
+@pytest.mark.parametrize("secret", ["TEST_PROVIDER_KEY", "TEST_REDIS_URL", "TEST_REDIS_TOKEN"])
+def test_a_conditional_capture_binding_on_the_key_or_the_quota_store_is_blocked(tmp_path, secret):
+    check = preflight(tmp_path, T_JOB="0", T_FLAG="false", T_CAPTURE_CONDITIONAL=secret)[CAPTURE_CHECK]
+    assert check["status"] == "BLOCKED", check
+    assert f"{secret} (roles/secretmanager.secretAccessor conditional)" in check["detail"]
+    assert "normalisation-off" in check["detail"]
+
+
+def test_the_capture_check_passes_only_on_what_it_read(tmp_path):
+    check = preflight(tmp_path, T_JOB="0", T_FLAG="false")[CAPTURE_CHECK]
+    assert check["status"] == "PASS" and "quota store (read back)" in check["detail"]
+
+
+@pytest.mark.parametrize(("roles", "expected"), [
+    ("", "PASS"),
+    ("capture:roles/secretmanager.secretAccessor", "BLOCKED"),
+    ("api:roles/secretmanager.admin", "BLOCKED"),
+    ("api:roles/editor", "BLOCKED"),
+    ("capture:roles/owner", "BLOCKED"),
+    ("worker:roles/editor", "PASS"),          # only the capture and API identities are held to it here
+])
+def test_no_runtime_identity_reaches_every_secret_through_the_project(tmp_path, roles, expected):
+    check = preflight(tmp_path, T_JOB="0", T_FLAG="false", T_PROJECT_ROLES=roles)["iam:no-project-level-secret-access"]
+    assert check["status"] == expected, check
+    if expected == "BLOCKED":
+        # The report redacts identities; the role it names is enough to act on.
+        assert f"reach every secret: [REDACTED] {roles.split(':', 1)[1]}." in check["detail"]
+
+
+def test_an_unreadable_project_policy_is_blocked(tmp_path):
+    check = preflight(tmp_path, T_JOB="0", T_FLAG="false", T_PROJECT_FAIL="1")["iam:no-project-level-secret-access"]
+    assert check["status"] == "BLOCKED" and "could not be read" in check["detail"]
+
+
+@pytest.mark.parametrize(("state", "expected", "needle"), [
+    ({}, "PASS", "holds no role carrying run.jobs.runWithOverrides"),
+    ({"T_API_JOB_ROLE": "roles/run.jobsExecutorWithOverrides"}, "BLOCKED",
+     "roles/run.jobsExecutorWithOverrides (job)"),
+    ({"T_PROJECT_ROLES": "api:roles/run.developer"}, "BLOCKED", "roles/run.developer (project)"),
+    ({"T_JOB_POLICY_FAIL": "1"}, "BLOCKED", "could not be read"),
+    ({"T_ROLE_FAIL": "roles/run.jobsExecutor"}, "BLOCKED", "permissions of roles/run.jobsExecutor"),
+])
+def test_the_api_may_run_the_key_holding_job_but_never_override_it(tmp_path, state, expected, needle):
+    check = preflight(tmp_path, T_JOB="1", T_FLAG="true", **state)["iam:api-cannot-override-normalisation-job"]
+    assert check["status"] == expected and needle in check["detail"], check
+    # No job, nothing holds the key: nothing to override.
+    absent = preflight(tmp_path / "absent", T_JOB="0", T_FLAG="false", **state)
+    assert absent["iam:api-cannot-override-normalisation-job"]["status"] == "PASS"
+
+
+def test_a_job_left_behind_points_the_operator_at_normalisation_off(tmp_path):
+    check = preflight(tmp_path, T_JOB="1", T_FLAG="false")["cloud-run:normalisation-job"]
+    assert check["status"] == "BLOCKED"
+    assert "Website stage -> stage = normalisation-off" in check["detail"]
+    assert "website-stage.sh --stage normalisation-off" in check["detail"]

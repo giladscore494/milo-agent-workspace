@@ -59,8 +59,11 @@ class NormalizationMemoryMixin:
                                            grace_seconds: int) -> dict[str, Any]:
         names = [row.get("name") for row in input_rows]
         if not input_rows or len(input_rows) > normalization.MAX_INPUT_NAMES or len(set(names)) != len(names) \
-                or not all(isinstance(n, str) for n in names):
+                or not all(isinstance(n, str) and 1 <= len(n) <= 200 for n in names) \
+                or any(not isinstance(v, str) or len(v) > normalization.MAX_SAMPLE_CHARS
+                       for row in input_rows for v in [*(row.get("tozeret_nm") or []), *(row.get("samples") or [])]):
             raise _refused("CATALOG_NORMALIZATION_REQUEST_INVALID")
+        digest = hashlib.sha256(json.dumps(input_rows, sort_keys=True).encode()).hexdigest()
         register, state = self._register_state(), self._norm_state()
         with self.lock:
             latest = max((g for g in register["groups"].values() if g.get("kind") == "normalisation"),
@@ -69,6 +72,17 @@ class NormalizationMemoryMixin:
                 proposal = next(p for p in state["proposals"].values() if p["group_id"] == latest["id"])
                 return {"decision": "existing", "group": dict(latest),
                         "proposal": {k: v for k, v in proposal.items() if k != "input"}}
+            answered = self.latest_manufacturer_normalization_proposal("proposed")
+            if answered is not None and answered["input_sha256"] == digest:
+                return {"decision": "reused", "group": None, "proposal": answered}
+            if latest is not None:
+                ready_at = datetime.fromisoformat(str(latest["claimed_at"])) + timedelta(
+                    seconds=normalization.REQUEST_COOLDOWN_SECONDS)
+                if ready_at > datetime.now(UTC):
+                    proposal = next(p for p in state["proposals"].values() if p["group_id"] == latest["id"])
+                    return {"decision": "cooldown", "group": dict(latest),
+                            "proposal": {k: v for k, v in proposal.items() if k != "input"},
+                            "retry_after_seconds": int((ready_at - datetime.now(UTC)).total_seconds()) + 1}
             group = {"id": str(uuid4()), "kind": "normalisation", "register_version": None,
                      "requested_by": str(requested_by), "expected_rows": 0, "run_id": None,
                      "trigger_state": "claimed", "execution_name": None, "claimed_at": _now(),
@@ -76,17 +90,38 @@ class NormalizationMemoryMixin:
             register["groups"][group["id"]] = group
             proposal = {"id": str(uuid4()), "group_id": group["id"], "requested_by": str(requested_by),
                         "input": json.loads(json.dumps(input_rows)),
-                        "input_sha256": hashlib.sha256(json.dumps(input_rows, sort_keys=True).encode()).hexdigest(),
+                        "input_sha256": digest,
                         "status": "requested", "groups": None, "reason_code": None, "model": None,
                         "created_at": _now(), "updated_at": _now()}
             state["proposals"][proposal["id"]] = proposal
             return {"decision": "claimed", "group": dict(group),
                     "proposal": {k: v for k, v in proposal.items() if k != "input"}}
 
-    def latest_manufacturer_normalization_proposal(self) -> dict[str, Any] | None:
-        proposals = self._norm_state()["proposals"].values()
+    def latest_manufacturer_normalization_proposal(self, status: str | None = None) -> dict[str, Any] | None:
+        proposals = [p for p in self._norm_state()["proposals"].values() if status in (None, p["status"])]
         latest = max(proposals, key=lambda p: (str(p["created_at"]), p["id"]), default=None)
         return None if latest is None else {k: v for k, v in latest.items() if k != "input"}
+
+    def _latest_normalisation_group(self) -> dict[str, Any] | None:
+        return max((g for g in self._register_state()["groups"].values() if g.get("kind") == "normalisation"),
+                   key=lambda g: (str(g["claimed_at"]), g["id"]), default=None)
+
+    def requested_manufacturer_normalization(self) -> dict[str, Any] | None:
+        group = self._latest_normalisation_group()
+        if group is None or group.get("run_id") is None:
+            return None
+        proposal = next(p for p in self._norm_state()["proposals"].values() if p["group_id"] == group["id"])
+        return {"id": proposal["id"], "run_id": str(group["run_id"])} if proposal["status"] == "requested" else None
+
+    def claim_manufacturer_normalization(self, proposal_id: str, run_id: UUID, worker_id: str,
+                                         lease_seconds: int = 300) -> dict[str, Any]:
+        with self.lock:
+            if self.requested_manufacturer_normalization() != {"id": str(proposal_id), "run_id": str(run_id)}:
+                raise _refused("CATALOG_NORMALIZATION_NOT_REQUESTED")
+            try:
+                return self.claim_run(UUID(str(run_id)), worker_id, lease_seconds=lease_seconds)
+            except AppError:
+                raise _refused("CATALOG_NORMALIZATION_ALREADY_CLAIMED") from None
 
     def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         proposal = self._norm_state()["proposals"].get(str(proposal_id))

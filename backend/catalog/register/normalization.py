@@ -26,13 +26,18 @@ values underneath.
    internet; a strict JSON contract (`validate_groups`: every member is an
    input name, no name in two groups, a closed confidence, bounded text --
    anything else is refused with a static code). It runs in its OWN
-   normalisation job (the capture job's definition, run as the worker
-   identity; the only job holding the provider key) under an operator
-   capture run -- the lease and budget anchor the gateway's per-run and daily
-   caps (the deployment's RuntimePolicy) need; never a
-   product run -- behind its own flag, allowed while paid runs are disabled
-   (decision 33): the budget's kill switch is the per-execution switch the
-   API's invocation sets, not MILO_ENABLE_PAID_EXECUTION.
+   normalisation job (the capture job's image, run as the worker identity;
+   the only job holding the provider key), executed by the API WITHOUT
+   overrides: its fixed definition claims the single requested proposal and
+   its run from the database (`claim_manufacturer_normalization`), so no
+   caller can change what it runs. The operator capture run is the lease and
+   budget anchor the gateway's per-run and daily caps (the deployment's
+   RuntimePolicy) need; never a product run. Behind its own flag, allowed
+   while paid runs are disabled (decision 33): the job's switch is baked into
+   its definition, and the kill switch deletes the job -- not
+   MILO_ENABLE_PAID_EXECUTION. The same input is never asked twice (a
+   `proposed` answer to it is reused), and requests are spaced by
+   `REQUEST_COOLDOWN_SECONDS` (both in the database).
 
 3. Approval (decision 15, `approve`): high-confidence, non-conflicting groups
    together in one call; a low-confidence or conflicting group only alone.
@@ -52,8 +57,8 @@ from backend.production_config import TRUE_VALUES
 
 #: The website stage flag: the "Normalise manufacturers" button (API).
 FLAG = "MILO_ENABLE_MANUFACTURER_NORMALISATION"
-#: The capture job's per-execution switch (set only by the API's invocation);
-#: the model call's budget kill switch.
+#: The normalisation job's switch, baked into its definition (never an
+#: override); a job without it refuses the mode.
 JOB_SWITCH = NORMALISATION_SWITCH
 MODEL = "kimi-k3"
 AGENT, PHASE = "normaliser", "manufacturers"
@@ -61,6 +66,11 @@ MAX_SAMPLES = 3
 MAX_CANONICAL_CHARS = 120
 MAX_REASON_CHARS = 300
 MAX_INPUT_NAMES = 2000
+#: One evidence string (a tozeret_nm or a sample kinuy_mishari), at most.
+MAX_SAMPLE_CHARS = 120
+#: Between two requests that start a model call (restated from the database's
+#: request_manufacturer_normalization, which enforces it).
+REQUEST_COOLDOWN_SECONDS = 600
 
 #: The code-owned deterministic rules (the database holds the same list).
 RULES: Mapping[str, str] = {
@@ -80,6 +90,7 @@ REASONS: Mapping[str, str] = {
     "NORMALIZATION_POLICY_REFUSED": "the deployment's RuntimePolicy does not bound the call",
     "NORMALIZATION_JOB_DISABLED": "manufacturer normalisation is not enabled for this execution",
     "NORMALIZATION_PROPOSAL_UNKNOWN": "that normalisation proposal is not this run's",
+    "NORMALIZATION_INPUT_TOO_LARGE": "more unmapped source names than one call may carry",
 }
 
 
@@ -140,7 +151,12 @@ def deterministic_groups(names: Mapping[str, int], evidence: Mapping[str, Mappin
         if len(group) < 2:
             continue
         rule = "R2_TOZERET_CD" if any(find(n) == root for n in via_codes) else "R1_SPELLING"
-        canonical = sorted(group, key=lambda n: (-int(names.get(n) or 0), n.encode("utf-8")))[0].strip()
+        # The canonical name is a member's, and never one carrying a format
+        # character (a bidi override or a zero-width mark reads as another name).
+        readable = [n for n in group if not has_format_char(n)]
+        if not readable:
+            continue
+        canonical = sorted(readable, key=lambda n: (-int(names.get(n) or 0), n.encode("utf-8")))[0].strip()
         if len(canonical) > MAX_CANONICAL_CHARS:
             continue
         # A shared manufacturer code can join two brands of one maker: approved alone.
@@ -160,13 +176,18 @@ def _codes_key(name: str, evidence: Mapping[str, Mapping[str, Any]]) -> tuple[in
 
 def model_input(names: Mapping[str, int], evidence: Mapping[str, Mapping[str, Any]],
                 mapped: Iterable[str] = ()) -> list[dict[str, Any]]:
-    """Every source name still unmapped, with its evidence (bounded)."""
+    """Every source name still unmapped, with its evidence (bounded: at most
+    MAX_SAMPLES strings of at most MAX_SAMPLE_CHARS each). More names than one
+    call may carry is refused -- never silently cut."""
+    unmapped = sorted(set(names) - set(mapped), key=lambda n: n.encode("utf-8"))
+    if len(unmapped) > MAX_INPUT_NAMES:
+        raise NormalizationRefused("NORMALIZATION_INPUT_TOO_LARGE")
     rows = []
-    for name in sorted(set(names) - set(mapped), key=lambda n: n.encode("utf-8"))[:MAX_INPUT_NAMES]:
+    for name in unmapped:
         seen = evidence.get(name) or {}
         rows.append({"name": name, "rows": int(names[name] or 0),
-                     "tozeret_nm": [str(v) for v in (seen.get("tozeret_nm") or [])][:MAX_SAMPLES],
-                     "samples": [str(v) for v in (seen.get("samples") or [])][:MAX_SAMPLES]})
+                     "tozeret_nm": [str(v)[:MAX_SAMPLE_CHARS] for v in (seen.get("tozeret_nm") or [])][:MAX_SAMPLES],
+                     "samples": [str(v)[:MAX_SAMPLE_CHARS] for v in (seen.get("samples") or [])][:MAX_SAMPLES]})
     return rows
 
 
@@ -224,8 +245,9 @@ def validate_groups(text: Any, input_names: Iterable[str]) -> list[dict[str, Any
                 or canonical.strip() != canonical or group["confidence"] not in CONFIDENCE
                 or not isinstance(group["reason"], str) or len(group["reason"]) > MAX_REASON_CHARS
                 or not _storable(canonical) or not _storable(group["reason"])
+                or has_format_char(canonical)
                 or not isinstance(members, list) or not members
-                or not all(isinstance(m, str) for m in members)):
+                or not all(isinstance(m, str) and not has_format_char(m) for m in members)):
             raise NormalizationRefused("NORMALIZATION_OUTPUT_SHAPE_INVALID")
         if any(m not in names for m in members):
             raise NormalizationRefused("NORMALIZATION_MEMBER_INVENTED")
@@ -235,6 +257,14 @@ def validate_groups(text: Any, input_names: Iterable[str]) -> list[dict[str, Any
         out.append({"canonical": canonical, "members": list(members), "confidence": group["confidence"],
                     "reason": group["reason"]})
     return out
+
+
+def has_format_char(text: str) -> bool:
+    """A Unicode format character (category Cf: bidi overrides and isolates,
+    zero-width characters, the BOM, tag characters) -- refused in a proposed
+    canonical name and member (the database's
+    catalog_normalization_has_format_char restates the class)."""
+    return any(unicodedata.category(ch) == "Cf" for ch in text)
 
 
 def _storable(text: str) -> bool:
@@ -341,6 +371,16 @@ def current_map(repository: Any) -> dict[str, str]:
     return {str(e["source_tozar"]): str(e["canonical_name"]) for e in current.get("entries") or []}
 
 
+def current_map_or_empty(repository: Any) -> dict[str, str]:
+    """The mapping for a READ that only decorates source names (the Register
+    page, the catalog browser): unreadable, it degrades to the exact source
+    names ({}) instead of failing the page."""
+    try:
+        return current_map(repository)
+    except Exception:  # noqa: BLE001 - a label, never a gate
+        return {}
+
+
 def conflicts(group: Mapping[str, Any], active: Mapping[str, str],
               others: Sequence[Mapping[str, Any]]) -> bool:
     """A group conflicts when it re-maps an active name to another canonical,
@@ -352,6 +392,6 @@ def conflicts(group: Mapping[str, Any], active: Mapping[str, str],
 
 
 __all__ = ["AGENT", "CONFIDENCE", "FLAG", "INSTRUCTION", "JOB_SWITCH", "MODEL", "NormalizationRefused",
-           "OUTPUT_SCHEMA", "PHASE", "REASONS", "RULES", "conflicts", "current_map", "deterministic_groups",
-           "enabled", "guarded_gateway", "messages", "model_input", "propose", "spelling_key",
-           "validate_groups"]
+           "OUTPUT_SCHEMA", "PHASE", "REASONS", "REQUEST_COOLDOWN_SECONDS", "RULES", "conflicts", "current_map",
+           "current_map_or_empty", "deterministic_groups", "enabled", "guarded_gateway", "has_format_char",
+           "messages", "model_input", "propose", "spelling_key", "validate_groups"]

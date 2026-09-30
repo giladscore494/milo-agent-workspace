@@ -29,6 +29,21 @@
 --     proposal, a rule entry must name a code-owned rule, and every source
 --     name must be in the latest register directory.
 --
+--   * The normalisation job is executed WITHOUT overrides (its definition is
+--     fixed): it reads the single requested proposal
+--     (requested_manufacturer_normalization) and claims it together with its
+--     run's lease (claim_manufacturer_normalization -- the existing
+--     claim_run_lease CAS, under the proposal lock), so two executions never
+--     both claim it.
+--   * A proposal moves once: requested -> proposed (its groups re-validated
+--     against its input by a trigger) or requested -> refused; nothing else
+--     is ever updated, so validated groups cannot be rewritten afterwards.
+--   * Rule provenance (R1_SPELLING / R2_TOZERET_CD) is trusted from the
+--     service layer: the database checks the rule id and that every member is
+--     a tozar of the latest directory, but does not recompute the rule (R1's
+--     key is Unicode NFKC + case folding + category stripping, which SQL
+--     cannot restate exactly). Model provenance is checked in full.
+--
 -- Filters and "Add to plan" keep working on the exact source values: no
 -- existing table, function or Mapping Plan contract is changed beyond the
 -- group kind. Forward-only and rerun-safe.
@@ -111,6 +126,22 @@ create trigger catalog_manufacturer_normalization_entries_append_only
 -- ---------------------------------------------------------------------------
 -- 3. The model output contract, checked in the database too.
 -- ---------------------------------------------------------------------------
+-- A name carries no Unicode format character (category Cf: bidi overrides and
+-- isolates, zero-width characters, the soft hyphen, the BOM, tag characters):
+-- they make two different names read the same. The class restates Python's
+-- unicodedata category Cf (backend/catalog/register/normalization.py).
+create or replace function public.catalog_normalization_has_format_char(p_text text)
+returns boolean
+language sql
+immutable
+set search_path = pg_catalog
+as $$
+  select p_text ~ ('[' || U&'\00AD\0600-\0605\061C\06DD\070F\0890\0891\08E2\180E\200B-\200F\202A-\202E'
+                   || U&'\2060-\2064\2066-\206F\FEFF\FFF9-\FFFB'
+                   || U&'\+0110BD\+0110CD\+013430-\+01343F\+01BCA0-\+01BCA3\+01D173-\+01D17A'
+                   || U&'\+0E0001\+0E0020-\+0E007F' || ']')
+$$;
+
 -- [{"canonical": text, "members": [input names], "confidence": "high"|"low",
 --   "reason": text}], every member an input name, none in two groups.
 create or replace function public.catalog_normalization_groups_valid(p_groups jsonb, p_input jsonb)
@@ -134,11 +165,13 @@ as $$
                  char_length(g->>'canonical') between 1 and 120
                  -- no leading/trailing whitespace (Python's strip) and no control character
                  and g->>'canonical' !~ '^[[:space:]]|[[:space:]]$' and g->>'canonical' !~ '[[:cntrl:]]'
+                 and not public.catalog_normalization_has_format_char(g->>'canonical')
                  and g->>'confidence' in ('high', 'low')
                  and char_length(g->>'reason') <= 300 and g->>'reason' !~ '[[:cntrl:]]'
                  and jsonb_array_length(g->'members') >= 1
                  and not exists (select 1 from jsonb_array_elements(g->'members') m
                                   where jsonb_typeof(m) <> 'string'
+                                     or public.catalog_normalization_has_format_char(m #>> '{}')
                                      or not exists (select 1 from jsonb_array_elements(p_input) i
                                                      where i->>'name' = m #>> '{}')), false)
              end)
@@ -153,7 +186,12 @@ $$;
 -- ---------------------------------------------------------------------------
 
 -- One live normalisation at a time (the group liveness rule, as a directory
--- refresh). A live one answers `existing` and writes nothing.
+-- refresh). A live one answers `existing` and writes nothing. A press never
+-- spends twice on the same question: when the newest `proposed` proposal was
+-- made from the SAME input (input_sha256), it is answered (`reused`) and no
+-- model call starts; and a new request waits out a cooldown after the last one
+-- (`cooldown`, with the seconds left) -- 600 s, owned here and restated as
+-- backend/catalog/register/normalization.py REQUEST_COOLDOWN_SECONDS.
 create or replace function public.request_manufacturer_normalization(
   p_requested_by uuid, p_grace_seconds integer, p_input jsonb
 ) returns jsonb
@@ -163,14 +201,22 @@ as $$
 declare
   v_group public.catalog_register_capture_groups%rowtype;
   v_proposal public.catalog_manufacturer_normalization_proposals%rowtype;
+  v_sha text;
+  v_cooldown constant integer := 600;
 begin
   if p_requested_by is null or p_grace_seconds is null or p_grace_seconds not between 300 and 86400
      or p_input is null or jsonb_typeof(p_input) <> 'array' or jsonb_array_length(p_input) not between 1 and 2000
      or exists (select 1 from jsonb_array_elements(p_input) i
-                 where jsonb_typeof(i) <> 'object' or jsonb_typeof(i->'name') <> 'string')
+                 where jsonb_typeof(i) <> 'object' or jsonb_typeof(i->'name') <> 'string'
+                    or char_length(i->>'name') not between 1 and 200
+                    -- the evidence is bounded per string, not only per list
+                    or exists (select 1 from jsonb_array_elements(
+                                 coalesce(i->'tozeret_nm', '[]'::jsonb) || coalesce(i->'samples', '[]'::jsonb)) v
+                                where jsonb_typeof(v) <> 'string' or char_length(v #>> '{}') > 120))
      or (select count(*) <> count(distinct i->>'name') from jsonb_array_elements(p_input) i) then
     raise exception 'CATALOG_NORMALIZATION_REQUEST_INVALID: invalid normalisation request' using errcode = '22023';
   end if;
+  v_sha := encode(sha256(convert_to(p_input::text, 'UTF8')), 'hex');
   perform pg_advisory_xact_lock(hashtext('public.catalog_manufacturer_normalization'));
   select * into v_group from public.catalog_register_capture_groups
    where kind = 'normalisation' order by claimed_at desc, id desc limit 1;
@@ -179,11 +225,24 @@ begin
     return jsonb_build_object('decision', 'existing', 'group', to_jsonb(v_group),
                               'proposal', to_jsonb(v_proposal) - 'input');
   end if;
+  -- The same question already has an answer: no second model call.
+  select * into v_proposal from public.catalog_manufacturer_normalization_proposals
+   where status = 'proposed' order by created_at desc, id desc limit 1;
+  if found and v_proposal.input_sha256 = v_sha then
+    return jsonb_build_object('decision', 'reused', 'group', null, 'proposal', to_jsonb(v_proposal) - 'input');
+  end if;
+  if v_group.id is not null and v_group.claimed_at > now() - make_interval(secs => v_cooldown) then
+    select * into v_proposal from public.catalog_manufacturer_normalization_proposals where group_id = v_group.id;
+    return jsonb_build_object('decision', 'cooldown', 'group', to_jsonb(v_group),
+                              'proposal', to_jsonb(v_proposal) - 'input',
+                              'retry_after_seconds',
+                              ceil(extract(epoch from v_group.claimed_at + make_interval(secs => v_cooldown) - now()))::integer);
+  end if;
   insert into public.catalog_register_capture_groups (kind, register_version, requested_by, expected_rows)
   values ('normalisation', null, p_requested_by, 0)
   returning * into v_group;
   insert into public.catalog_manufacturer_normalization_proposals (group_id, requested_by, input, input_sha256)
-  values (v_group.id, p_requested_by, p_input, encode(sha256(convert_to(p_input::text, 'UTF8')), 'hex'))
+  values (v_group.id, p_requested_by, p_input, v_sha)
   returning * into v_proposal;
   return jsonb_build_object('decision', 'claimed', 'group', to_jsonb(v_group),
                             'proposal', to_jsonb(v_proposal) - 'input');
@@ -233,6 +292,83 @@ begin
 end;
 $$;
 
+-- A proposal moves ONCE, and only forward: requested -> proposed (its groups
+-- valid against its own input) or requested -> refused. Nothing else of it is
+-- ever updated -- the validated groups cannot be rewritten below the RPCs.
+create or replace function public.catalog_normalization_proposal_transition()
+returns trigger
+language plpgsql
+set search_path = pg_catalog
+as $$
+begin
+  if old.status <> 'requested' or new.status not in ('proposed', 'refused')
+     or new.id is distinct from old.id or new.group_id is distinct from old.group_id
+     or new.requested_by is distinct from old.requested_by or new.input is distinct from old.input
+     or new.input_sha256 is distinct from old.input_sha256 or new.created_at is distinct from old.created_at
+     or (new.status = 'proposed' and not public.catalog_normalization_groups_valid(new.groups, old.input)) then
+    raise exception 'CATALOG_NORMALIZATION_PROPOSAL_IMMUTABLE: a proposal moves once, from requested to proposed or refused'
+      using errcode = '42501';
+  end if;
+  return new;
+end;
+$$;
+drop trigger if exists catalog_manufacturer_normalization_proposals_transition
+  on public.catalog_manufacturer_normalization_proposals;
+create trigger catalog_manufacturer_normalization_proposals_transition
+  before update on public.catalog_manufacturer_normalization_proposals
+  for each row execute function public.catalog_normalization_proposal_transition();
+
+-- The normalisation job's work, read: the newest normalisation request, while
+-- it is still `requested` and the API has recorded its run -- {id, run_id} --
+-- else null (the job then starts nothing).
+create or replace function public.requested_manufacturer_normalization()
+returns jsonb
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select case when p.status = 'requested' and g.run_id is not null
+              then jsonb_build_object('id', p.id, 'run_id', g.run_id) end
+    from public.catalog_register_capture_groups g
+    join public.catalog_manufacturer_normalization_proposals p on p.group_id = g.id
+   where g.kind = 'normalisation'
+   order by g.claimed_at desc, g.id desc
+   limit 1
+$$;
+
+-- ...and claimed: under the proposal lock, still exactly that request, and its
+-- run's lease through the existing claim_run_lease CAS (the fencing the
+-- outcome's record_manufacturer_normalization_proposal asserts). A second
+-- execution finds the lease held (CATALOG_NORMALIZATION_ALREADY_CLAIMED) or the
+-- proposal answered (CATALOG_NORMALIZATION_NOT_REQUESTED).
+create or replace function public.claim_manufacturer_normalization(
+  p_proposal_id uuid, p_run_id uuid, p_worker_id text, p_lease_seconds integer
+) returns setof public.runs
+language plpgsql
+-- claim_run_lease (migration 012) pins no search_path and draws its lease token
+-- from pgcrypto's gen_random_bytes, which lives in `public` here and in
+-- `extensions` on Supabase: both are on this (security invoker) function's path.
+set search_path = pg_catalog, public, extensions
+as $$
+declare
+  v_run public.runs%rowtype;
+begin
+  perform pg_advisory_xact_lock(hashtext('public.catalog_manufacturer_normalization'));
+  if p_proposal_id is null or p_run_id is null
+     or public.requested_manufacturer_normalization()
+        is distinct from jsonb_build_object('id', p_proposal_id, 'run_id', p_run_id) then
+    raise exception 'CATALOG_NORMALIZATION_NOT_REQUESTED: that normalisation is not the requested one'
+      using errcode = '40001';
+  end if;
+  select * into v_run from public.claim_run_lease(p_run_id, p_worker_id, p_lease_seconds);
+  if not found then
+    raise exception 'CATALOG_NORMALIZATION_ALREADY_CLAIMED: another execution holds this normalisation'
+      using errcode = '40001';
+  end if;
+  return next v_run;
+end;
+$$;
+
 -- The active mapping: the newest version's entries.
 create or replace function public.catalog_manufacturer_normalization_current()
 returns jsonb
@@ -275,6 +411,7 @@ begin
      or exists (select 1 from jsonb_array_elements(p_entries) e
                  where jsonb_typeof(e) <> 'object' or jsonb_typeof(e->'source_tozar') <> 'string'
                     or jsonb_typeof(e->'canonical_name') <> 'string'
+                    or public.catalog_normalization_has_format_char(e->>'canonical_name')
                     or e->>'provenance' not in ('rule', 'model'))
      or (select count(*) <> count(distinct e->>'source_tozar') from jsonb_array_elements(p_entries) e) then
     raise exception 'CATALOG_NORMALIZATION_APPROVAL_INVALID: invalid approval' using errcode = '22023';
@@ -452,10 +589,13 @@ declare
   v_writes text[] := array[
     'public.request_manufacturer_normalization(uuid,integer,jsonb)',
     'public.record_manufacturer_normalization_proposal(uuid,text,integer,text,uuid,text,jsonb,text,text)',
+    'public.claim_manufacturer_normalization(uuid,uuid,text,integer)',
+    'public.requested_manufacturer_normalization()',
     'public.approve_manufacturer_normalization(uuid,integer,jsonb)',
     'public.reject_manufacturer_normalization_group(uuid,jsonb)'];
   v_reads text[] := array[
     'public.catalog_normalization_groups_valid(jsonb,jsonb)',
+    'public.catalog_normalization_has_format_char(text)',
     'public.catalog_manufacturer_normalization_current()',
     'public.catalog_manufacturer_evidence()'];
   v_tables text[] := array[

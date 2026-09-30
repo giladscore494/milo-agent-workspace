@@ -272,7 +272,9 @@ class Repository(Protocol):
     def manufacturer_normalization_current(self) -> dict[str, Any]: ...
     def catalog_manufacturer_evidence(self) -> list[dict[str, Any]]: ...
     def request_manufacturer_normalization(self, requested_by: UUID, input_rows: list[dict[str, Any]], *, grace_seconds: int) -> dict[str, Any]: ...
-    def latest_manufacturer_normalization_proposal(self) -> dict[str, Any] | None: ...
+    def latest_manufacturer_normalization_proposal(self, status: str | None = None) -> dict[str, Any] | None: ...
+    def requested_manufacturer_normalization(self) -> dict[str, Any] | None: ...
+    def claim_manufacturer_normalization(self, proposal_id: str, run_id: UUID, worker_id: str, lease_seconds: int = 300) -> dict[str, Any]: ...
     def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None: ...
     def record_manufacturer_normalization_proposal(self, run_id: UUID, proposal_id: str, status: str, groups: list[dict[str, Any]] | None, reason_code: str | None, model: str, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
     def approve_manufacturer_normalization(self, approved_by: UUID, expected_version: int, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
@@ -2631,7 +2633,8 @@ class SupabaseRepository:
     _NORMALIZATION_REFUSALS = ("CATALOG_NORMALIZATION_REQUEST_INVALID", "CATALOG_NORMALIZATION_NOT_THIS_RUN",
                                "CATALOG_NORMALIZATION_ALREADY_RECORDED", "CATALOG_NORMALIZATION_OUTPUT_INVALID",
                                "CATALOG_NORMALIZATION_APPROVAL_INVALID", "CATALOG_NORMALIZATION_VERSION_STALE",
-                               "CATALOG_NORMALIZATION_REJECTION_INVALID")
+                               "CATALOG_NORMALIZATION_REJECTION_INVALID", "CATALOG_NORMALIZATION_NOT_REQUESTED",
+                               "CATALOG_NORMALIZATION_ALREADY_CLAIMED")
 
     def manufacturer_normalization_current(self) -> dict[str, Any]:
         try:
@@ -2656,11 +2659,35 @@ class SupabaseRepository:
             "p_requested_by": str(requested_by), "p_grace_seconds": int(grace_seconds), "p_input": list(input_rows)},
             "manufacturer normalisation", refusals=self._NORMALIZATION_REFUSALS)
 
-    def latest_manufacturer_normalization_proposal(self) -> dict[str, Any] | None:
-        rows = self._many(self.client.table("catalog_manufacturer_normalization_proposals")
-                          .select("id, group_id, status, groups, reason_code, model, created_at, updated_at")
-                          .order("created_at", desc=True).order("id").limit(1))
+    def latest_manufacturer_normalization_proposal(self, status: str | None = None) -> dict[str, Any] | None:
+        """The newest proposal, or the newest of one status (the approval
+        screen reads the newest `proposed` one: a later refused or requested
+        proposal never hides approvable groups)."""
+        query = (self.client.table("catalog_manufacturer_normalization_proposals")
+                 .select("id, group_id, status, groups, reason_code, model, input_sha256, created_at, updated_at"))
+        if status is not None:
+            query = query.eq("status", status)
+        rows = self._many(query.order("created_at", desc=True).order("id").limit(1))
         return rows[0] if rows else None
+
+    def requested_manufacturer_normalization(self) -> dict[str, Any] | None:
+        """PR-D3, the normalisation job: the requested proposal and its run
+        ({id, run_id}), else None."""
+        data = self._guarded_rpc("requested_manufacturer_normalization", {}, "manufacturer normalisation")
+        return data if isinstance(data, dict) and data.get("id") and data.get("run_id") else None
+
+    def claim_manufacturer_normalization(self, proposal_id: str, run_id: UUID, worker_id: str,
+                                         lease_seconds: int = 300) -> dict[str, Any]:
+        """PR-D3: that proposal, still requested, and its run's lease -- one
+        statement; the run row as claimed (claim_run_lease's CAS)."""
+        data = self._guarded_rpc("claim_manufacturer_normalization", {
+            "p_proposal_id": str(proposal_id), "p_run_id": str(run_id), "p_worker_id": worker_id,
+            "p_lease_seconds": int(lease_seconds)}, "manufacturer normalisation claim",
+            refusals=self._NORMALIZATION_REFUSALS)
+        rows = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+        if not rows:
+            raise AppError("CATALOG_NORMALIZATION_ALREADY_CLAIMED", "the normalisation is already claimed", 409)
+        return rows[0]
 
     def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None:
         rows = self._many(self.client.table("catalog_manufacturer_normalization_proposals").select("*")

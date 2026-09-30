@@ -14,6 +14,13 @@ name: Website stage
 #                    (refused until scripts/ops/setup-register-archive.sh ran)
 #   catalog-browser  PR-L1, the read-only catalog browser:
 #                    website-execution-activate.sh --apply-catalog-browser
+#   manufacturer-normalisation
+#                    PR-D3: website-execution-activate.sh --apply-manufacturer-normalisation
+#   normalisation-off
+#                    PR-D3 OFF: website-execution-activate.sh
+#                    --remove-manufacturer-normalisation (the API flag off, the
+#                    normalisation job deleted, the capture identity's access
+#                    revoked, each read back) -- no deploy, no kill switch
 #   all              both, then register-capture (the capture job ensured
 #                    once), then catalog-browser
 # Each canonical tool runs behind its own deployed gate, from the DEPLOYED
@@ -26,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       stage:
-        description: "Which plan tools to turn on"
+        description: "Which plan tools to turn on (normalisation-off: turn manufacturer normalisation OFF, read back)"
         required: true
         default: both
         type: choice
@@ -37,6 +44,7 @@ on:
           - register-capture
           - catalog-browser
           - manufacturer-normalisation
+          - normalisation-off
           - all
       sha:
         description: "The deployed release SHA (empty: the release production runs)"
@@ -75,8 +83,8 @@ jobs:
             exit 1
           fi
           case "${STAGE_INPUT}" in
-            plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all) ;;
-            *) echo "stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation or all."; exit 1 ;;
+            plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | normalisation-off | all) ;;
+            *) echo "stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation, normalisation-off or all."; exit 1 ;;
           esac
           if [[ -n "${SHA_INPUT}" && ! "${SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "sha must be empty or exactly 40 lowercase hexadecimal characters."

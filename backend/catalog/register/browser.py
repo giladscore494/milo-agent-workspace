@@ -108,9 +108,10 @@ def browse(repo: Any, user_id: UUID, project_id: UUID, level: str, params: Mappi
         answer = repo.catalog_browser_manufacturers(filters, **page)
         # PR-D3: the approved canonical manufacturer beside each exact tozar
         # (every filter and "Add to plan" keep the tozar).
-        from backend.catalog.register.normalization import current_map
+        # A label only: an unreadable mapping degrades to the exact names.
+        from backend.catalog.register.normalization import current_map_or_empty
 
-        canonical = current_map(repo)
+        canonical = current_map_or_empty(repo)
         return {**answer, "items": [{**item, "canonical_manufacturer": canonical.get(str(item.get("tozar")))}
                                     for item in answer.get("items") or []]}
     tozar = _text(params, "tozar", required=True)

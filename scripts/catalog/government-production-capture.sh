@@ -72,6 +72,10 @@ Modes (exactly one; default --plan):
                 and -- on this job only -- the provider key and the shared quota
                 store. It runs as the WORKER identity (the one allowed to read
                 the key); the capture job and the capture identity never hold it.
+                Its invocation is FIXED (--normalisation-claim, its switch on):
+                the API runs it WITHOUT overrides (roles/run.jobsExecutor, no
+                run.jobs.runWithOverrides), and the job claims the requested
+                proposal from the database.
 
 Options:
   --enable-catalog-execution
@@ -294,6 +298,15 @@ ensure_normalisation_job() {
        > /dev/null 2>&1; then
     verb="update"
   fi
+  # The WHOLE invocation is the definition: the entrypoint's fixed arguments
+  # (no run id -- the job claims the requested proposal and its run) and the
+  # mode's switch on. Nothing is left for an execution to override.
+  local job_args env_args off="${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=false"
+  job_args="$(python3 "$CAPTURE_INVOCATION" normalisation-job-args --project-ref "$PROJECT_REF")" \
+    || fail "the normalisation job's arguments could not be built" 2
+  env_args="$(build_env_args)"
+  [[ "$env_args" == *"$off"* ]] || fail "the capture environment does not pin ${off}" 2
+  env_args="${env_args/"$off"/${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=true}"
   printf 'Normalisation job: %s (%s)\n' "$NORMALISATION_JOB" "$verb"
   gcloud run jobs "$verb" "$NORMALISATION_JOB" \
     --image "$WORKER_IMAGE" \
@@ -301,13 +314,31 @@ ensure_normalisation_job() {
     --project "$PROJECT_ID" \
     --service-account "$worker_sa" \
     --command python \
-    --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE}" \
-    --set-env-vars "$(build_env_args)${MILO_ENV_VAR_DELIMITER}${MILO_NORMALISATION_POLICY_VARS}" \
+    --args="-m,${MILO_CAPTURE_ENTRYPOINT_MODULE},${job_args}" \
+    --set-env-vars "${env_args}${MILO_ENV_VAR_DELIMITER}${MILO_NORMALISATION_POLICY_VARS}" \
     --set-secrets "$(build_secret_args),KIMI_API_KEY=${provider}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_URL=${redis_url}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_TOKEN=${redis_token}:${MILO_SECRET_VERSION}" \
     --max-retries 0 \
     --task-timeout "$TASK_TIMEOUT" \
     --tasks 1
-  grant_api_run_with_overrides "$NORMALISATION_JOB"
+  grant_api_run_without_overrides "$NORMALISATION_JOB"
+}
+
+# PR-D3: the API identity may RUN the normalisation job, exactly as defined,
+# and read it (the release check): roles/run.jobsExecutor -- run.jobs.run and
+# run.jobs.get, NOT run.jobs.runWithOverrides. That job holds the provider
+# key; an override (`python -c ...`) would hand the key to whoever controls
+# the API. website-execution-activate.sh reads back that no role the API holds
+# on it carries run.jobs.runWithOverrides.
+grant_api_run_without_overrides() {
+  local api_sa job="$1"
+  api_sa="$(milo_op API_SERVICE_ACCOUNT)"
+  if [[ -z "$api_sa" ]]; then
+    printf 'NOTE: no API_SERVICE_ACCOUNT configured; the website cannot execute %s.\n' "$job"
+    return 0
+  fi
+  gcloud run jobs add-iam-policy-binding "$job" --region "$REGION" --project "$PROJECT_ID" \
+    --member "serviceAccount:${api_sa}" --role "$MILO_API_NORMALISATION_RUN_ROLE" > /dev/null
+  printf 'API identity may run %s as defined (no overrides): %s\n' "$job" "$api_sa"
 }
 
 # E': the API's Prepare route executes THIS job (the same invocation this
