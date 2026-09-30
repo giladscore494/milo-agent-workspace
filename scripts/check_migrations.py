@@ -279,6 +279,17 @@ REQUIRED_PER_FILE["20261002000100_catalog_register_compaction.sql"] = [
     "public.catalog_raw_record_content_sha256(r)",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20261003000100_catalog_manufacturer_normalization.sql"] = [
+    # PR-D3: the source tozar never changes; the normalisation is versioned
+    # and append-only, the model's output is validated again in the database,
+    # and a model entry must be exactly a proposed group.
+    "create trigger catalog_manufacturer_normalization_entries_append_only",
+    "public.catalog_normalization_groups_valid(p_groups, v_proposal.input)",
+    "perform public.assert_worker_lease(p_run_id, p_worker_id, p_attempt, p_lease_token);",
+    "catalog_normalization_version_stale",
+    "enable row level security",
+    "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
+]
 REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
     # P27: the queue build leaves PR-U's placeholder records out (never
     # eligible, never queued), records each with its reason and counts them.

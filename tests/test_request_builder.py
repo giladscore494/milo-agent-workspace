@@ -139,6 +139,8 @@ def test_role_policies_are_the_reviewed_starting_point():
         ("commander", "replanning"): ("high", 16_000, 3_000),
         ("worker", "execute"): ("low", 12_000, 3_000),
         ("verifier", "verification"): ("high", 24_000, 4_000),
+        # PR-D3: the one manufacturer-normalisation call (never part of a run).
+        ("normaliser", "manufacturers"): ("low", 16_000, 4_000),
     }
     assert role_policy("worker:any-task-id", "execute") is ROLE_POLICIES[("worker", "execute")]
 

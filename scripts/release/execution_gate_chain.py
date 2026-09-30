@@ -412,6 +412,36 @@ GATE_CHAIN: tuple[Gate, ...] = (
         stage=2,
     ),
     Gate(
+        name="MILO_ENABLE_MANUFACTURER_NORMALISATION",
+        surface=API_RUNTIME,
+        current_default="false",
+        required_for_first_run=(
+            "NO — it lets a project member start ONE guarded K3 call that proposes "
+            "manufacturer groups (the reviewed per-run and daily caps; not a run)"),
+        when_to_enable=(
+            "After the register-capture stage, while paid runs may stay off "
+            "(website-execution-activate.sh --apply-manufacturer-normalisation)"),
+        requires_redeploy=UPDATE_SERVICE,
+        failure_behavior_when_off=(
+            "POST /projects/{id}/register/normalisation is refused by the surface "
+            "guard (403) and the button is not offered. No model is called."),
+        stage=2,
+    ),
+    Gate(
+        name="MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB",
+        surface=WORKER_RUNTIME,
+        current_default="false",
+        required_for_first_run="NO — only for one manufacturer normalisation call",
+        when_to_enable=(
+            "Never on a service or a job definition. The API's normalisation "
+            "invocation turns it on for ONE capture-job execution"),
+        requires_redeploy=UPDATE_JOB,
+        failure_behavior_when_off=(
+            "The capture entrypoint refuses the normalisation mode "
+            "(CAPTURE_NORMALISATION_DISABLED), and the budget refuses the call."),
+        stage=2,
+    ),
+    Gate(
         name="MILO_ENABLE_REGISTER_CAPTURE_JOB",
         surface=WORKER_RUNTIME,
         current_default="false",

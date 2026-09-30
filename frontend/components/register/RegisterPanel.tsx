@@ -20,6 +20,13 @@ import {
   parseRegister,
 } from '@/lib/register';
 import { safeText } from '@/lib/sanitize';
+import { NormalisationClient, NormalisationSection } from './NormalisationSection';
+
+const normalisationClient: NormalisationClient = {
+  read: (projectId) => api.normalisation(projectId),
+  request: (projectId, conversationId) => api.requestNormalisation(projectId, conversationId),
+  approve: (projectId, version, groups) => api.approveNormalisation(projectId, version, groups),
+};
 
 /** The three calls the page makes; injectable so tests need no network. */
 export type RegisterClient = {
@@ -42,6 +49,7 @@ export type RegisterPanelProps = {
   /** The open conversation a capture is recorded under; capture needs one. */
   conversationId?: string;
   client?: RegisterClient;
+  normalisation?: NormalisationClient;
 };
 
 type Loaded =
@@ -61,7 +69,8 @@ type Loaded =
  * larger than the cap is captured alone. Every state shown comes from the
  * server's durable rows, read again after every action.
  */
-export function RegisterPanel({ projectId, conversationId, client = defaultClient }: RegisterPanelProps) {
+export function RegisterPanel({ projectId, conversationId, client = defaultClient,
+  normalisation = normalisationClient }: RegisterPanelProps) {
   const [loaded, setLoaded] = useState<Loaded>({ kind: 'idle' });
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
@@ -195,6 +204,9 @@ export function RegisterPanel({ projectId, conversationId, client = defaultClien
                 onReload={() => void load(projectId)}
               />
             )}
+            {projectId && (
+              <NormalisationSection projectId={projectId} conversationId={conversationId} client={normalisation} />
+            )}
           </>
         )}
       </div>
@@ -301,7 +313,12 @@ function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, 
                         onChange={() => onToggle(item.tozar)} />
                     )}
                   </td>
-                  <td>{safeText(item.tozar)}</td>
+                  <td>
+                    {safeText(item.tozar)}
+                    {item.canonicalManufacturer && (
+                      <span className="note"> ({safeText(item.canonicalManufacturer)})</span>
+                    )}
+                  </td>
                   <td>{formatCount(item.expectedRows)}</td>
                   <td>
                     {REGISTER_STATE_COPY[item.state]}

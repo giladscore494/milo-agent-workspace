@@ -3692,6 +3692,10 @@ CATALOG_REGISTER_TABLES = ("catalog_register_directory_versions", "catalog_regis
 CATALOG_VARIANT_TABLES = ("catalog_variant_builds", "catalog_variants", "catalog_variants_current")
 # PR-L2: the compaction record, and the view every candidate reader reads.
 CATALOG_COMPACTION_TABLES = ("catalog_register_snapshot_compactions", "catalog_candidate_variants_resolved")
+#: PR-D3 (20261003000100): manufacturer normalisation -- three tables.
+CATALOG_NORMALIZATION_TABLES = ("catalog_manufacturer_normalization_proposals",
+                                "catalog_manufacturer_normalization_versions",
+                                "catalog_manufacturer_normalization_entries")
 CATALOG_COVERAGE_RPCS = ("catalog_variant_coverage_for_batch",
                          "record_catalog_variant_coverage_guarded",
                          "rebuild_catalog_variant_coverage", "catalog_variant_coverage_runs",
@@ -3849,7 +3853,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
         "20260930000100_catalog_variants.sql",
         "20260930000200_catalog_work_scope_placeholder_exclusion.sql",
         "20261001000100_catalog_variant_retention.sql",
-        "20261002000100_catalog_register_compaction.sql"]
+        "20261002000100_catalog_register_compaction.sql",
+        "20261003000100_catalog_manufacturer_normalization.sql"]
     before = db.psql(
         "select count(*) from information_schema.tables where table_schema='public' "
         "and table_name like 'catalog\\_%'")
@@ -3865,7 +3870,8 @@ def test_catalog_migration_applies_and_is_rerun_safe(db):
                          + len(CATALOG_PREPARATION_REQUEST_TABLES)
                          + len(CATALOG_REGISTER_TABLES)
                          + len(CATALOG_VARIANT_TABLES)
-                         + len(CATALOG_COMPACTION_TABLES))
+                         + len(CATALOG_COMPACTION_TABLES)
+                         + len(CATALOG_NORMALIZATION_TABLES))
     _reapply_catalog_migrations(db)
     _reapply_catalog_migrations(db)
     assert db.psql(
@@ -8825,7 +8831,8 @@ SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100
 #: variant coverage migration, and (E') the web preparation request migration.
 PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
                               "20260928000100", "20260929000100", "20260930000100",
-                              "20260930000200", "20261001000100", "20261002000100")
+                              "20260930000200", "20261001000100", "20261002000100",
+                              "20261003000100")
 PARTIAL_PG_PORT = "54995"
 
 

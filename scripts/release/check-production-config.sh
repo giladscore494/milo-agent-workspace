@@ -112,6 +112,10 @@ INVENTORY=(
   "MILO_REGISTER_GROUP_MAX_ROWS|cloud-run-api-only|no|backend/catalog/register/config.py"
   # PR-L1: the read-only catalog browser (API, GET only).
   "MILO_ENABLE_CATALOG_BROWSER|cloud-run-api-only|no|backend/catalog/register/browser.py"
+  # PR-D3: the "Normalise manufacturers" button (API) and the capture job's
+  # per-execution switch of the ONE guarded model call.
+  "MILO_ENABLE_MANUFACTURER_NORMALISATION|cloud-run-api-only|no|backend/catalog/register/normalization.py"
+  "MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB|cloud-run-worker-only|no|backend/catalog/register/normalization.py"
   "MILO_REGISTER_ARCHIVE_BUCKET|cloud-run-worker-only|no|backend/catalog/register/config.py"
   "MILO_REGISTER_DIRECTORY_MAX_REQUESTS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
   "MILO_REGISTER_DIRECTORY_MAX_SECONDS|cloud-run-worker-only|no|backend/catalog/government/directory.py"
@@ -210,6 +214,8 @@ EXECUTION_FLAGS=(
   MILO_ENABLE_REGISTER_CAPTURE
   MILO_ENABLE_REGISTER_CAPTURE_JOB
   MILO_ENABLE_CATALOG_BROWSER
+  MILO_ENABLE_MANUFACTURER_NORMALISATION
+  MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB
   GATEWAY_ALLOW_EXECUTION_ROUTES
   NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI
 )

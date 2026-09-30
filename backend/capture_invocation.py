@@ -60,6 +60,9 @@ PREPARATION_SWITCH_ON = "true"
 #: and group capture). Set ONLY by these invocations, like the one above.
 REGISTER_SWITCH = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
 REGISTER_SWITCH_ON = "true"
+#: PR-D3: the per-execution switch of the manufacturer normalisation mode --
+#: the ONE model call's budget kill switch. Set ONLY by the invocation below.
+NORMALISATION_SWITCH = "MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
 
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _REVISION = re.compile(r"^[1-9][0-9]{0,8}$")
@@ -146,6 +149,14 @@ def register_directory(*, project_ref: str, run_id: str) -> Invocation:
         entrypoint_args=(*capture_arguments(project_ref=project_ref, run_id=run_id),
                          "--register-directory"),
         env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
+
+
+def manufacturer_normalisation(*, project_ref: str, run_id: str, proposal_id: str) -> Invocation:
+    """PR-D3: the ONE execution that makes one proposal's guarded K3 call."""
+    return Invocation(
+        entrypoint_args=(*capture_arguments(project_ref=project_ref, run_id=run_id),
+                         "--normalisation-proposal-id", _checked(_UUID, proposal_id, "proposal id")),
+        env_overrides=((NORMALISATION_SWITCH, "true"),))
 
 
 def main(argv: list[str] | None = None) -> int:

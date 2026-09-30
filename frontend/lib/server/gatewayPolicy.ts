@@ -129,6 +129,14 @@ const SAFE_RULES: GatewayRule[] = [
     path: new RegExp(`^/projects/${UUID}/register$`, 'i'),
   },
   /**
+   * PR-D3: the Register page's manufacturer normalisation -- the canonical
+   * names and the pending groups. A membership-gated READ, GET only.
+   */
+  {
+    method: 'GET',
+    path: new RegExp(`^/projects/${UUID}/register/normalisation$`, 'i'),
+  },
+  /**
    * PR-CAT: the catalog browser -- PR-L1's paged discovery tree, one exact
    * path per level. A membership-gated READ, GET only, answered 404 while
    * MILO_ENABLE_CATALOG_BROWSER is off. It has no write.
@@ -169,6 +177,10 @@ const EXECUTION_RULES: GatewayRule[] = [
   // API executes the capture job; nothing starts a run, so neither is a
   // run-start rule. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE).
   { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory)$`, 'i') },
+  // PR-D3: the ONE guarded model call (the capture job; not a run) and the
+  // owner's approval. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE,
+  // and MILO_ENABLE_MANUFACTURER_NORMALISATION for the call).
+  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/normalisation(/approvals)?$`, 'i') },
 ];
 
 const RUN_CREATION_RULES = [

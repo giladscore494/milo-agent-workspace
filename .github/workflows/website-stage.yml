@@ -36,6 +36,7 @@ on:
           - web-preparation
           - register-capture
           - catalog-browser
+          - manufacturer-normalisation
           - all
       sha:
         description: "The deployed release SHA (empty: the release production runs)"
@@ -74,8 +75,8 @@ jobs:
             exit 1
           fi
           case "${STAGE_INPUT}" in
-            plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;
-            *) echo "stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser or all."; exit 1 ;;
+            plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all) ;;
+            *) echo "stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation or all."; exit 1 ;;
           esac
           if [[ -n "${SHA_INPUT}" && ! "${SHA_INPUT}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "sha must be empty or exactly 40 lowercase hexadecimal characters."

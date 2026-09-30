@@ -421,7 +421,8 @@ def test_the_tree_pages_down_to_variants(browsing):
     client, base, headers, _repo = browsing
     makers = client.get(f"{base}/manufacturers", headers=headers)
     assert makers.status_code == 200, makers.text
-    assert makers.json() == {"total": 1, "limit": 50, "offset": 0, "items": [{"tozar": "טויוטה", "variants": 16}]}
+    assert makers.json() == {"total": 1, "limit": 50, "offset": 0, "items": [{"tozar": "טויוטה", "variants": 16,
+                                                                                   "canonical_manufacturer": None}]}
     models = client.get(f"{base}/models", params={"tozar": "טויוטה"}, headers=headers).json()
     assert [(m["kinuy_mishari"], m["variants"], m["year_min"], m["year_max"]) for m in models["items"]] == \
         [("4RUNNER", 5, 2026, 2026), ("RAV4", 11, 2022, 2026)]

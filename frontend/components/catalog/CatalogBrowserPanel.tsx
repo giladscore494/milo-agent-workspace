@@ -363,6 +363,7 @@ function Listing({ listing, path, onOpen, canPlan, entries, selected, busy, onTo
                   checked={selected.has(item.tozar)} onChange={() => onToggle(item.tozar)} />)}
               <button type="button" className="button button--quiet" onClick={() => onOpen({ tozar: item.tozar })}>
                 {safeText(item.tozar)}</button>
+              {item.canonical && <span className="note"> ({safeText(item.canonical)})</span>}
               {' '}<span className="muted">{item.variants} variants</span>
             </li>);
         })}</ul>);

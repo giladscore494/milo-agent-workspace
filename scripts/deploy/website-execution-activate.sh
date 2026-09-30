@@ -37,6 +37,15 @@
 #                           (MILO_CATALOG_BROWSER_API_ENABLE_FLAGS on the API
 #                           only, read back). GET only, $0: no run, no job,
 #                           no model; run creation stays off.
+#   --apply-manufacturer-normalisation PR-D3. The Register page's "Normalise
+#                           manufacturers" button: its API flag
+#                           (MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS),
+#                           and on the capture job
+#                           the provider key and the shared quota store (the
+#                           capture identity gets secretAccessor on exactly
+#                           those three secrets), each read back. Run creation
+#                           and paid execution read back OFF (decision 33).
+#                           Needs the register-capture stage first.
 #   --apply-backend         Stage 2. Everything a website-initiated batch run
 #                           needs on the API and the worker -- and ONLY where
 #                           it is needed (deployment-contract.sh names each
@@ -98,7 +107,7 @@ WS_ARGS=()
 
 usage() {
   cat << 'EOF'
-Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-catalog-browser|--apply-backend] [options]
+Usage: website-execution-activate.sh [--plan|--apply-runtime-policy|--apply-plan-authoring|--apply-web-preparation|--apply-register-capture|--apply-catalog-browser|--apply-manufacturer-normalisation|--apply-backend] [options]
 
 Default --plan changes nothing and prints both stages.
 
@@ -150,6 +159,7 @@ while [[ $# -gt 0 ]]; do
     --apply-web-preparation) MODE="apply-web-preparation"; shift ;;
     --apply-register-capture) MODE="apply-register-capture"; shift ;;
     --apply-catalog-browser) MODE="apply-catalog-browser"; shift ;;
+    --apply-manufacturer-normalisation) MODE="apply-manufacturer-normalisation"; shift ;;
     --apply-backend) MODE="apply-backend"; shift ;;
     --work-scope-id | --work-scope-revision | --work-scope-digest) WS_ARGS+=("$1" "${2:?}"); shift 2 ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
@@ -257,6 +267,15 @@ REGISTER_API_VARS+="${MILO_ENV_VAR_DELIMITER}CLOUD_RUN_CAPTURE_JOB=${CAPTURE_JOB
 # PR-L1: the read-only catalog browser on the API, nothing else.
 BROWSER_API_VARS="$(pairs "$ENABLED" "${MILO_CATALOG_BROWSER_API_ENABLE_FLAGS[@]}")"
 
+# PR-D3: the "Normalise manufacturers" button on the API; the key and the
+# quota store on the capture job.
+NORMALISATION_API_VARS="$(pairs "$ENABLED" "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[@]}")"
+CAPTURE_SA="$(milo_op CAPTURE_SERVICE_ACCOUNT)"
+[[ -n "$CAPTURE_SA" ]] || CAPTURE_SA="$(milo_op WORKER_SERVICE_ACCOUNT)"
+REDIS_URL_SECRET="$(milo_op SECRET_REDIS_URL)"
+REDIS_TOKEN_SECRET="$(milo_op SECRET_REDIS_TOKEN)"
+NORMALISATION_JOB_SECRETS="KIMI_API_KEY=${PROVIDER_SECRET}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_URL=${REDIS_URL_SECRET}:${MILO_SECRET_VERSION},UPSTASH_REDIS_REST_TOKEN=${REDIS_TOKEN_SECRET}:${MILO_SECRET_VERSION}"
+
 # Stage 2.
 S2_API_VARS="$(pairs "$ENABLED" "${MILO_STAGE2_API_ENABLE_FLAGS[@]}")"
 S2_API_VARS+="${MILO_ENV_VAR_DELIMITER}$(pairs "$DISABLED" "${MILO_STAGE2_API_PINNED_OFF_FLAGS[@]}")"
@@ -348,6 +367,25 @@ print_catalog_browser_commands() {
 gcloud run services update ${API_SERVICE} \\
   --region ${REGION} --project ${PROJECT_ID} \\
   --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${BROWSER_API_VARS}'
+EOC
+}
+
+print_manufacturer_normalisation_commands() {
+  cat << EOC
+# --- PR-D3, capture identity: read exactly the three secrets the ONE model
+# call needs (the provider key and the shared quota store). <CAPTURE_SERVICE_ACCOUNT>
+# is the operator configuration's key: no address is printed.
+for secret in ${PROVIDER_SECRET} ${REDIS_URL_SECRET:-<SECRET_REDIS_URL>} ${REDIS_TOKEN_SECRET:-<SECRET_REDIS_TOKEN>}; do
+  gcloud secrets add-iam-policy-binding "\$secret" --project ${PROJECT_ID} \\
+    --member serviceAccount:<CAPTURE_SERVICE_ACCOUNT> --role roles/secretmanager.secretAccessor
+done
+# --- PR-D3, capture job: the key and the store, bound (never as plain env).
+gcloud run jobs update ${CAPTURE_JOB:-<CLOUD_RUN_CAPTURE_JOB>} --region ${REGION} --project ${PROJECT_ID} \\
+  --update-secrets '${NORMALISATION_JOB_SECRETS}'
+# --- PR-D3, API only: the button. Run creation and paid execution stay off.
+gcloud run services update ${API_SERVICE} \\
+  --region ${REGION} --project ${PROJECT_ID} \\
+  --update-env-vars '^${MILO_ENV_VAR_DELIMITER}^${NORMALISATION_API_VARS}'
 EOC
 }
 
@@ -548,6 +586,8 @@ if [[ "$MODE" == "plan" ]]; then
   print_register_capture_commands
   printf '\n== PR-L1 — the read-only catalog browser (Cloud Run API only) ==\n'
   print_catalog_browser_commands
+  printf '\n== PR-D3 — manufacturer normalisation (capture job secrets + API) ==\n'
+  print_manufacturer_normalisation_commands
   printf '\nPLAN ONLY — nothing was changed.\n'
   exit 0
 fi
@@ -625,6 +665,54 @@ if [[ "$MODE" == "apply-catalog-browser" ]]; then
     exit 1
   fi
   printf '\nCatalog browser applied and read back. Run creation and paid execution are still OFF.\n'
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# --apply-manufacturer-normalisation (PR-D3)
+# ---------------------------------------------------------------------------
+if [[ "$MODE" == "apply-manufacturer-normalisation" ]]; then
+  if [[ -z "$CAPTURE_JOB" || -z "$CAPTURE_SA" || -z "$REDIS_URL_SECRET" || -z "$REDIS_TOKEN_SECRET" ]]; then
+    printf 'FAIL: --apply-manufacturer-normalisation needs CLOUD_RUN_CAPTURE_JOB, CAPTURE_SERVICE_ACCOUNT (or WORKER_SERVICE_ACCOUNT), SECRET_REDIS_URL and SECRET_REDIS_TOKEN in %s.\n' "$CONFIG_PATH" >&2
+    exit 2
+  fi
+  printf '== Gate: the release is deployed and the database carries the exact migration set ==\n'
+  if ! bash "${SCRIPT_DIR}/production-verify.sh" --operator-config "$CONFIG_PATH" --gate deployed; then
+    printf '\nFAIL: the deployed gate did not pass; nothing was changed.\n' >&2
+    exit 1
+  fi
+  # The button lives on the Register page: that stage must already be on.
+  split_pairs "$REGISTER_API_VARS"
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}"; then
+    printf 'FAIL: the register-capture stage is not on (above); apply it first. Nothing was changed.\n' >&2
+    exit 1
+  fi
+  printf '\n== Applying manufacturer normalisation (capture job secrets, then the API) ==\n'
+  print_manufacturer_normalisation_commands
+  for secret in "$PROVIDER_SECRET" "$REDIS_URL_SECRET" "$REDIS_TOKEN_SECRET"; do
+    gcloud secrets add-iam-policy-binding "$secret" --project "$PROJECT_ID" \
+      --member "serviceAccount:${CAPTURE_SA}" --role roles/secretmanager.secretAccessor > /dev/null
+  done
+  gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
+    --update-secrets "$NORMALISATION_JOB_SECRETS"
+  if ! readback_secret job "$CAPTURE_JOB" KIMI_API_KEY "$PROVIDER_SECRET" \
+     || ! readback_secret job "$CAPTURE_JOB" UPSTASH_REDIS_REST_URL "$REDIS_URL_SECRET" \
+     || ! readback_secret job "$CAPTURE_JOB" UPSTASH_REDIS_REST_TOKEN "$REDIS_TOKEN_SECRET" \
+     || ! readback job "$CAPTURE_JOB" "MILO_ENABLE_PAID_EXECUTION=${DISABLED}" \
+          "${MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME}=${DISABLED}"; then
+    printf 'FAIL: the capture job does not carry the normalisation posture (above). The API was not changed.\n' >&2
+    exit 1
+  fi
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "^${MILO_ENV_VAR_DELIMITER}^${NORMALISATION_API_VARS}"
+  split_pairs "$NORMALISATION_API_VARS"
+  # Decision 33: allowed while paid runs are off -- and they stay off.
+  if ! readback service "$API_SERVICE" "${SPLIT[@]}" "MILO_ENABLE_RUN_CREATION=${DISABLED}" \
+       "MILO_ENABLE_PAID_EXECUTION=${DISABLED}"; then
+    printf 'FAIL: the API does not carry the normalisation posture (above).\n' >&2
+    exit 1
+  fi
+  printf '\nManufacturer normalisation applied and read back. Run creation and paid execution are still OFF.\n'
   exit 0
 fi
 

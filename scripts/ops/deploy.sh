@@ -42,7 +42,7 @@ REQUIRED_CI_JOBS=(offline-checks frontend-and-docker postgres-checks e2e)
 usage() {
   cat << 'EOF'
 Usage: deploy.sh --sha <40-hex> [--permanent-mode true|false] [--dry-run]
-                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|catalog-browser|all]
+                 [--restore-website-stage none|plan-authoring|web-preparation|both|register-capture|catalog-browser|manufacturer-normalisation|all]
                  [--operator-config <path>]
 
 Deploys the checked-out release after proving CI, migrations, the website and
@@ -65,8 +65,8 @@ done
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { printf 'FAIL: --sha must be a full 40-character lowercase SHA\n' >&2; exit 2; }
 case "$PERMANENT" in true | false) ;; *) printf 'FAIL: --permanent-mode must be true or false\n' >&2; exit 2 ;; esac
 case "$RESTORE_STAGE" in
-  none | plan-authoring | web-preparation | both | register-capture | catalog-browser | all) ;;
-  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture, catalog-browser or all\n' >&2; exit 2 ;;
+  none | plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all) ;;
+  *) printf 'FAIL: --restore-website-stage must be none, plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation or all\n' >&2; exit 2 ;;
 esac
 
 ops_load_config
@@ -78,8 +78,11 @@ if ! build_sa_problem="$(milo_build_service_account_problem "$(milo_op CLOUD_BUI
 fi
 # Restoring the Register page needs the archive bucket: refused before the
 # deploy starts, not after it (step 11).
-if [[ "$RESTORE_STAGE" == "register-capture" || "$RESTORE_STAGE" == "all" ]]; then
+if [[ "$RESTORE_STAGE" == "register-capture" || "$RESTORE_STAGE" == "all" || "$RESTORE_STAGE" == "manufacturer-normalisation" ]]; then
   milo_require_op REGISTER_ARCHIVE_BUCKET || exit 2
+fi
+if [[ "$RESTORE_STAGE" == "manufacturer-normalisation" ]]; then
+  milo_require_op SECRET_REDIS_URL SECRET_REDIS_TOKEN || exit 2
 fi
 CONFIG_ARG=(--operator-config "$CONFIG_PATH")
 summary_header "Deploy ${SHA:0:12} (permanent mode: ${PERMANENT}; restore website stage: ${RESTORE_STAGE})"

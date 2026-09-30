@@ -38,7 +38,9 @@ export type BrowserFilters = {
 };
 
 export type Page<T> = { total: number; limit: number; offset: number; items: T[] };
-export type Manufacturer = { tozar: string; variants: number };
+/** PR-D3: `canonical` is the approved canonical manufacturer, shown beside
+ *  the exact tozar every read and "Add to plan" keep using. */
+export type Manufacturer = { tozar: string; variants: number; canonical?: string };
 /** `null` is the register's own "not stated": listed, never opened (the
  *  next level needs a value to ask for). */
 export type Model = { kinuyMishari: string | null; variants: number; yearMin: number | null; yearMax: number | null };
@@ -115,7 +117,9 @@ export function parsePage<T>(body: unknown, item: (value: unknown) => T | undefi
 export function parseManufacturer(value: unknown): Manufacturer | undefined {
   const source = obj(value);
   const [tozar, variants] = [text(source.tozar), count(source.variants)];
-  return tozar === undefined || variants === undefined ? undefined : { tozar, variants };
+  if (tozar === undefined || variants === undefined) return undefined;
+  const canonical = text(source.canonical_manufacturer);
+  return canonical === undefined ? { tozar, variants } : { tozar, variants, canonical };
 }
 
 export function parseModel(value: unknown): Model | undefined {

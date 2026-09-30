@@ -82,6 +82,9 @@ ROLE_POLICIES: Mapping[tuple[str, str], RolePolicy] = {
                                       total_deadline_seconds=300.0),
     ("verifier", "verification"): RolePolicy(effort="high", max_output=24_000, min_answer_reserve=4_000,
                                              total_deadline_seconds=480.0),
+    # PR-D3: the ONE manufacturer-normalisation call (no tools, no run).
+    ("normaliser", "manufacturers"): RolePolicy(effort="low", max_output=16_000, min_answer_reserve=4_000,
+                                                total_deadline_seconds=300.0),
 }
 
 #: The longest total deadline any role declares: what the lease TTL must admit.

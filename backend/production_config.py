@@ -201,6 +201,11 @@ EXECUTION_FLAGS = (
     # other stage flag, turned on only by
     # `website-execution-activate.sh --apply-catalog-browser`.
     "MILO_ENABLE_CATALOG_BROWSER",
+    # PR-D3: the "Normalise manufacturers" button -- ONE guarded K3 call in the
+    # capture job, allowed while paid runs are off (decision 33) behind this
+    # flag only; pinned off here, turned on only by
+    # `website-execution-activate.sh --apply-manufacturer-normalisation`.
+    "MILO_ENABLE_MANUFACTURER_NORMALISATION",
 )
 
 # NEXT_PUBLIC_* values ship to the browser bundle: secret material is banned.

@@ -27,6 +27,17 @@
 #                    MILO_ENABLE_CATALOG_BROWSER on the API, read back
 #                    (website-execution-activate.sh --apply-catalog-browser).
 #                    GET only and $0: no job, no run, no model.
+#   manufacturer-normalisation
+#                    PR-D3, the Register page's "Normalise manufacturers"
+#                    button: the capture job on the release image, then the
+#                    provider key and the quota store bound on it (the
+#                    capture identity reads exactly those secrets) and
+#                    MILO_ENABLE_MANUFACTURER_NORMALISATION on the API, read
+#                    back; run creation and paid execution read back OFF
+#                    (website-execution-activate.sh
+#                    --apply-manufacturer-normalisation), after the Register
+#                    page (register-capture) it lives on. Never part of `all`: it binds a
+#                    paid provider key, so it is always its own decision.
 #   all              `both`, then the Register page (the capture job is
 #                    ensured once), then the catalog browser
 #   none             nothing
@@ -48,7 +59,7 @@ source "${SCRIPT_DIR}/common.sh"
 STAGE="" STEP_PREFIX="" HEADER=1
 usage() {
   cat << 'EOF'
-Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|catalog-browser|all|none [--dry-run]
+Usage: website-stage.sh --stage plan-authoring|web-preparation|both|register-capture|catalog-browser|manufacturer-normalisation|all|none [--dry-run]
                         [--operator-config <path>] [--step-prefix <n>] [--no-header]
 
 Turns the website's plan authoring (Stage P) and/or its Prepare button (E'),
@@ -69,8 +80,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 case "$STAGE" in
-  plan-authoring | web-preparation | both | register-capture | catalog-browser | all | none) ;;
-  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, all or none\n' >&2; usage >&2; exit 2 ;;
+  plan-authoring | web-preparation | both | register-capture | catalog-browser | manufacturer-normalisation | all | none) ;;
+  *) printf 'FAIL: --stage must be plan-authoring, web-preparation, both, register-capture, catalog-browser, manufacturer-normalisation, all or none\n' >&2; usage >&2; exit 2 ;;
 esac
 [[ -z "$STEP_PREFIX" || "$STEP_PREFIX" =~ ^[0-9]{1,2}$ ]] \
   || { printf 'FAIL: --step-prefix must be a step number\n' >&2; exit 2; }
@@ -82,7 +93,8 @@ if [[ "$STAGE" != "none" ]]; then
   milo_require_op SECRET_PROVIDER_API_KEY MILO_GATEWAY_AUDIENCE MILO_APPROVED_GATEWAY_IDENTITIES \
     PRODUCTION_ORIGIN MILO_WORKER_AUDIENCE || exit 2
 fi
-if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "register-capture" || "$STAGE" == "all" ]]; then
+if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "register-capture" || "$STAGE" == "all" \
+      || "$STAGE" == "manufacturer-normalisation" ]]; then
   milo_require_op CLOUD_RUN_CAPTURE_JOB API_SERVICE_ACCOUNT ARTIFACT_REGISTRY_REPOSITORY \
     SUPABASE_PROJECT_REF SECRET_SUPABASE_URL SECRET_SUPABASE_SERVICE_KEY || exit 2
 fi
@@ -132,6 +144,24 @@ if [[ "$STAGE" == "web-preparation" || "$STAGE" == "both" || "$STAGE" == "all" ]
     "E' (the Prepare button): the API identity reads the capture and worker jobs (${MILO_API_JOB_READ_ROLE}, read back); MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS on the API; paid execution and preparation read back OFF" \
     "E' was not applied (above); the Prepare button stays off" \
     "${activate[@]}" --apply-web-preparation
+fi
+if [[ "$STAGE" == "manufacturer-normalisation" ]]; then
+  milo_require_op SECRET_REDIS_URL SECRET_REDIS_TOKEN REGISTER_ARCHIVE_BUCKET || exit 2
+  # Ensuring the job re-creates its secrets without the key: bind it after.
+  run_step "$(step_name 1 a capture-job)" \
+    "the capture job on the release image ${release:0:12}, with the register archive bucket" \
+    "the capture job was not ensured (above); normalisation stays off" \
+    "${capture[@]}" --ensure-job --enable-catalog-execution
+  # The button lives on the Register page: that stage first (a deploy turned
+  # both off).
+  run_step "$(step_name 2 b register-capture)" \
+    "PR-D1 (the Register page, which carries the button): MILO_ENABLE_REGISTER_CAPTURE on the API; paid execution read back OFF" \
+    "register capture was not applied (above); normalisation stays off" \
+    "${activate[@]}" --apply-register-capture
+  run_step "$(step_name 3 c manufacturer-normalisation)" \
+    "PR-D3 (Normalise manufacturers): the provider key and the quota store on the capture job (read back); MILO_ENABLE_MANUFACTURER_NORMALISATION on the API; run creation and paid execution read back OFF" \
+    "manufacturer normalisation was not applied (above); the button stays off" \
+    "${activate[@]}" --apply-manufacturer-normalisation
 fi
 if [[ "$STAGE" == "register-capture" ]]; then
   run_step "$(step_name 2 b capture-job)" \

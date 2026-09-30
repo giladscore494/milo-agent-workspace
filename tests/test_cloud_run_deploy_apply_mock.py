@@ -83,6 +83,9 @@ EXECUTION_FLAGS = (
     # PR-L1: the read-only catalog browser (API): pinned false on both
     # product surfaces like every other Stage A flag.
     "MILO_ENABLE_CATALOG_BROWSER",
+    # PR-D3: the "Normalise manufacturers" button (API): pinned false on both
+    # product surfaces like every other Stage A flag.
+    "MILO_ENABLE_MANUFACTURER_NORMALISATION",
 )
 
 MOCK_GCLOUD = r"""#!/usr/bin/env bash

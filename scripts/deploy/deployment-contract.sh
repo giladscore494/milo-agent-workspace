@@ -47,6 +47,7 @@ MILO_STAGE_A_EXECUTION_FLAGS=(
   MILO_ENABLE_REGISTER_CAPTURE=false
   MILO_ENABLE_REGISTER_CAPTURE_JOB=false
   MILO_ENABLE_CATALOG_BROWSER=false
+  MILO_ENABLE_MANUFACTURER_NORMALISATION=false
 )
 
 # PR-Y: the replay capture (backend/replay_capture.py). A diagnostic, not an
@@ -435,6 +436,7 @@ MILO_CAPTURE_PINNED_OFF_FLAGS=(
   MILO_ENABLE_EXECUTION_CONTROL=false
   MILO_ENABLE_WORK_SCOPE_PREPARATION=false
   MILO_ENABLE_REGISTER_CAPTURE_JOB=false
+  MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB=false
 )
 
 # Scoped catalog PR2: the scoped-preparation switch, BY NAME ONLY. The job
@@ -511,6 +513,20 @@ MILO_REGISTER_CAPTURE_JOB_FLAG_NAME="MILO_ENABLE_REGISTER_CAPTURE_JOB"
 MILO_CATALOG_BROWSER_API_ENABLE_FLAGS=(
   MILO_ENABLE_CATALOG_BROWSER
 )
+
+# PR-D3 — manufacturer normalisation (decisions 14, 33). API: the "Normalise
+# manufacturers" button, which executes the EXISTING capture job with its own
+# per-execution switch (MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB) for ONE
+# guarded K3 call under the reviewed per-run and daily caps. The capture job
+# then carries the provider key and the shared provider-quota store while this
+# stage is on: bound by website-execution-activate.sh
+# --apply-manufacturer-normalisation (after the job is ensured), gone again on
+# every capture-job ensure (--set-secrets) and removed by the kill switch.
+# Allowed while paid runs are off; run creation and paid execution stay off.
+MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS=(
+  MILO_ENABLE_MANUFACTURER_NORMALISATION
+)
+MILO_MANUFACTURER_NORMALISATION_JOB_FLAG_NAME="MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
 
 # Stage 2 (website execution), API service.
 #

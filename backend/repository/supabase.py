@@ -267,6 +267,15 @@ class Repository(Protocol):
     def catalog_register_snapshot_archivable(self, snapshot_id: str) -> int: ...
     def catalog_register_superseded_snapshots(self, snapshot_key: str) -> list[dict[str, Any]]: ...
     def register_snapshot_archived(self, snapshot_id: str) -> bool: ...
+    # PR-D3: manufacturer normalisation.
+    def manufacturer_normalization_current(self) -> dict[str, Any]: ...
+    def catalog_manufacturer_evidence(self) -> list[dict[str, Any]]: ...
+    def request_manufacturer_normalization(self, requested_by: UUID, input_rows: list[dict[str, Any]], *, grace_seconds: int) -> dict[str, Any]: ...
+    def latest_manufacturer_normalization_proposal(self) -> dict[str, Any] | None: ...
+    def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None: ...
+    def record_manufacturer_normalization_proposal(self, run_id: UUID, proposal_id: str, status: str, groups: list[dict[str, Any]] | None, reason_code: str | None, model: str, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]: ...
+    def approve_manufacturer_normalization(self, approved_by: UUID, expected_version: int, entries: list[dict[str, Any]]) -> dict[str, Any]: ...
+    def project_member_role(self, project_id: UUID, user_id: UUID) -> str | None: ...
     # PR-L1: catalog variants and the discovery tree.
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None: ...
     def record_catalog_variants(self, snapshot_id: str, mapper_version: str, rows: list[dict[str, Any]]) -> dict[str, Any]: ...
@@ -2591,6 +2600,65 @@ class SupabaseRepository:
         rows = self._many(self.client.table("catalog_register_snapshot_compactions").select("snapshot_id")
                           .eq("snapshot_id", str(snapshot_id)).eq("readers", "archive").limit(1))
         return bool(rows)
+    # -- PR-D3: manufacturer normalisation (migration 20261003000100) -----
+    _NORMALIZATION_REFUSALS = ("CATALOG_NORMALIZATION_REQUEST_INVALID", "CATALOG_NORMALIZATION_NOT_THIS_RUN",
+                               "CATALOG_NORMALIZATION_ALREADY_RECORDED", "CATALOG_NORMALIZATION_OUTPUT_INVALID",
+                               "CATALOG_NORMALIZATION_APPROVAL_INVALID", "CATALOG_NORMALIZATION_VERSION_STALE")
+
+    def manufacturer_normalization_current(self) -> dict[str, Any]:
+        try:
+            data = self.client.rpc("catalog_manufacturer_normalization_current", {}).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "the normalisation could not be read", 502) from exc
+        if not isinstance(data, dict) or not isinstance(data.get("entries"), list):
+            raise AppError("REPOSITORY_ERROR", "the normalisation returned an unreadable document", 502)
+        return data
+
+    def catalog_manufacturer_evidence(self) -> list[dict[str, Any]]:
+        try:
+            data = self.client.rpc("catalog_manufacturer_evidence", {}).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "the manufacturer evidence could not be read", 502) from exc
+        if not isinstance(data, list):
+            raise AppError("REPOSITORY_ERROR", "the manufacturer evidence is unreadable", 502)
+        return [row for row in data if isinstance(row, dict)]
+
+    def request_manufacturer_normalization(self, requested_by: UUID, input_rows: list[dict[str, Any]], *, grace_seconds: int) -> dict[str, Any]:
+        return self._guarded_rpc("request_manufacturer_normalization", {
+            "p_requested_by": str(requested_by), "p_grace_seconds": int(grace_seconds), "p_input": list(input_rows)},
+            "manufacturer normalisation", refusals=self._NORMALIZATION_REFUSALS)
+
+    def latest_manufacturer_normalization_proposal(self) -> dict[str, Any] | None:
+        rows = self._many(self.client.table("catalog_manufacturer_normalization_proposals")
+                          .select("id, group_id, status, groups, reason_code, model, created_at, updated_at")
+                          .order("created_at", desc=True).order("id").limit(1))
+        return rows[0] if rows else None
+
+    def manufacturer_normalization_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        rows = self._many(self.client.table("catalog_manufacturer_normalization_proposals").select("*")
+                          .eq("id", str(proposal_id)).limit(1))
+        if not rows:
+            return None
+        groups = self.register_capture_groups([str(rows[0]["group_id"])])
+        return {**rows[0], "run_id": groups[0].get("run_id") if groups else None}
+
+    def record_manufacturer_normalization_proposal(self, run_id: UUID, proposal_id: str, status: str, groups: list[dict[str, Any]] | None, reason_code: str | None, model: str, *, worker_id: str, attempt: int, lease_token: str) -> dict[str, Any]:
+        return self._guarded_rpc("record_manufacturer_normalization_proposal", {
+            "p_run_id": str(run_id), "p_worker_id": worker_id, "p_attempt": int(attempt),
+            "p_lease_token": lease_token, "p_proposal_id": str(proposal_id), "p_status": status,
+            "p_groups": groups, "p_reason_code": reason_code, "p_model": model},
+            "manufacturer normalisation proposal", refusals=self._NORMALIZATION_REFUSALS)
+
+    def approve_manufacturer_normalization(self, approved_by: UUID, expected_version: int, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        return self._guarded_rpc("approve_manufacturer_normalization", {
+            "p_approved_by": str(approved_by), "p_expected_version": int(expected_version),
+            "p_entries": list(entries)}, "manufacturer normalisation approval",
+            refusals=self._NORMALIZATION_REFUSALS)
+
+    def project_member_role(self, project_id: UUID, user_id: UUID) -> str | None:
+        rows = self._many(self.client.table("project_members").select("role")
+                          .eq("project_id", str(project_id)).eq("user_id", str(user_id)).limit(1))
+        return str(rows[0]["role"]) if rows else None
 
     # -- PR-L1: catalog variants (migration 20260930000100) --------------
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None:

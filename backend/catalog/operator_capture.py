@@ -201,6 +201,7 @@ from backend.run_identity import (
 )
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
+from backend.catalog.register import normalization
 from backend.catalog.register.capture import (REGISTER_CAPTURE_REASONS, RegisterCaptureError,
                                               capture_group as register_capture_group,
                                               refresh_directory as register_refresh_directory)
@@ -287,6 +288,9 @@ WORK_SCOPE_PREPARATION_FLAG = "MILO_ENABLE_WORK_SCOPE_PREPARATION"
 #: API's invocation, backend/capture_invocation.py REGISTER_SWITCH).
 REGISTER_CAPTURE_JOB_FLAG = "MILO_ENABLE_REGISTER_CAPTURE_JOB"
 #: The register modes' arguments: one of the two, never both.
+NORMALISATION_ARGUMENTS: tuple[tuple[str, str], ...] = (
+    ("normalisation_proposal_id", "--normalisation-proposal-id"),
+)
 REGISTER_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("register_group_id", "--register-group-id"),
     ("register_directory", "--register-directory"),
@@ -402,6 +406,12 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "register capture needs exactly one of a group id (a UUID) or a directory refresh",
     "CAPTURE_REGISTER_CAPTURE_DISABLED":
         "register capture is not enabled for this execution",
+    # PR-D3: the manufacturer normalisation mode (one guarded model call).
+    "CAPTURE_NORMALISATION_ARGUMENTS_INVALID":
+        "manufacturer normalisation needs exactly one proposal id (a UUID) and no other mode",
+    "CAPTURE_NORMALISATION_DISABLED":
+        "manufacturer normalisation is not enabled for this execution",
+    "CAPTURE_NORMALISATION_FAILED": "the manufacturer normalisation did not record its outcome",
 }
 
 
@@ -548,6 +558,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--execute only: capture this register capture group (PR-D1)")
     parser.add_argument("--register-directory", action="store_true", default=None,
                         help="--execute only: refresh the register directory (PR-D1)")
+    parser.add_argument("--normalisation-proposal-id", default=None,
+                        help="--execute only: the ONE guarded model call of this proposal (PR-D3)")
     parser.add_argument("--report-path", default=None,
                         help="optional path for the sanitized report; the only file written")
     return parser
@@ -634,7 +646,7 @@ CAPTURE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("page_limit", "--page-limit"),
     ("max_pages", "--max-pages"),
     ("max_records", "--max-records"),
-) + WORK_SCOPE_ARGUMENTS + REGISTER_ARGUMENTS
+) + WORK_SCOPE_ARGUMENTS + REGISTER_ARGUMENTS + NORMALISATION_ARGUMENTS
 PREPARE_ONLY_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("conversation_id", "--conversation-id"),
     ("requested_by", "--requested-by"),
@@ -722,7 +734,20 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
             return "CAPTURE_REGISTER_ARGUMENTS_INVALID"
         if (env.get(REGISTER_CAPTURE_JOB_FLAG) or "").strip().lower() not in TRUE_VALUES:
             return "CAPTURE_REGISTER_CAPTURE_DISABLED"
+    if _supplied(args, NORMALISATION_ARGUMENTS):
+        if _supplied(args, WORK_SCOPE_ARGUMENTS) or _supplied(args, REGISTER_ARGUMENTS) \
+                or _normalisation_request(args) is None:
+            return "CAPTURE_NORMALISATION_ARGUMENTS_INVALID"
+        if (env.get(normalization.JOB_SWITCH) or "").strip().lower() not in TRUE_VALUES:
+            return "CAPTURE_NORMALISATION_DISABLED"
     return ""
+
+
+def _normalisation_request(args: argparse.Namespace) -> str | None:
+    try:
+        return str(UUID(str(getattr(args, "normalisation_proposal_id", None))))
+    except (TypeError, ValueError):
+        return None
 
 
 def _register_request(args: argparse.Namespace) -> tuple[str, str] | None:
@@ -1578,7 +1603,20 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
     register = _register_request(args) if _supplied(args, REGISTER_ARGUMENTS) else None
     preparation: WorkScopePreparation | None = None
     register_document: dict[str, Any] | None = None
+    normalise = _normalisation_request(args) if _supplied(args, NORMALISATION_ARGUMENTS) else None
     supervisor.start()
+    if normalise is not None:
+        # PR-D3: ONE guarded model call; no Government request, no client.
+        try:
+            outcome = normalization.propose(repository, lease, normalise, env=env)
+        except Exception:  # noqa: BLE001 - reduced to a static code
+            supervisor.stop()
+            _finalize(repository, lease, document={}, reason_code="CAPTURE_NORMALISATION_FAILED",
+                      cancelled=False)
+            return EXIT_FAILED, _envelope("failed", "CAPTURE_NORMALISATION_FAILED")
+        supervisor.stop()
+        _finalize(repository, lease, document={"normalisation": outcome}, reason_code="", cancelled=False)
+        return EXIT_OK, _envelope("succeeded", "", normalisation=outcome)
     try:
         client = DataGovClient(_open_transport(), page_limit=CAPTURE_PAGE_LIMIT,
                                max_pages=CAPTURE_MAX_PAGES, max_records=CAPTURE_MAX_RECORDS,

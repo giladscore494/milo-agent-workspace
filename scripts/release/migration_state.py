@@ -106,6 +106,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20261001000100": ("column", "catalog_variants.equipment_stated"),
     # PR-L2 payload compaction.
     "20261002000100": ("table", "catalog_register_snapshot_compactions"),
+    # PR-D3 manufacturer normalisation.
+    "20261003000100": ("table", "catalog_manufacturer_normalization_versions"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

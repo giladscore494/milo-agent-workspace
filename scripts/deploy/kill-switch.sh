@@ -15,7 +15,7 @@
 #      the remaining Stage P / Stage 2 API and worker flags; the contract's
 #      pinned-off flags re-asserted false on both (MILO_ENABLE_CATALOG_PROMOTION,
 #      MILO_ENABLE_WORK_SCOPE_PREPARATION, ...); the Government capture job's
-#      master flag, when that job exists; and the Vercel
+#      master flag and (PR-D3) its provider key, when that job exists; and the Vercel
 #      GATEWAY_ALLOW_EXECUTION_ROUTES and NEXT_PUBLIC_MILO_ENABLE_EXECUTION_UI.
 #      Step 6 closes run cancellation and the website's execution routes too,
 #      so cancel runs that are still executing BEFORE it (or use
@@ -354,10 +354,24 @@ if [[ "$SCOPE" != "order" ]]; then
     printf '# if the capture job %s exists:\n' "$CAPTURE_JOB"
     show gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
       --update-env-vars "${CAPTURE_FLAG}=${CLOSED}"
-  elif describe_capture > /dev/null 2>&1; then
+    # PR-D3: the provider key the normalisation stage bound on it.
+    printf '# if KIMI_API_KEY is bound on the capture job (manufacturer normalisation):\n'
+    show gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets KIMI_API_KEY
+  elif capture_json="$(describe_capture 2> /dev/null)"; then
     CAPTURE_PRESENT=1
     run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" \
       --update-env-vars "${CAPTURE_FLAG}=${CLOSED}"
+    # PR-D3: the provider key the normalisation stage bound on it.
+    for key in "${PROVIDER_KEY_NAMES[@]}"; do
+      form="$(key_binding_form "$capture_json" "$key")" || form="unreadable"
+      case "$form" in
+        secret) run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-secrets "$key" ;;
+        env) run 6 gcloud run jobs update "$CAPTURE_JOB" --region "$REGION" --project "$PROJECT_ID" --remove-env-vars "$key" ;;
+        "") ;;
+        *) printf 'STEP 6 FAILED: could not read how %s is bound on the capture job\n' "$key" >&2
+           FAILED_STEPS+=(6) ;;
+      esac
+    done
   else
     printf 'The capture job %s does not exist: nothing to close.\n' "$CAPTURE_JOB"
   fi
@@ -452,7 +466,7 @@ else
 fi
 if [[ "$SCOPE" != "order" && "${CAPTURE_PRESENT:-0}" -eq 1 ]]; then
   if capture_json="$(describe_capture)"; then
-    verify_json "capture" "$capture_json" 0 0 "$CAPTURE_FLAG" || verified=0
+    verify_json "capture" "$capture_json" 0 1 "$CAPTURE_FLAG" || verified=0
   else
     printf 'READ-BACK FAILED: could not describe the capture job\n' >&2
     verified=0
