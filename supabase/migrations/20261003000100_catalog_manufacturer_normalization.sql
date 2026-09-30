@@ -374,7 +374,7 @@ begin
      or jsonb_typeof(p_group->'members') is distinct from 'array'
      or jsonb_array_length(p_group->'members') not between 1 and 2000
      or exists (select 1 from jsonb_array_elements(p_group->'members') m where jsonb_typeof(m) <> 'string')
-     or (p_group ? 'rule_id') = (p_group ? 'proposal_id') then
+     or (nullif(p_group->>'rule_id', '') is null) = (nullif(p_group->>'proposal_id', '') is null) then
     raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: invalid rejection' using errcode = '22023';
   end if;
   select array_agg(m order by m collate "C") into v_members
@@ -383,7 +383,7 @@ begin
     raise exception 'CATALOG_NORMALIZATION_REJECTION_INVALID: a name appears twice' using errcode = '22023';
   end if;
   v_rule := p_group->>'rule_id';
-  if p_group ? 'proposal_id' then
+  if nullif(p_group->>'proposal_id', '') is not null then
     begin
       v_proposal := (p_group->>'proposal_id')::uuid;
     exception when others then

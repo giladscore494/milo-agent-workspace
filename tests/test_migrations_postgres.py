@@ -3695,7 +3695,8 @@ CATALOG_COMPACTION_TABLES = ("catalog_register_snapshot_compactions", "catalog_c
 #: PR-D3 (20261003000100): manufacturer normalisation -- three tables.
 CATALOG_NORMALIZATION_TABLES = ("catalog_manufacturer_normalization_proposals",
                                 "catalog_manufacturer_normalization_versions",
-                                "catalog_manufacturer_normalization_entries")
+                                "catalog_manufacturer_normalization_entries",
+                                "catalog_manufacturer_normalization_rejections")
 CATALOG_COVERAGE_RPCS = ("catalog_variant_coverage_for_batch",
                          "record_catalog_variant_coverage_guarded",
                          "rebuild_catalog_variant_coverage", "catalog_variant_coverage_runs",

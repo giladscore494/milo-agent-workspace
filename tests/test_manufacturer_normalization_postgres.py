@@ -166,7 +166,9 @@ def test_a_rejection_is_exactly_a_pending_group_and_append_only(ndb, proposal):
                 {"canonical": "Lexus", "members": [LEXUS, LEXUS], "proposal_id": proposal["id"]},  # twice
                 {"canonical": "Honda", "members": ["הונדה"], "rule_id": "R1_SPELLING"},            # not in the directory
                 {"canonical": "Toyota", "members": [TOYOTA], "rule_id": "R9_GUESS"},               # not a rule
-                {"canonical": "Lexus", "members": [LEXUS]}):                                      # no provenance
+                {"canonical": "Lexus", "members": [LEXUS]},                                       # no provenance
+                {"canonical": "Lexus", "members": [LEXUS], "rule_id": None},                      # a null one
+                {"canonical": "Lexus", "members": [LEXUS], "rule_id": None, "proposal_id": None}):
         with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_REJECTION_INVALID"):
             reject(bad)
     first = json.loads(reject({"canonical": "Lexus", "members": [LEXUS], "proposal_id": proposal["id"]}))

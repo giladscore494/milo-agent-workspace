@@ -29,9 +29,10 @@
 #                    GET only and $0: no job, no run, no model.
 #   manufacturer-normalisation
 #                    PR-D3, the Register page's "Normalise manufacturers"
-#                    button: the capture job on the release image, then the
-#                    provider key and the quota store bound on it (the
-#                    capture identity reads exactly those secrets) and
+#                    button: the capture job on the release image, then its
+#                    own normalisation job (the worker identity, the ONLY job
+#                    holding the provider key and the quota store; the
+#                    capture identity reads neither) and
 #                    MILO_ENABLE_MANUFACTURER_NORMALISATION on the API, read
 #                    back; run creation and paid execution read back OFF
 #                    (website-execution-activate.sh
@@ -159,7 +160,7 @@ if [[ "$STAGE" == "manufacturer-normalisation" ]]; then
     "register capture was not applied (above); normalisation stays off" \
     "${activate[@]}" --apply-register-capture
   run_step "$(step_name 3 c manufacturer-normalisation)" \
-    "PR-D3 (Normalise manufacturers): the provider key and the quota store on the capture job (read back); MILO_ENABLE_MANUFACTURER_NORMALISATION on the API; run creation and paid execution read back OFF" \
+    "PR-D3 (Normalise manufacturers): the normalisation job with the provider key and the quota store, as the worker identity (read back); MILO_ENABLE_MANUFACTURER_NORMALISATION on the API; run creation and paid execution read back OFF" \
     "manufacturer normalisation was not applied (above); the button stays off" \
     "${activate[@]}" --apply-manufacturer-normalisation
 fi

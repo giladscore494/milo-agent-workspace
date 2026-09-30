@@ -73,6 +73,8 @@ Anything else is recorded as a refused proposal with that code. A budget refusal
 
 Only a project **owner** presses the button (it spends the owner's daily budget) and approves (`project_members.role`); anyone else gets `CATALOG_NORMALIZATION_OWNER_ONLY`.
 
+The mapping is **deployment-wide** (one register, one canonical name per tozar): an owner of any project on this deployment approves or rejects for every project. That fits the single-tenant deployment this is built for; a multi-tenant one would need an operator role instead.
+
 A model group that the active mapping already holds is no longer pending.
 
 - **Together:** every high-confidence group that conflicts with nothing can be approved in one call.
@@ -109,14 +111,15 @@ The normalisation job exists exactly while the stage is on: it carries the provi
 
    It is never part of `all`: it binds a paid provider key, so it is always its own decision.
 3. **After a deploy:** a Stage A deploy deletes the job; dispatch **Deploy** with `restore_website_stage = manufacturer-normalisation`, or re-run step 2.
+4. **Use it:** open **Register**, press **Normalise manufacturers**, reload after the job ends, and approve or reject.
 5. **Turn it off:** `bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation` (or the kill switch).
-4. **Use it:** open **Register**, press **Normalise manufacturers**, reload after the job ends, and approve.
 
 A read-only role created after the migration gets no reads. Grant them the same way as PR-D1's roles:
 
 ```sql
 grant select on public.catalog_manufacturer_normalization_proposals,
-  public.catalog_manufacturer_normalization_versions, public.catalog_manufacturer_normalization_entries to <role>;
+  public.catalog_manufacturer_normalization_versions, public.catalog_manufacturer_normalization_entries,
+  public.catalog_manufacturer_normalization_rejections to <role>;
 grant execute on function public.catalog_normalization_groups_valid(jsonb,jsonb),
   public.catalog_manufacturer_normalization_current(), public.catalog_manufacturer_evidence() to <role>;
 ```

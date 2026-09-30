@@ -386,7 +386,7 @@ if [[ "$SCOPE" != "order" ]]; then
     for secret in "${CAPTURE_DENIED_SECRETS[@]}"; do
       printf '# if the capture identity holds an accessor on %s:\n' "$secret"
       show gcloud secrets remove-iam-policy-binding "$secret" --project "$PROJECT_ID" \
-        --member "serviceAccount:${CAPTURE_ONLY_SA}" --role roles/secretmanager.secretAccessor
+        --member "serviceAccount:${CAPTURE_ONLY_SA}" --role roles/secretmanager.secretAccessor --all
       if [[ "$MODE" == "apply" ]] && ! milo_revoke_accessor "$secret" "serviceAccount:${CAPTURE_ONLY_SA}" "$PROJECT_ID"; then
         printf 'STEP 6 FAILED: the capture identity may still read %s\n' "$secret" >&2
         FAILED_STEPS+=(6)
@@ -500,8 +500,10 @@ if [[ "$SCOPE" != "order" && -n "$NORMALISATION_JOB" ]]; then
 fi
 if [[ "$SCOPE" != "order" && -n "$CAPTURE_ONLY_SA" ]]; then
   for secret in "${CAPTURE_DENIED_SECRETS[@]}"; do
+    # Any role, conditional or not, or an unreadable policy: not closed.
     if ! policy="$(gcloud secrets get-iam-policy "$secret" --project "$PROJECT_ID" --format=json)" \
-       || milo_policy_has_member roles/secretmanager.secretAccessor "serviceAccount:${CAPTURE_ONLY_SA}" <<< "$policy"; then
+       || ! roles="$(milo_policy_member_roles "serviceAccount:${CAPTURE_ONLY_SA}" <<< "$policy")" \
+       || [[ -n "$roles" ]]; then
       printf 'NOT CLOSED (capture identity): it may read %s\n' "$secret"
       verified=0
     fi

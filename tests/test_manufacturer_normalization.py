@@ -285,6 +285,12 @@ def test_the_owner_rejects_a_pending_group_and_it_is_no_longer_pending():
     refused = reject(dict(pending["Toyota"], canonical="Toyota Motor"))
     assert refused.status_code == 422 and refused.json()["error"]["code"] == "CATALOG_NORMALIZATION_REJECTION_INVALID"
     assert reject(pending["Toyota"]).json() == {"rejected": True}
+    # Once rejected it is no longer pending; and the store keeps one record per group (the
+    # database's group_key), whoever rejects it again.
+    assert reject(pending["Toyota"]).status_code == 422
+    group = {"canonical": "Toyota", "members": [TOYOTA], "proposal_id": proposal_id}
+    again = repo.reject_manufacturer_normalization_group(UUID(int=7), group)
+    assert again["rejected_by"] == str(USER) and len(repo.manufacturer_normalization_rejections()) == 1
     after = {g["canonical"] for g in api.get(url, headers=as_user()).json()["pending"]}
     assert "Toyota" not in after and "Lexus" in after
     # A rejected group is not approved either, and nothing was mapped.

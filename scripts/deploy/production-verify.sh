@@ -202,9 +202,13 @@ elif ! normalisation_state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PR
   printf 'NORMALISATION_JOB=UNVERIFIED (the Cloud Run jobs could not be listed)\n'
   [[ "${FACTS[CODE_DEPLOYED]:-}" != "VERIFIED" ]] \
     || fact CODE_DEPLOYED UNVERIFIED "NORMALISATION_JOB: the Cloud Run jobs could not be listed"
+elif ! api_json="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+       --format=json 2> /dev/null)"; then
+  printf 'NORMALISATION_JOB=UNVERIFIED (the API service could not be described)\n'
+  [[ "${FACTS[CODE_DEPLOYED]:-}" != "VERIFIED" ]] \
+    || fact CODE_DEPLOYED UNVERIFIED "NORMALISATION_JOB: the API service could not be described"
 else
-  normalisation_flag="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-    --format=json 2> /dev/null | milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" || true)"
+  normalisation_flag="$(milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" <<< "$api_json")"
   posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
   printf 'NORMALISATION_JOB=%s (%s: %s)\n' "${posture%% *}" "$NORMALISATION_JOB" "${posture#* }"
   [[ "${posture%% *}" == "PASS" ]] || fact CODE_DEPLOYED NO "NORMALISATION_JOB: ${posture#* }"

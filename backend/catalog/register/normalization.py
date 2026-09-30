@@ -25,9 +25,11 @@ values underneath.
    count, `tozeret_nm` and up to three sample `kinuy_mishari`; no tool, no
    internet; a strict JSON contract (`validate_groups`: every member is an
    input name, no name in two groups, a closed confidence, bounded text --
-   anything else is refused with a static code). It runs in the EXISTING
-   capture job under an operator capture run -- the lease and budget anchor
-   the gateway's per-run and daily caps (the reviewed envelope) need; never a
+   anything else is refused with a static code). It runs in its OWN
+   normalisation job (the capture job's definition, run as the worker
+   identity; the only job holding the provider key) under an operator
+   capture run -- the lease and budget anchor the gateway's per-run and daily
+   caps (the deployment's RuntimePolicy) need; never a
    product run -- behind its own flag, allowed while paid runs are disabled
    (decision 33): the budget's kill switch is the per-execution switch the
    API's invocation sets, not MILO_ENABLE_PAID_EXECUTION.

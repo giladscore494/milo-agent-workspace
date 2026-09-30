@@ -275,14 +275,23 @@ fi
 # absent + off PASS, anything else BLOCKED.
 NORMALISATION_JOB="$(milo_normalisation_job_name)"
 if [[ -n "$NORMALISATION_JOB" ]]; then
-  if normalisation_state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID")"; then
-    normalisation_flag="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
-      --format=json 2> /dev/null | milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" || true)"
-    posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
-    record_check "${posture%% *}" "cloud-run:normalisation-job" "${NORMALISATION_JOB}: ${posture#* }"
-  else
+  if ! normalisation_state="$(milo_job_state "$NORMALISATION_JOB" "$REGION" "$PROJECT_ID")"; then
     record_check BLOCKED "cloud-run:normalisation-job" \
       "the Cloud Run jobs could not be listed, so whether ${NORMALISATION_JOB} (which holds the provider key) exists is unknown"
+  elif ! api_json="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+         --format=json 2> /dev/null)"; then
+    record_check BLOCKED "cloud-run:normalisation-job" \
+      "the API service could not be described, so whether the stage is on is unknown (${NORMALISATION_JOB} is ${normalisation_state})"
+  else
+    normalisation_flag="$(milo_env_value "${MILO_MANUFACTURER_NORMALISATION_API_ENABLE_FLAGS[0]}" <<< "$api_json")"
+    posture="$(milo_normalisation_posture "$normalisation_state" "$normalisation_flag")"
+    # The worker identity reads the key while the stage is on: a capture job
+    # running as that identity (no distinct capture identity) could too.
+    if [[ "$normalisation_state" == "present" || "$posture" == BLOCKED\ the\ stage\ is\ on* ]] \
+       && [[ -z "$CAPTURE_SA" || "$CAPTURE_SA" == "$(milo_op WORKER_SERVICE_ACCOUNT)" ]]; then
+      posture="BLOCKED the stage is on but the capture job has no identity distinct from the worker's, which reads the provider key. Remediation: set CAPTURE_SERVICE_ACCOUNT, or bash scripts/deploy/website-execution-activate.sh --remove-manufacturer-normalisation"
+    fi
+    record_check "${posture%% *}" "cloud-run:normalisation-job" "${NORMALISATION_JOB}: ${posture#* }"
   fi
 fi
 

@@ -49,7 +49,7 @@ case "${args}" in
     [[ "${MOCK_IGNORE_UPDATES:-0}" == 1 ]] || rm -f "${MOCK_DIR}/normalisation.present" ;;
   "secrets get-iam-policy "*" --project p --format=json")
     cat "${MOCK_DIR}/policy-$3.json" 2> /dev/null || echo '{}' ;;
-  "secrets remove-iam-policy-binding "*" --project p --member serviceAccount:capture@p.iam.gserviceaccount.com --role roles/secretmanager.secretAccessor")
+  "secrets remove-iam-policy-binding "*" --project p --member serviceAccount:capture@p.iam.gserviceaccount.com --role roles/secretmanager.secretAccessor --all")
     [[ "${MOCK_IGNORE_UPDATES:-0}" == 1 ]] || rm -f "${MOCK_DIR}/policy-$3.json" ;;
   *) echo "unexpected gcloud invocation: ${args}" >&2; exit 9 ;;
 esac

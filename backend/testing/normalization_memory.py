@@ -135,9 +135,13 @@ class NormalizationMemoryMixin:
                 raise _refused("CATALOG_NORMALIZATION_REJECTION_INVALID")
             row = {"canonical_name": group["canonical"], "members": members, "rule_id": rule,
                    "proposal_id": proposal_id, "rejected_by": str(rejected_by)}
-            if row not in state["rejections"]:
+            # One record per group (the SQL's group_key): the first rejection stands.
+            key = {k: row[k] for k in ("canonical_name", "members", "rule_id", "proposal_id")}
+            existing = next((r for r in state["rejections"]
+                             if {k: r[k] for k in key} == key), None)
+            if existing is None:
                 state["rejections"].append(row)
-            return dict(row)
+            return dict(existing or row)
 
     def manufacturer_normalization_rejections(self) -> list[dict[str, Any]]:
         return [dict(row) for row in self._norm_state()["rejections"]]

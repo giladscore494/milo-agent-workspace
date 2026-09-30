@@ -603,16 +603,42 @@ milo_normalisation_posture() {
   esac
 }
 
-# milo_revoke_accessor SECRET MEMBER PROJECT — MEMBER holds no
-# secretAccessor on SECRET: removed where it holds one, then read back.
+# milo_policy_member_roles MEMBER < POLICY_JSON — every role MEMBER holds,
+# one per line (" conditional" appended for a conditional binding); nonzero
+# when the policy is not readable JSON (never "no roles").
+milo_policy_member_roles() {
+  python3 -c '
+import json, sys
+try:
+    policy = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(2)
+if not isinstance(policy, dict):
+    sys.exit(2)
+for b in policy.get("bindings") or []:
+    if isinstance(b, dict) and sys.argv[1] in (b.get("members") or []):
+        print(str(b.get("role")) + (" conditional" if b.get("condition") else ""))
+' "$1"
+}
+
+# milo_revoke_accessor SECRET MEMBER PROJECT — MEMBER holds no role at all on
+# SECRET: its secretAccessor bindings (conditional ones too, --all) removed,
+# then read back. Any OTHER role (admin, owner) is refused and named, never
+# removed silently; an unreadable policy is a failure.
 milo_revoke_accessor() {
-  local policy
+  local policy roles
   policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
-  milo_policy_has_member roles/secretmanager.secretAccessor "$2" <<< "$policy" || return 0
+  roles="$(milo_policy_member_roles "$2" <<< "$policy")" || return 1
+  [[ -n "$roles" ]] || return 0
+  if grep -qv '^roles/secretmanager.secretAccessor\( conditional\)\?$' <<< "$roles"; then
+    printf 'FAIL: %s holds %s on %s: remove it by hand.\n' "$2" "$(tr '\n' ' ' <<< "$roles")" "$1" >&2
+    return 1
+  fi
   gcloud secrets remove-iam-policy-binding "$1" --project "$3" --member "$2" \
-    --role roles/secretmanager.secretAccessor > /dev/null || return 1
+    --role roles/secretmanager.secretAccessor --all > /dev/null || return 1
   policy="$(gcloud secrets get-iam-policy "$1" --project "$3" --format=json)" || return 1
-  ! milo_policy_has_member roles/secretmanager.secretAccessor "$2" <<< "$policy"
+  roles="$(milo_policy_member_roles "$2" <<< "$policy")" || return 1
+  [[ -z "$roles" ]]
 }
 
 # Stage 2 (website execution), API service.
