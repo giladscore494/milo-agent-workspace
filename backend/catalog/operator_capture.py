@@ -1619,7 +1619,10 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         reason = _classify(failure)
         supervisor.stop()
         _finalize(repository, lease, document={}, reason_code=reason, cancelled=False)
-        return EXIT_FAILED, _envelope("failed", reason)
+        # A source refusal's structured detail (the numeric HTTP status of an
+        # unexpected answer, nothing else) is reported with its code.
+        detail = failure.detail if isinstance(failure, GovernmentSourceError) else {}
+        return EXIT_FAILED, _envelope("failed", reason, **({"detail": detail} if detail else {}))
     supervisor.stop()
 
     if register_document is not None:
@@ -1671,7 +1674,8 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         print(safe_message("CAPTURE_REPORT_NOT_WRITTEN"), file=sys.stderr)
         return EXIT_FAILED if status == EXIT_OK else status
     if document["reason_code"]:
-        print(f'{document["reason_code"]}: {document["reason"]}', file=sys.stderr)
+        detail = "".join(f" {key}={value}" for key, value in sorted((document.get("detail") or {}).items()))
+        print(f'{document["reason_code"]}: {document["reason"]}{detail}', file=sys.stderr)
     return status
 
 

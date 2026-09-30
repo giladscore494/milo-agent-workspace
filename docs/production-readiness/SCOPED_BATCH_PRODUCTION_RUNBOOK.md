@@ -557,7 +557,9 @@ snapshot and the exact batch.
 
 - `STOP: GOVERNMENT_SOURCE_UNREACHABLE (GOV_TRANSPORT_FAILED | GOV_HTTP_STATUS_UNEXPECTED …)`:
   the capture job could not read `data.gov.il` from Cloud Run. Record the
-  execution name, reason code and time. **This repository has no alternate
+  execution name, reason code, time and, for `GOV_HTTP_STATUS_UNEXPECTED`, the
+  numeric status the failure line reports (`http_status=<n>`; also `detail` in
+  the JSON report). **This repository has no alternate
   production import route.** `scripts/r5_capture_fixtures.py import-capture`
   writes *test fixtures* only and must never be used to create production
   evidence. Do not substitute cached, fixture or hand-built rows. Proceed only

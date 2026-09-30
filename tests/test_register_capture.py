@@ -25,10 +25,11 @@ from backend.catalog import operator_capture as entrypoint
 from backend.catalog.government import source as src
 from backend.catalog.government.capture_scope import CaptureScope
 from backend.catalog.government.client import DataGovClient
-from backend.catalog.government.directory import (DirectoryUnit, discover_directory,
-                                                  register_version)
+from backend.catalog.government.directory import (SCAN_TOTAL_ESTIMATION_THRESHOLD, DirectoryUnit,
+                                                  count_tozar, discover_directory, register_version)
 from backend.catalog.government.ingest import GovernmentCatalogIngestor
 from backend.catalog.government.source import GovernmentSourceError
+from backend.catalog.government.transport import HttpResponse
 from backend.catalog.register import archive as arc
 from backend.catalog.register import config as register_config
 from backend.catalog.register import coverage as coverage_module
@@ -203,13 +204,18 @@ class DirectoryClient:
     The register is a row list in `_id` order. ``distinct=true`` behaves the
     way data.gov.il does (production probes A/B, 2026-09-30): its ``total``
     counts the distinct values but its ``records`` are truncated -- ONE value
-    when sorted, 26 when not -- whatever the limit asked.
+    when sorted, 26 when not -- whatever the limit asked. An UNFILTERED scan
+    answers ``total_was_estimated: true`` unless it sends
+    ``total_estimation_threshold`` >= the code's constant (production probes,
+    2026-09-30); ``estimated`` answers estimated even then, and
+    ``drop_threshold`` sends the scan as #175 did, without the parameter.
     """
 
     def __init__(self, counts: Mapping[str | None, int], *, extra_fields: bool = False,
                  total_moves_on_page: int | None = None, short_page: int | None = None,
                  miscount: str | None = None, estimated: bool = False,
-                 total_bias: int = 0, distinct_fails: bool = False) -> None:
+                 total_bias: int = 0, distinct_fails: bool = False,
+                 drop_threshold: bool = False) -> None:
         self.counts = dict(counts)
         self.rows = [value for value, n in self.counts.items() for _ in range(n)]
         self.extra_fields = extra_fields
@@ -219,6 +225,7 @@ class DirectoryClient:
         self.estimated = estimated
         self.total_bias = total_bias
         self.distinct_fails = distinct_fails
+        self.drop_threshold = drop_threshold
         self.calls: list[dict[str, str]] = []
 
     @property
@@ -227,6 +234,8 @@ class DirectoryClient:
 
     def _request(self, action: str, params: Mapping[str, str]):
         assert action == src.DATASTORE_SEARCH
+        if self.drop_threshold:
+            params = {k: v for k, v in params.items() if k != "total_estimation_threshold"}
         self.calls.append(dict(params))
         result: dict[str, Any] = {"resource_id": params["resource_id"]}
         if params.get("distinct") == "true":
@@ -251,8 +260,9 @@ class DirectoryClient:
                 total += 1
             result.update(total=total, records=[
                 {"tozar": v, **({"degem": "x"} if self.extra_fields else {})} for v in rows])
-            if self.estimated:
-                result["total_was_estimated"] = True
+            threshold = int(params.get("total_estimation_threshold") or 0)
+            result["total_was_estimated"] = \
+                self.estimated or threshold < SCAN_TOTAL_ESTIMATION_THRESHOLD
         return {"success": True, "result": result}, None, None
 
 
@@ -270,10 +280,12 @@ def test_the_directory_is_metadata_only_bounded_and_exact():
     assert distinct == {"resource_id": src.WLTP_RESOURCE_ID, "fields": "tozar",
                         "distinct": "true", "limit": "0"}
     scans, counts = rest[:6], rest[6:]
-    assert [(c["fields"], c["sort"], c["limit"], c["offset"]) for c in scans] == [
-        ("tozar", "_id", "1000", str(offset)) for offset in range(0, 6000, 1000)]
+    assert [(c["fields"], c["sort"], c["limit"], c["offset"], c["total_estimation_threshold"])
+            for c in scans] == [("tozar", "_id", "1000", str(offset), "10000000")
+                                for offset in range(0, 6000, 1000)]
     assert all("distinct" not in c and "filters" not in c for c in scans)
-    assert all(call["limit"] == "0" and "fields" not in call for call in counts)
+    assert all(set(call) == {"resource_id", "limit", "filters"} and call["limit"] == "0"
+               for call in counts)
     assert len(counts) == 2 and found.requests == 9
 
 
@@ -299,8 +311,29 @@ def test_the_directory_scans_past_a_truncating_distinct_read():
     assert found.distinct_total == 137 and found.unfilterable_values == 0
     # 1 cross-check + 102 scan pages + 137 counts: inside the default cap.
     assert len(fake.scans) == 102 and found.requests == 240 < 6000
-    assert all(set(c) == {"resource_id", "fields", "sort", "limit", "offset"}
+    assert all(set(c) == {"resource_id", "fields", "sort", "limit", "offset",
+                          "total_estimation_threshold"}
                and c["fields"] == "tozar" for c in fake.scans)
+
+
+def test_every_scan_page_asks_for_an_exact_total():
+    # Production, 2026-09-30 (milo-catalog-capture-9t9v5): an unfiltered scan
+    # answers total_was_estimated=true, so #175's scan was refused on page 1.
+    assert SCAN_TOTAL_ESTIMATION_THRESHOLD == 10_000_000
+    counts = {TOYOTA: 1500, LEXUS: 700}
+    as_before = DirectoryClient(counts, drop_threshold=True)
+    with pytest.raises(GovernmentSourceError) as refused:
+        discover_directory(as_before, clock=lambda: 0.0)
+    assert refused.value.reason_code == "GOV_DIRECTORY_RESULT_INVALID" and len(as_before.scans) == 1
+    fake = DirectoryClient(counts)
+    found = discover_directory(fake, clock=lambda: 0.0)
+    assert {u.tozar: u.expected_rows for u in found.units} == counts
+    assert [c["total_estimation_threshold"] for c in fake.scans] == ["10000000"] * 3
+    # The distinct cross-check and the per-tozar counts are unchanged: exact
+    # already (filtered / distinct), so they never carry the parameter.
+    assert all("total_estimation_threshold" not in c for c in fake.calls if c not in fake.scans)
+    assert fake.calls[0] == {"resource_id": src.WLTP_RESOURCE_ID, "fields": "tozar",
+                             "distinct": "true", "limit": "0"}
 
 
 def test_an_unavailable_distinct_total_is_only_a_missing_cross_check():
@@ -319,6 +352,7 @@ def test_an_unavailable_distinct_total_is_only_a_missing_cross_check():
     # the rows counted fall short of / run past the scan's total
     ({"total_bias": 1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
     ({"total_bias": -1}, "GOV_DIRECTORY_RESULT_INVALID", 4, 0),
+    # the total is still estimated although the threshold was sent
     ({"estimated": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
     # a scan row carrying any field but tozar is row payload
     ({"extra_fields": True}, "GOV_DIRECTORY_RESULT_INVALID", 1, 0),
@@ -333,6 +367,82 @@ def test_an_inconsistent_scan_writes_no_directory_version(fault, reason, scan_pa
     assert len(fake.scans) == scan_pages
     assert sum("filters" in call for call in fake.calls) == counts
     assert repo.latest_register_directory() is None
+
+
+class StatusTransport:
+    """Answers every request with one non-200 status and a body that must never
+    leave the client (production: milo-catalog-capture-ns5qh logged only
+    GOV_HTTP_STATUS_UNEXPECTED, with no status to diagnose)."""
+
+    BODY = b"<html>Access denied LEAKED-BODY-MARKER</html>"
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.calls = 0
+
+    def get(self, url: str, *, params: Mapping[str, str], connect_timeout: float,
+            read_timeout: float, max_bytes: int) -> HttpResponse:
+        self.calls += 1
+        return HttpResponse(status=self.status, body=self.BODY, content_type="text/html",
+                            final_url=src.canonical_request_url(str(url).rsplit("/", 1)[-1], params))
+
+
+@pytest.mark.parametrize(("status", "attempts"), [(403, 1), (404, 1), (503, 3)])
+def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
+    # The retry policy is unchanged: only 429/5xx are retried (3 attempts).
+    assert src.RETRYABLE_STATUS_CODES == frozenset({429, 500, 502, 503, 504})
+    transport = StatusTransport(status)
+    client = DataGovClient(transport, sleep_fn=lambda _s: None)
+    with pytest.raises(GovernmentSourceError) as refused:
+        count_tozar(client, TOYOTA, clock=lambda: 0.0)
+    assert refused.value.reason_code == "GOV_HTTP_STATUS_UNEXPECTED"
+    assert refused.value.detail == {"http_status": status} and transport.calls == attempts
+    assert "LEAKED" not in str(refused.value) and "LEAKED" not in repr(vars(refused.value))
+    # The directory path: the distinct cross-check is optional, the scan is not.
+    transport = StatusTransport(status)
+    with pytest.raises(GovernmentSourceError) as refused:
+        discover_directory(DataGovClient(transport, sleep_fn=lambda _s: None), clock=lambda: 0.0)
+    assert refused.value.detail == {"http_status": status} and transport.calls == 2 * attempts
+    # Any other refusal carries no detail.
+    assert GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID").detail == {}
+
+
+def test_the_capture_job_logs_the_status_of_a_failed_directory_refresh(capsys, monkeypatch):
+    repo, w = world()
+    trigger = FakeTrigger()
+    started = client(repo, trigger).post(f"/projects/{w['project']}/register/directory",
+                                         headers=as_user(), json={"conversation_id": w["conversation"]})
+    assert started.status_code == 202, started.text
+    args = list(trigger.calls[0].entrypoint_args)
+    run_id = args[args.index("--run-id") + 1]
+    monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
+    monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
+    status = entrypoint.main(authorized_argv(run_id, **{"--register-directory": True}), env=env)
+    out, err = capsys.readouterr()
+    document = json.loads(out)
+    assert status == entrypoint.EXIT_FAILED
+    assert (document["reason_code"], document["detail"]) == ("GOV_HTTP_STATUS_UNEXPECTED",
+                                                             {"http_status": 403})
+    assert err.strip() == ("GOV_HTTP_STATUS_UNEXPECTED: "
+                           f"{src.GOVERNMENT_SOURCE_REASONS['GOV_HTTP_STATUS_UNEXPECTED']} http_status=403")
+    assert "LEAKED" not in out + err and "Access denied" not in out + err
+    assert repo.latest_register_directory() is None
+
+
+def test_a_unit_failed_by_an_unexpected_status_reports_its_number():
+    failing = DataGovClient(StatusTransport(403), page_limit=entrypoint.CAPTURE_PAGE_LIMIT,
+                            sleep_fn=lambda _s: None)
+    repo, _w, _version, report, _writer = captured_world(client=failing)
+    (unit,) = report.units
+    assert (unit.status, unit.failure_code, unit.http_status) == \
+        ("failed", "GOV_HTTP_STATUS_UNEXPECTED", 403)
+    assert unit.as_document()["http_status"] == 403
+    assert "LEAKED" not in json.dumps(report.as_document())
+    assert the_unit(repo)["failure_code"] == "GOV_HTTP_STATUS_UNEXPECTED"
+    # A unit that did not fail on a status carries no such key.
+    _repo, _w, _version, captured, _writer = captured_world()
+    assert "http_status" not in captured.units[0].as_document()
 
 
 @pytest.mark.parametrize(("rows", "pages"), [(0, 1), (1000, 1), (1001, 2), (2000, 2)])
