@@ -45,13 +45,14 @@ import unicodedata
 from typing import Any, Callable, Iterable, Mapping, Sequence
 from uuid import UUID
 
+from backend.capture_invocation import NORMALISATION_SWITCH
 from backend.production_config import TRUE_VALUES
 
 #: The website stage flag: the "Normalise manufacturers" button (API).
 FLAG = "MILO_ENABLE_MANUFACTURER_NORMALISATION"
 #: The capture job's per-execution switch (set only by the API's invocation);
 #: the model call's budget kill switch.
-JOB_SWITCH = "MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB"
+JOB_SWITCH = NORMALISATION_SWITCH
 MODEL = "kimi-k3"
 AGENT, PHASE = "normaliser", "manufacturers"
 MAX_SAMPLES = 3
@@ -137,8 +138,12 @@ def deterministic_groups(names: Mapping[str, int], evidence: Mapping[str, Mappin
             continue
         rule = "R2_TOZERET_CD" if any(find(n) == root for n in via_codes) else "R1_SPELLING"
         canonical = sorted(group, key=lambda n: (-int(names.get(n) or 0), n.encode("utf-8")))[0].strip()
+        if len(canonical) > MAX_CANONICAL_CHARS:
+            continue
+        # A shared manufacturer code can join two brands of one maker: approved alone.
         groups.append({"canonical": canonical, "members": sorted(group, key=lambda n: n.encode("utf-8")),
-                       "confidence": "high", "rule_id": rule, "reason": RULES[rule]})
+                       "confidence": "high" if rule == "R1_SPELLING" else "low", "rule_id": rule,
+                       "reason": RULES[rule]})
     return sorted(groups, key=lambda g: g["canonical"].encode("utf-8"))
 
 
@@ -214,6 +219,7 @@ def validate_groups(text: Any, input_names: Iterable[str]) -> list[dict[str, Any
         if (not isinstance(canonical, str) or not 1 <= len(canonical) <= MAX_CANONICAL_CHARS
                 or canonical.strip() != canonical or group["confidence"] not in CONFIDENCE
                 or not isinstance(group["reason"], str) or len(group["reason"]) > MAX_REASON_CHARS
+                or not _storable(canonical) or not _storable(group["reason"])
                 or not isinstance(members, list) or not members
                 or not all(isinstance(m, str) for m in members)):
             raise NormalizationRefused("NORMALIZATION_OUTPUT_SHAPE_INVALID")
@@ -225,6 +231,11 @@ def validate_groups(text: Any, input_names: Iterable[str]) -> list[dict[str, Any
         out.append({"canonical": canonical, "members": list(members), "confidence": group["confidence"],
                     "reason": group["reason"]})
     return out
+
+
+def _storable(text: str) -> bool:
+    """No control character or lone surrogate: the database's JSON refuses them."""
+    return not any(unicodedata.category(ch) in ("Cc", "Cs") for ch in text)
 
 
 def propose(repository: Any, lease: Any, proposal_id: str, *, env: Mapping[str, str] | None = None,

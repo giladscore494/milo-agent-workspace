@@ -71,7 +71,7 @@ REQUEST_REASONS: Mapping[str, tuple[int, str]] = {
     # PR-D3.
     "CATALOG_NORMALIZATION_DISABLED": (404, "manufacturer normalisation is not enabled"),
     "CATALOG_NORMALIZATION_NOTHING_UNMAPPED": (409, "every source manufacturer name is already mapped"),
-    "CATALOG_NORMALIZATION_OWNER_ONLY": (403, "only a project owner approves a normalisation"),
+    "CATALOG_NORMALIZATION_OWNER_ONLY": (403, "only a project owner starts or approves a normalisation"),
     "CATALOG_NORMALIZATION_APPROVAL_INVALID": (422, "that is not a pending group, or it must be approved alone"),
     "CATALOG_NORMALIZATION_VERSION_STALE": (409, "the active normalisation changed; reload"),
 }
@@ -419,7 +419,9 @@ def _pending(repo: Any) -> dict[str, Any]:
     rules = normalization.deterministic_groups(names, evidence, active)
     proposal = repo.latest_manufacturer_normalization_proposal()
     model = [dict(group, proposal_id=str(proposal["id"]))
-             for group in (proposal or {}).get("groups") or []] if (proposal or {}).get("status") == "proposed" else []
+             for group in (proposal or {}).get("groups") or []
+             if any(active.get(m) != group["canonical"] for m in group["members"])
+             ] if (proposal or {}).get("status") == "proposed" else []
     pending = rules + model
     for group in pending:
         group["conflicting"] = normalization.conflicts(group, active, pending)
@@ -439,6 +441,7 @@ def normalization_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: A
     if not _supported(repo.get_project(project_id, user_id)):
         raise _refusal("CATALOG_REGISTER_DISABLED")
     state = _pending(repo)
+    owner = repo.project_member_role(project_id, user_id) == "owner"
     canonical: dict[str, list[str]] = {}
     for source, name in sorted(state["active"].items(), key=lambda item: item[0].encode("utf-8")):
         canonical.setdefault(name, []).append(source)
@@ -450,8 +453,9 @@ def normalization_view(repo: Any, user_id: UUID, project_id: UUID, *, trigger: A
         "pending": state["pending"],
         "proposal": None if proposal is None else {
             key: proposal.get(key) for key in ("id", "status", "reason_code", "model", "created_at")},
-        "can_normalise": normalization.enabled(environment) and trigger is not None and state["unmapped"] > 0,
-        "can_approve": repo.project_member_role(project_id, user_id) == "owner",
+        "can_normalise": (normalization.enabled(environment) and trigger is not None and state["unmapped"] > 0
+                          and owner),
+        "can_approve": owner,
     }
 
 
@@ -465,6 +469,8 @@ def request_normalization(repo: Any, user_id: UUID, project_id: UUID, *, convers
         if not normalization.enabled(environment):
             raise _refusal("CATALOG_NORMALIZATION_DISABLED")
         _authorized_conversation(repo, user_id, project_id, conversation_id)
+        if repo.project_member_role(project_id, user_id) != "owner":
+            raise _refusal("CATALOG_NORMALIZATION_OWNER_ONLY")  # it spends the owner's daily budget
         if trigger is None:
             raise _refusal("CATALOG_REGISTER_UNAVAILABLE")
         _release_gate(trigger)

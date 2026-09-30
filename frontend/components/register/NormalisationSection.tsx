@@ -71,7 +71,10 @@ export function NormalisationSection({ projectId, conversationId, client }: {
           ))}
         </ul>
       )}
-      {view.proposal?.status === 'requested' && <p className="muted" role="status">The model proposal is running.</p>}
+      {view.proposal?.status === 'requested' && (
+        <p className="muted" role="status">A model proposal was requested. Reload when it ends; if it never
+          does, press the button again.</p>
+      )}
       {view.proposal?.status === 'refused' && (
         <p className="note">The last model proposal was refused: <span className="identifier">
           {safeText(view.proposal.reasonCode ?? 'UNKNOWN')}</span></p>

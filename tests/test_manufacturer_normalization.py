@@ -60,6 +60,8 @@ def test_r2_joins_names_with_the_same_register_codes_and_mapped_names_are_left_a
     groups = {g["rule_id"]: g for g in norm.deterministic_groups(names(), evidence)}
     assert groups["R2_TOZERET_CD"]["members"] == sorted([HONDA, HONDA_JP], key=str.encode)
     assert groups["R2_TOZERET_CD"]["canonical"] == HONDA          # the most rows
+    # One maker's codes may carry two brands: an R2 group is approved alone.
+    assert groups["R2_TOZERET_CD"]["confidence"] == "low"
     # Toyota and Lexus share one code but not the SAME set: not joined.
     assert all(TOYOTA not in g["members"] for g in groups.values())
     # A mapped name is never proposed again.
@@ -89,6 +91,11 @@ VALID = {"groups": [{"canonical": "Mercedes-Benz", "members": [MERCEDES, MERCEDE
      "NORMALIZATION_MEMBER_DUPLICATED"),
     (json.dumps({"groups": [{"canonical": "A", "members": [LEXUS, LEXUS], "confidence": "high", "reason": ""}]}),
      "NORMALIZATION_MEMBER_DUPLICATED"),
+    # Text the database's JSON cannot store: refused, never a failed write after the call.
+    (json.dumps({"groups": [{"canonical": "X\u0000", "members": [TOYOTA], "confidence": "high", "reason": ""}]}),
+     "NORMALIZATION_OUTPUT_SHAPE_INVALID"),
+    ('{"groups": [{"canonical": "X", "members": ["%s"], "confidence": "high", "reason": "\\ud800"}]}' % TOYOTA,
+     "NORMALIZATION_OUTPUT_SHAPE_INVALID"),
 ])
 def test_the_contract_refuses_anything_but_groups_of_input_names(answer, code):
     with pytest.raises(norm.NormalizationRefused) as refused:
@@ -225,6 +232,10 @@ def test_high_confidence_groups_together_and_any_other_alone():
     # Something the server did not propose is refused.
     assert approve([dict(pending[("Toyota", None)], canonical="Toyota Motor")]).status_code == 422
     assert approve([pending[("Toyota", None)]]).json() == {"version": 1, "entry_count": 1}
+    # An approved group is no longer pending: it cannot be approved into a new version again.
+    again = api.get(f"/projects/{w['project']}/register/normalisation", headers=as_user()).json()["pending"]
+    assert ("Toyota", None) not in {(g["canonical"], g.get("rule_id")) for g in again}
+    assert approve([pending[("Toyota", None)]], version=1).status_code == 422
     assert approve([pending[("Lexus", None)]]).status_code == 409          # stale version
     assert approve([pending[("Lexus", None)]], version=1).json()["version"] == 2
     assert approve([pending[(MERCEDES, "R1_SPELLING")]], version=2).json() == {"version": 3, "entry_count": 4}
@@ -250,6 +261,11 @@ def test_only_an_owner_approves_and_the_button_needs_its_flag(monkeypatch):
                                                "proposal_id": proposal_id}]}
     refused = api.post(f"/projects/{w['project']}/register/normalisation/approvals", headers=as_user(), json=body)
     assert refused.status_code == 403 and refused.json()["error"]["code"] == "CATALOG_NORMALIZATION_OWNER_ONLY"
+    # The paid call spends the owner's daily budget: only an owner starts it.
+    assert view["can_normalise"] is False
+    pressed = api.post(f"/projects/{w['project']}/register/normalisation", headers=as_user(),
+                       json={"conversation_id": w["conversation"]})
+    assert pressed.status_code == 403 and pressed.json()["error"]["code"] == "CATALOG_NORMALIZATION_OWNER_ONLY"
     monkeypatch.setenv(norm.FLAG, "false")
     closed = api.post(f"/projects/{w['project']}/register/normalisation", headers=as_user(),
                       json={"conversation_id": w["conversation"]})

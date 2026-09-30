@@ -27,6 +27,7 @@ Code-owned rules. The database accepts only these rule ids.
 
 - Only unmapped names are grouped.
 - The canonical name is the member with the most rows.
+- An R1 group is high confidence. An R2 group is low confidence and is approved alone, because one maker's codes can carry two brands.
 - A rule group is a pending proposal like the model's: it becomes active only when the owner approves it.
 
 ## 2. The one K3 call (decision 14)
@@ -51,6 +52,7 @@ The server validates the answer, in Python and again in the database (`catalog_n
 - No name appears twice: `NORMALIZATION_MEMBER_DUPLICATED`.
 - The keys, the confidence and the text bounds are exact: `NORMALIZATION_OUTPUT_SHAPE_INVALID`.
 - The answer is JSON: `NORMALIZATION_OUTPUT_NOT_JSON`.
+- No control character or lone surrogate, which the database's JSON cannot store: `NORMALIZATION_OUTPUT_SHAPE_INVALID`.
 
 Anything else is recorded as a refused proposal with that code. A budget refusal is recorded as `NORMALIZATION_BUDGET_REFUSED`, any other failure as `NORMALIZATION_MODEL_FAILED`.
 
@@ -66,7 +68,9 @@ Anything else is recorded as a refused proposal with that code. A budget refusal
 
 ## 3. Approval (decision 15)
 
-Only a project **owner** approves (`project_members.role`); anyone else gets `CATALOG_NORMALIZATION_OWNER_ONLY`.
+Only a project **owner** presses the button (it spends the owner's daily budget) and approves (`project_members.role`); anyone else gets `CATALOG_NORMALIZATION_OWNER_ONLY`.
+
+A model group that the active mapping already holds is no longer pending.
 
 - **Together:** every high-confidence group that conflicts with nothing can be approved in one call.
 - **Alone:** a low-confidence group, or a conflicting one, is approved on its own. A group conflicts when it re-maps an active name to another canonical name, or shares a member with another pending group.
@@ -84,7 +88,7 @@ Only a project **owner** approves (`project_members.role`); anyone else gets `CA
 | `MILO_ENABLE_MANUFACTURER_NORMALISATION` | API | Stage A pinned off. The button. The view and approvals ride the Register page's flag, `MILO_ENABLE_REGISTER_CAPTURE`. |
 | `MILO_ENABLE_MANUFACTURER_NORMALISATION_JOB` | Capture job, per execution | Pinned off on the job. |
 
-While the stage is on, the capture job carries the provider key (`KIMI_API_KEY`) and the shared quota store (`UPSTASH_REDIS_REST_*`) as secret bindings. The capture identity has `roles/secretmanager.secretAccessor` on exactly those three secrets. The bindings go away in three ways:
+While the stage is on, the capture job carries the provider key (`KIMI_API_KEY`) and the shared quota store (`UPSTASH_REDIS_REST_*`) as secret bindings. The capture identity has `roles/secretmanager.secretAccessor` on exactly those three secrets. That grant is a standing one: the capture identity falls back to the worker's, which needs the key. The job's bindings go away in three ways:
 - every capture-job ensure (`--set-secrets`) re-creates the job without them
 - a Stage A deploy
 - the kill switch, which removes `KIMI_API_KEY` from the capture job and reads it back

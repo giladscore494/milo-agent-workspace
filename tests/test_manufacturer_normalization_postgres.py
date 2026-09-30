@@ -99,7 +99,12 @@ def test_the_database_holds_no_invented_or_duplicated_name(ndb, proposal):
     invented = [dict(GROUPS[0], members=[MERCEDES, "מרצדס"])]
     duplicated = [GROUPS[0], dict(GROUPS[1], members=[LEXUS, MERCEDES])]
     extra_key = [dict(GROUPS[0], note="x")]
-    for groups in (invented, duplicated, extra_key):
+    # Parity with the Python contract: a null confidence, a canonical with a
+    # leading tab, a control character, and a group that is not an object.
+    null_confidence = [dict(GROUPS[0], confidence=None)]
+    tabbed = [dict(GROUPS[0], canonical="\tMercedes-Benz")]
+    control = [dict(GROUPS[0], reason="a\u0001b")]
+    for groups in (invented, duplicated, extra_key, null_confidence, tabbed, control, ["x"], [[MERCEDES]]):
         with pytest.raises(AssertionError, match="CATALOG_NORMALIZATION_OUTPUT_INVALID"):
             _record(ndb, proposal, "proposed", groups)
     # Another run's lease is refused.

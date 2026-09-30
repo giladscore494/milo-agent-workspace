@@ -117,25 +117,33 @@ language sql
 immutable
 set search_path = pg_catalog
 as $$
-  select coalesce(
-    jsonb_typeof(p_groups) = 'array'
-    and not exists (
+  -- Each shape test is evaluated only for an object of the right key set
+  -- (CASE, not an OR chain the planner may reorder), and a NULL is a failure.
+  select case when jsonb_typeof(p_groups) <> 'array' then false else coalesce(
+    not exists (
       select 1 from jsonb_array_elements(p_groups) g
-       where jsonb_typeof(g) <> 'object'
-          or (select array_agg(k order by k) from jsonb_object_keys(g) k)
-             is distinct from array['canonical', 'confidence', 'members', 'reason']
-          or jsonb_typeof(g->'canonical') <> 'string'
-          or char_length(g->>'canonical') not between 1 and 120 or btrim(g->>'canonical') <> g->>'canonical'
-          or g->>'confidence' not in ('high', 'low')
-          or jsonb_typeof(g->'reason') <> 'string' or char_length(g->>'reason') > 300
-          or jsonb_typeof(g->'members') <> 'array' or jsonb_array_length(g->'members') < 1
-          or exists (select 1 from jsonb_array_elements(g->'members') m
-                      where jsonb_typeof(m) <> 'string'
-                         or not exists (select 1 from jsonb_array_elements(p_input) i
-                                         where i->>'name' = m #>> '{}')))
+       where case
+               when jsonb_typeof(g) <> 'object' then true
+               when (select array_agg(k order by k) from jsonb_object_keys(g) k)
+                    is distinct from array['canonical', 'confidence', 'members', 'reason'] then true
+               when jsonb_typeof(g->'canonical') <> 'string' or jsonb_typeof(g->'reason') <> 'string'
+                    or jsonb_typeof(g->'members') <> 'array' then true
+               else not coalesce(
+                 char_length(g->>'canonical') between 1 and 120
+                 -- no leading/trailing whitespace (Python's strip) and no control character
+                 and g->>'canonical' !~ '^[[:space:]]|[[:space:]]$' and g->>'canonical' !~ '[[:cntrl:]]'
+                 and g->>'confidence' in ('high', 'low')
+                 and char_length(g->>'reason') <= 300 and g->>'reason' !~ '[[:cntrl:]]'
+                 and jsonb_array_length(g->'members') >= 1
+                 and not exists (select 1 from jsonb_array_elements(g->'members') m
+                                  where jsonb_typeof(m) <> 'string'
+                                     or not exists (select 1 from jsonb_array_elements(p_input) i
+                                                     where i->>'name' = m #>> '{}')), false)
+             end)
     and (select count(*) = count(distinct m #>> '{}')
-           from jsonb_array_elements(p_groups) g, jsonb_array_elements(g->'members') m),
-    false)
+           from jsonb_array_elements(p_groups) g, jsonb_array_elements(g->'members') m
+          where jsonb_typeof(g) = 'object' and jsonb_typeof(g->'members') = 'array'),
+    false) end
 $$;
 
 -- ---------------------------------------------------------------------------
