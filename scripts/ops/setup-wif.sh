@@ -202,7 +202,7 @@ REQUIRED_APIS=(cloudresourcemanager.googleapis.com iam.googleapis.com iamcredent
                artifactregistry.googleapis.com serviceusage.googleapis.com
                logging.googleapis.com)   # build logs: CLOUD_LOGGING_ONLY
 for api in "${REQUIRED_APIS[@]}"; do
-  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name:${api}" \
+  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name=${api}" \
           --format='value(config.name)' 2> /dev/null)" == "$api" ]]; then
     ok "API ${api} enabled"
   else

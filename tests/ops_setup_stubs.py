@@ -11,7 +11,7 @@ understood; anything else fails loudly (exit 90).
 from __future__ import annotations
 
 STUB_SOURCE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 
 state_path = Path(os.environ["STUB_STATE"])
@@ -62,8 +62,12 @@ if tool == "gcloud":
     if args[:2] == ["projects", "get-iam-policy"]:
         done(json.dumps(policy("project")))
     if args[:3] == ["services", "list", "--enabled"]:
-        api = opt("--filter").split(":", 1)[1]
-        done(api if api in state.setdefault("apis", []) else "")
+        # gcloud's filter: `config.name=X` is exact; `config.name:X` is not:
+        # production answered storage.googleapis.com with bigquerystorage,
+        # storage-api, storage-component and storage, one per line.
+        exact, api = re.match(r"config\.name([=:])(.*)$", opt("--filter")).groups()
+        enabled = state.setdefault("apis", [])
+        done("\n".join(a for a in enabled if (a == api if exact == "=" else api.split(".")[0] in a)))
     if args[:2] == ["services", "enable"]:
         state["apis"].append(args[2]); mutate("enable", args[2]); done()
     if args[:3] == ["storage", "buckets", "describe"]:
@@ -134,9 +138,13 @@ elif tool == "gh":
         if len(parts) == 3:
             done("424242" if "--jq" in args else json.dumps({"id": 424242}))
         name = parts[4]
+        # A missing environment: `gh api` prints the error document on STDOUT
+        # and exits 1 (a --jq read prints nothing).
+        not_found = "" if "--jq" in args else json.dumps(
+            {"message": "Not Found", "documentation_url": "https://docs.github.com/rest", "status": "404"})
         if path.endswith("/deployment-branch-policies") or "/deployment-branch-policies/" in path:
             env = envs.get(name)
-            if env is None: done("", 1)
+            if env is None: done(not_found, 1)
             if method == "GET":
                 if "--jq" in args:
                     done("\n".join(f'{p["id"]} {p["name"]}' for p in env["branches"]))
@@ -149,7 +157,8 @@ elif tool == "gh":
                 mutate("delete-branch-policy", name); done()
         if method == "GET":
             env = envs.get(name)
-            if env is None: done("", 1)
+            if env is None: done(not_found, 1)
+            if state.get("gh_environment_garbage"): done("<html>not json</html>")
             done(json.dumps({"name": name, "protection_rules": env["rules"],
                              "deployment_branch_policy": env["policy"]}))
         if method == "PUT":

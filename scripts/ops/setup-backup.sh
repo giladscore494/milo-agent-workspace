@@ -169,11 +169,11 @@ pass "${DEPLOYER_ID} is impersonable only from the production and production-kil
 
 # 1. APIs ---------------------------------------------------------------------
 for api in storage.googleapis.com iam.googleapis.com iamcredentials.googleapis.com sts.googleapis.com; do
-  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name:${api}" \
+  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name=${api}" \
           --format='value(config.name)' 2> /dev/null)" != "$api" ]] && applying; then
     quiet gcloud services enable "$api" --project "$PROJECT_ID" || true
   fi
-  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name:${api}" \
+  if [[ "$(gcloud services list --enabled --project "$PROJECT_ID" --filter="config.name=${api}" \
           --format='value(config.name)' 2> /dev/null)" == "$api" ]]; then
     pass "API ${api} enabled"
   else
@@ -358,13 +358,26 @@ fi
 
 # 7. The GitHub environment, its secrets and variables -------------------------------------
 repo_api="repos/${GITHUB_REPOSITORY_NAME}/environments/${ENVIRONMENT_NAME}"
+# `gh api` prints its error document (e.g. {"message":"Not Found",...}) on
+# STDOUT and exits non-zero, so a failed read is "{}" (missing) -- its body is
+# never used, and never concatenated with anything.
+gh_api_json() {
+  local body
+  if body="$(gh api "$1" 2> /dev/null)"; then printf '%s' "$body"; else printf '{}'; fi
+}
 environment_problems() {
   local env_json branches_json
-  env_json="$(gh api "$repo_api" 2> /dev/null || printf '{}')"
-  branches_json="$(gh api "${repo_api}/deployment-branch-policies" 2> /dev/null || printf '{}')"
+  env_json="$(gh_api_json "$repo_api")"
+  branches_json="$(gh_api_json "${repo_api}/deployment-branch-policies")"
+  # Anything unreadable is a visible problem (a FAIL line), never a silent exit.
   python3 -c '
 import json, sys
-env, branches = json.loads(sys.argv[1] or "{}"), json.loads(sys.argv[2] or "{}")
+try:
+    env, branches = json.loads(sys.argv[1] or "{}"), json.loads(sys.argv[2] or "{}")
+except ValueError:
+    print("unreadable"); sys.exit()
+if not isinstance(env, dict) or not isinstance(branches, dict):
+    print("unreadable"); sys.exit()
 if not env.get("name"):
     print("missing"); sys.exit()
 problems = []
@@ -376,7 +389,7 @@ if not policy.get("custom_branch_policies"):
 names = sorted((p.get("name"), p.get("type", "branch")) for p in branches.get("branch_policies") or [])
 if names != [("main", "branch")]:
     problems.append("branches")
-print(" ".join(problems))' "$env_json" "$branches_json"
+print(" ".join(problems))' "$env_json" "$branches_json" 2> /dev/null || printf 'unreadable\n'
 }
 if [[ -n "$(environment_problems)" ]] && applying; then
   printf '{"wait_timer": 0, "reviewers": null, "deployment_branch_policy": {"protected_branches": false, "custom_branch_policies": true}}' \
