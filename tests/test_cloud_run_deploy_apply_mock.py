@@ -122,7 +122,7 @@ case "$args" in
     echo "$MOCK_PROJECT" ;;
   "services list"*)
     for a in "$@"; do
-      case "$a" in --filter=config.name:*) echo "${a#--filter=config.name:}" ;; esac
+      case "$a" in --filter=config.name=*) echo "${a#--filter=config.name=}" ;; esac
     done ;;
   "iam service-accounts describe"*)
     echo "$3" ;;
