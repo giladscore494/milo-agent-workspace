@@ -10,10 +10,14 @@ name: Register retention
 # coverage ledger. Database rows only: no archive object is ever deleted.
 # PR-L2, operation=vacuum-full (scripts/ops/register-vacuum.sh): mode=dry-run
 # prints the sizes of catalog_raw_records and catalog_candidate_variants,
-# pg_database_size and what is live; mode=apply with confirm=VACUUM refuses
-# while any run or register capture is live, then VACUUM (FULL, ANALYZE) each
-# table (ACCESS EXCLUSIVE while it rewrites it; at most 5 s waiting for the
-# lock) as the release read-only role, and prints the sizes after.
+# pg_database_size, what is live and whether the owner connection owns both;
+# mode=apply with confirm=VACUUM then, before EACH table, refuses while any
+# run or register capture is live or without the headroom for its copy
+# (pg_database_size + table x 1.1 <= 450 MB), and VACUUM (FULL, ANALYZE) it
+# (ACCESS EXCLUSIVE while it rewrites it; at most 5 s waiting for the lock) as
+# the tables' OWNER -- the migrations' own credential (SUPABASE_DB_PASSWORD,
+# given to that step only, through PGPASSWORD, never printed) -- and prints
+# the sizes after.
 # Runs in the `production` environment, whose required reviewers approve each
 # dispatch before it starts.
 
@@ -146,22 +150,34 @@ jobs:
         run: command -v psql > /dev/null || { sudo apt-get update && sudo apt-get install -y postgresql-client; }
 
       - name: Register retention
+        if: ${{ inputs.operation == 'prune' }}
         env:
-          OPERATION_INPUT: ${{ inputs.operation }}
           MODE_INPUT: ${{ inputs.mode }}
           CONFIRM_INPUT: ${{ inputs.confirm }}
           DIGEST_INPUT: ${{ inputs.digest }}
           MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
         run: |
           set -euo pipefail
-          if [[ "${OPERATION_INPUT}" == "vacuum-full" ]]; then
-            if [[ "${MODE_INPUT}" == "apply" ]]; then
-              bash scripts/ops/register-vacuum.sh --apply --confirm "${CONFIRM_INPUT}"
-            else
-              bash scripts/ops/register-vacuum.sh --sizes
-            fi
-          elif [[ "${MODE_INPUT}" == "apply" ]]; then
+          if [[ "${MODE_INPUT}" == "apply" ]]; then
             bash scripts/ops/register-retention.sh --apply --confirm "${CONFIRM_INPUT}" --digest "${DIGEST_INPUT}"
           else
             bash scripts/ops/register-retention.sh --list
+          fi
+
+      # The owner's credential reaches this step only (the migrations' own,
+      # same reviewer-gated environment); the script passes it as PGPASSWORD.
+      - name: Register space reclamation
+        if: ${{ inputs.operation == 'vacuum-full' }}
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+          CONFIRM_INPUT: ${{ inputs.confirm }}
+          MILO_READONLY_DB_URL: ${{ secrets.MILO_READONLY_DB_URL }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
+        run: |
+          set -euo pipefail
+          if [[ "${MODE_INPUT}" == "apply" ]]; then
+            bash scripts/ops/register-vacuum.sh --apply --confirm "${CONFIRM_INPUT}"
+          else
+            bash scripts/ops/register-vacuum.sh --sizes
           fi

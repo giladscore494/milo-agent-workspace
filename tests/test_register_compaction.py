@@ -75,16 +75,21 @@ def readers(repo: MemoryRepository, snapshot: dict[str, Any]) -> dict[str, Any]:
     return answers
 
 
+def applied(repo, snapshot, writer) -> dict[str, Any]:
+    """The operator's and the capture job's apply: dry-run, the archive read back, then apply."""
+    return compaction.apply_verified(repo, writer, snapshot["snapshot_key"], str(snapshot["id"]))
+
+
 def test_the_capture_job_compacts_a_built_archived_snapshot_and_every_reader_answers_the_same():
-    repo, snapshot, _writer = uncompacted()
+    repo, snapshot, writer = uncompacted()
     before = readers(repo, snapshot)
     assert before["37425"][0] == 1 and before["90001"][2] == ("ramat_gimur",)
-    answer = compaction.compact(repo, snapshot["snapshot_key"], apply=True)
+    answer = applied(repo, snapshot, writer)
     assert answer["status"] == "compacted" and answer["payloads_removed"] == 19
     assert all(r["payload"] is None for r in repo.catalog_raw_records.values()
                if str(r["snapshot_id"]) == str(snapshot["id"]))
     assert readers(repo, snapshot) == before
-    assert compaction.compact(repo, snapshot["snapshot_key"], apply=True)["status"] == "unchanged"
+    assert applied(repo, snapshot, writer)["status"] == "unchanged"
     # The capture job does the same by itself, and reports it.
     _repo, _w, _v, report, _wr = captured_world(rows_with_shapes())
     assert report.units[0].compaction == {"status": "compacted"}
@@ -92,10 +97,10 @@ def test_the_capture_job_compacts_a_built_archived_snapshot_and_every_reader_ans
 
 
 def test_the_typed_reading_is_the_payloads_projection_for_every_committed_row():
-    repo, snapshot, _writer = uncompacted()
+    repo, snapshot, writer = uncompacted()
     payloads = {r["upstream_record_id"]: r["payload"] for r in repo.catalog_raw_records.values()
                 if str(r["snapshot_id"]) == str(snapshot["id"])}
-    compaction.compact(repo, snapshot["snapshot_key"], apply=True)
+    applied(repo, snapshot, writer)
     for record_id, payload in payloads.items():
         reading = repo.catalog_compacted_record_reading(snapshot["id"], record_id)
         assert reading_projection(reading) == identity_projection(payload)
@@ -103,8 +108,8 @@ def test_the_typed_reading_is_the_payloads_projection_for_every_committed_row():
 
 
 def test_a_compacted_snapshot_is_never_rebuilt_from_the_database(monkeypatch, capsys):
-    repo, snapshot, _writer = uncompacted()
-    compaction.compact(repo, snapshot["snapshot_key"], apply=True)
+    repo, snapshot, writer = uncompacted()
+    applied(repo, snapshot, writer)
     # The current mapper's complete build is unchanged, without a read.
     assert mapper.build_snapshot_variants(repo, snapshot["id"])["status"] == "unchanged"
     monkeypatch.setattr(mapper, "MAPPER_VERSION", "gov.wltp.variant-mapper.9")
@@ -120,19 +125,48 @@ def test_a_compacted_snapshot_is_never_rebuilt_from_the_database(monkeypatch, ca
 
 
 def test_the_compaction_after_a_build_never_raises_and_reports_a_refusal():
-    repo, snapshot, _writer = uncompacted()
-    assert compaction.compact_after_build(repo, snapshot["snapshot_key"], {"status": "failed"}) == \
+    repo, snapshot, writer = uncompacted()
+    key, sid = snapshot["snapshot_key"], str(snapshot["id"])
+    assert compaction.compact_after_build(repo, key, {"status": "failed"}, writer=writer, snapshot_id=sid) == \
         {"status": "skipped"}
     repo._register_state()["archives"].clear()
-    assert compaction.compact_after_build(repo, snapshot["snapshot_key"], {"status": "built"}) == \
+    assert compaction.compact_after_build(repo, key, {"status": "built"}, writer=writer, snapshot_id=sid) == \
         {"status": "refused", "code": "CATALOG_COMPACTION_ARCHIVE_MISSING"}
 
     class Broken:
-        def compact_register_snapshot(self, *_args):
+        def compact_register_snapshot(self, *_args, **_kwargs):
             raise RuntimeError("database down")
 
-    assert compaction.compact_after_build(Broken(), "cs1.x", {"status": "built"}) == \
+    assert compaction.compact_after_build(Broken(), "cs1.x", {"status": "built"}, snapshot_id="x") == \
         {"status": "failed", "code": "CATALOG_COMPACTION_FAILED"}
+
+
+def test_no_payload_is_removed_unless_the_archive_bytes_read_back_as_recorded():
+    """PR-L2 blocker 1: the archive object is read back and hashed before any
+    apply. A same-size corrupted object, an unreadable one or an apply that
+    names no verified sha256 removes nothing."""
+    repo, snapshot, writer = uncompacted()
+    key, sid = snapshot["snapshot_key"], str(snapshot["id"])
+    (name,) = writer.objects
+    good = writer.objects[name]
+    corrupted = bytearray(good)
+    corrupted[len(corrupted) // 2] ^= 0xFF
+    writer.objects[name] = bytes(corrupted)
+    assert len(writer.objects[name]) == len(good)
+    with pytest.raises(compaction.CompactionError, match="CATALOG_COMPACTION_ARCHIVE_UNVERIFIED"):
+        applied(repo, snapshot, writer)
+    assert compaction.compact_after_build(repo, key, {"status": "built"}, writer=writer, snapshot_id=sid) == \
+        {"status": "failed", "code": "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED"}
+    del writer.objects[name]
+    with pytest.raises(compaction.CompactionError, match="CATALOG_COMPACTION_ARCHIVE_UNVERIFIED"):
+        applied(repo, snapshot, writer)
+    # The database refuses an apply that names no verified sha256, or another one.
+    for claimed in (None, "0" * 64):
+        answer = compaction.compact(repo, key, apply=True, verified_sha256=claimed)
+        assert (answer["status"], answer["code"]) == ("refused", "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED")
+    assert all(r["payload"] is not None for r in repo.catalog_raw_records.values() if str(r["snapshot_id"]) == sid)
+    writer.objects[name] = good
+    assert applied(repo, snapshot, writer)["status"] == "compacted"
 
 
 def test_every_precondition_is_refused_by_the_mirror():
@@ -179,7 +213,7 @@ def test_the_original_record_comes_from_the_archive_and_is_checked(capsys):
     repo, snapshot, writer = uncompacted()
     original = next(r["payload"] for r in repo.catalog_raw_records.values()
                     if str(r["snapshot_id"]) == str(snapshot["id"]) and r["upstream_record_id"] == "37425")
-    compaction.compact(repo, snapshot["snapshot_key"], apply=True)
+    applied(repo, snapshot, writer)
     assert compaction.source_record(repo, writer, snapshot["id"], "37425") == original
     assert compaction.main(["--snapshot-key", snapshot["snapshot_key"], "--show-record", "37425"],
                            repository=repo, archive_client=writer) == 0
@@ -193,7 +227,8 @@ def test_the_original_record_comes_from_the_archive_and_is_checked(capsys):
     with pytest.raises(compaction.CompactionError) as unreadable:
         compaction.source_record(repo, writer, snapshot["id"], "37425")
     assert unreadable.value.code == "CATALOG_ARCHIVE_UNREADABLE"
-    repo._register_state()["archives"][str(snapshot["id"])]["sha256"] = hashlib.sha256(writer.objects[name]).hexdigest()
+    repo._register_state()["archives"][str(snapshot["id"])].update(
+        sha256=hashlib.sha256(writer.objects[name]).hexdigest(), byte_size=len(writer.objects[name]))
     with pytest.raises(compaction.CompactionError) as mismatch:
         compaction.source_record(repo, writer, snapshot["id"], "37425")
     assert mismatch.value.code == "CATALOG_ARCHIVE_LINE_MISMATCH"
@@ -273,7 +308,8 @@ def test_the_capture_job_keeps_a_superseded_capture_as_its_referenced_rows(capsy
     assert compaction.main(["--snapshot-key", new["snapshot_key"], "--apply"], repository=repo,
                            archive_client=writer) == 0
     capsys.readouterr()
-    done = compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer)
+    done = compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer,
+                                          snapshot_id=str(new["id"]))
     assert done == {"status": "unchanged",
                     "superseded": [{"snapshot_key": old["snapshot_key"], "status": "compacted"}]}
     assert repo.register_snapshot_archived(old["id"])
@@ -285,8 +321,8 @@ def test_the_capture_job_keeps_a_superseded_capture_as_its_referenced_rows(capsy
         next(r for r in records if r["_id"] == 90002)
     assert readers(repo, new)["37425"][0] == 1
     # Again: nothing left to do.
-    assert compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer) == \
-        {"status": "unchanged"}
+    assert compaction.compact_after_build(repo, new["snapshot_key"], {"status": "unchanged"}, writer=writer,
+                                          snapshot_id=str(new["id"])) == {"status": "unchanged"}
 
 
 def test_the_archive_client_reads_an_object_back():
@@ -327,10 +363,11 @@ def test_a_mapper_bump_is_refused_while_compaction_has_no_rebuild_from_the_archi
         'fact DATABASE_READY NO "CATALOG_COMPACTION_MAPPER' in verify
 
 
-def test_the_release_read_only_role_gains_maintain_on_the_two_compacted_tables_and_nothing_else():
-    """The VACUUM path's only new power: this migration grants the read-only roles exactly these
-    reads, and MAINTAIN (release role only, PostgreSQL 17) on exactly the two compacted tables;
-    never a write privilege (the PostgreSQL test reads back that none exists anywhere)."""
+def test_the_read_only_roles_gain_reads_only_and_never_maintain():
+    """This migration grants the read-only roles exactly these reads -- never
+    MAINTAIN (it would also let them LOCK, CLUSTER and REINDEX; the space
+    reclamation rewrites as the owner) and never a write privilege (the
+    PostgreSQL test reads back that none exists anywhere)."""
     import re
     from pathlib import Path
 
@@ -342,17 +379,59 @@ def test_the_release_read_only_role_gains_maintain_on_the_two_compacted_tables_a
         "grant execute on function public.catalog_register_compaction_mapper_mismatches()",
         "grant execute on function public.catalog_register_maintenance_blockers()",
         "grant execute on function public.catalog_variant_candidate_reading(public.catalog_variants)",
-        "grant maintain on table public.catalog_raw_records, public.catalog_candidate_variants",
         "grant select on table public.catalog_candidate_variants_resolved",
         "grant select on table public.catalog_register_snapshot_compactions",
     ]
     # Every grant to a role the loop names goes through that list: no other grant names ro.
     assert len(re.findall(r"\bto %I',\s*ro\.rolname", sql)) == len(granted)
-    # MAINTAIN only for the release read-only role, only where the privilege exists.
-    guard = "if ro.rolname like 'milo\\_release\\_readonly\\_%' and current_setting('server_version_num')::integer >= 170000 then"
-    assert sql.index(guard) < sql.index("grant maintain") and sql.count("grant maintain") == 1
+    assert not re.search(r"\bmaintain\b", sql, re.I)
     # No write privilege is granted to anyone but service_role, and no role is granted ALL.
     for grant in re.findall(r"\bgrant\s+([a-z, ]+?)\s+on\s+(?:table|all tables)[^;']*?\bto\s+([a-z_%I]+)", sql, re.I):
         privileges, grantee = grant
         if re.search(r"\b(insert|update|delete|truncate|all)\b", privileges, re.I):
             assert grantee == "service_role", grant
+
+
+def test_duplicates_are_found_when_a_snapshot_is_compacted_mid_preparation():
+    """PR-L2 should-fix 5: a row read before the compaction (its payload) and
+    its duplicate read after (its typed reading) share one preparation's
+    cache: both forms are the variant content hash, so they still match."""
+    base = next(r for r in fixture_rows() if r["_id"] == 37425)
+    repo, snapshot, writer = uncompacted(rows_with_shapes() + [dict(base, _id=90009)])
+    query = GovernmentCatalogQuery(repo, snapshot_key=snapshot["snapshot_key"])
+    page = query.list_variants(limit=100).items
+    own = next(item for item in page if item.upstream_record_id == "37425")
+    assert _same_variant_rows(query, own, page, {}) == ["37425", "90009"]
+    cache: dict[str, Any] = {}
+    _same_variant_rows(query, own, [own], cache)  # read (and cached) before the compaction
+    applied(repo, snapshot, writer)
+    # PostgreSQL's content hash is not the Python digest of a payload: the two
+    # forms must never be compared. Stand in for that with a foreign hash.
+    reading = repo.catalog_compacted_record_reading
+    repo.catalog_compacted_record_reading = lambda *a, **k: (
+        lambda r: r and {**r, "content_sha256": "pg:" + str(r.get("content_sha256"))})(reading(*a, **k))
+    assert _same_variant_rows(query, own, page, cache) == ["37425", "90009"]
+    assert {entry[0] for entry in cache.values()} == {"compacted"}
+
+
+def test_a_capture_left_uncompacted_prices_the_next_capture_uncompacted():
+    """PR-L2 should-fix 6: the estimate counts compacted rows, so while a
+    finished capture's snapshot is not compacted (full-size rows), incoming
+    rows are priced as they land (UNCOMPACTED_BYTES_PER_ROW) -- never refused
+    outright; compacted, the estimate is back."""
+    from backend.catalog.register import config as register_config
+    from backend.catalog.register import service as register_service
+    from tests.test_register_capture import LEXUS, directory, request
+
+    repo, w, _version, report, writer = captured_world(rows_with_shapes(), writer=FakeReader(), compact=False)
+    snapshot = snapshot_by_key(repo, report.units[0].snapshot_key)
+    assert repo.catalog_register_uncompacted_captures() == 1
+    version = directory(repo, {TOYOTA: 28, LEXUS: 1000})
+    # 396,000,000 + 1000 x 3000 = 399,000,000 fits; x 5500 = 401,500,000 does not.
+    repo.register_database_bytes = 396_000_000
+    with pytest.raises(register_service.CapacityRefusal) as refused:
+        request(repo, w, version, [LEXUS])
+    assert refused.value.capacity["projected_bytes"] == 396_000_000 + 1000 * register_config.UNCOMPACTED_BYTES_PER_ROW
+    assert applied(repo, snapshot, writer)["status"] == "compacted"
+    assert repo.catalog_register_uncompacted_captures() == 0
+    assert request(repo, w, version, [LEXUS])[1]

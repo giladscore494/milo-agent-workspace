@@ -48,7 +48,8 @@ COMPACTION_REASONS: Mapping[str, str] = {
     "CATALOG_COMPACTION_COUNT_UNVERIFIED": "the snapshot's capture is not count-verified",
     "CATALOG_COMPACTION_BUILD_INCOMPLETE": "the snapshot's variant build under the current mapper is not complete",
     "CATALOG_COMPACTION_TYPED_MISMATCH": "a row's typed variant does not read exactly as its payload or candidate",
-    "CATALOG_COMPACTION_SNAPSHOT_IN_USE": "something live can still read the superseded snapshot",
+    "CATALOG_COMPACTION_SNAPSHOT_IN_USE": "something live can still read the snapshot",
+    "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED": "the archive object's bytes could not be read back, or are not its record",
     "CATALOG_COMPACTION_FAILED": "the compaction did not complete",
     "CATALOG_ARCHIVE_NOT_CONFIGURED": "no archive bucket is configured",
     "CATALOG_ARCHIVE_WRITE_FAILED": "the snapshot's archive could not be written or verified",
@@ -65,9 +66,11 @@ class CompactionError(Exception):
         self.code = code
 
 
-def compact(repository: Any, snapshot_key: str, *, apply: bool) -> dict[str, Any]:
+def compact(repository: Any, snapshot_key: str, *, apply: bool, verified_sha256: str | None = None,
+            caller_run_id: Any = None) -> dict[str, Any]:
     """The database's answer: status ready / compacted / unchanged / refused (+ code)."""
-    answer = repository.compact_register_snapshot(str(snapshot_key), bool(apply))
+    answer = repository.compact_register_snapshot(str(snapshot_key), bool(apply), verified_sha256=verified_sha256,
+                                                  caller_run_id=str(caller_run_id) if caller_run_id else None)
     if not isinstance(answer, Mapping) or answer.get("status") not in ("ready", "compacted", "unchanged", "refused"):
         raise CompactionError("CATALOG_COMPACTION_FAILED")
     return dict(answer)
@@ -80,16 +83,51 @@ def _outcome(answer: Mapping[str, Any]) -> dict[str, Any]:
     return report
 
 
+def verified_archive(repository: Any, reader: Any, snapshot_id: str) -> tuple[str, bytes]:
+    """The snapshot's archive object, read back from Cloud Storage: its length,
+    sha256 and line count exactly its record's. The sha256 is what an apply
+    hands the database (`p_verified_sha256`): nothing is removed on the word of
+    an upload answer alone."""
+    archive = repository.register_snapshot_archive(str(snapshot_id))
+    if archive is None:
+        raise CompactionError("CATALOG_COMPACTION_ARCHIVE_UNVERIFIED")
+    bucket, _, name = str(archive["gcs_uri"]).removeprefix("gs://").partition("/")
+    if reader is None or getattr(reader, "bucket", None) != bucket:
+        raise CompactionError("CATALOG_COMPACTION_ARCHIVE_UNVERIFIED")
+    try:
+        data = reader.get(name)
+        lines = len(archive_module.read_lines(data))
+    except Exception:  # noqa: BLE001 - an unreadable object is never verified
+        raise CompactionError("CATALOG_COMPACTION_ARCHIVE_UNVERIFIED") from None
+    digest = hashlib.sha256(data).hexdigest()
+    if len(data) != int(archive["byte_size"]) or digest != archive["sha256"] or lines != int(archive["line_count"]):
+        raise CompactionError("CATALOG_COMPACTION_ARCHIVE_UNVERIFIED")
+    return digest, data
+
+
+def apply_verified(repository: Any, reader: Any, snapshot_key: str, snapshot_id: str, *,
+                   caller_run_id: Any = None) -> dict[str, Any]:
+    """Every apply: the dry-run first; only a READY snapshot has its archive
+    read back and verified, then the apply names the sha256 it computed."""
+    ready = compact(repository, snapshot_key, apply=False, caller_run_id=caller_run_id)
+    if ready["status"] != "ready":
+        return ready
+    digest, _data = verified_archive(repository, reader, snapshot_id)
+    return compact(repository, snapshot_key, apply=True, verified_sha256=digest, caller_run_id=caller_run_id)
+
+
 def compact_after_build(repository: Any, snapshot_key: str | None, build: Mapping[str, Any], *,
-                        writer: Any = None) -> dict[str, Any]:
-    """The capture job's compaction of a snapshot it just built, then of the
-    tozar's superseded snapshots (their archive written from their rows first
-    when they have none). Never raises: a refusal or a failure leaves the rows
-    in place and is reported."""
-    if not snapshot_key or (build or {}).get("status") not in ("built", "unchanged"):
+                        writer: Any = None, snapshot_id: str | None = None, run_id: Any = None) -> dict[str, Any]:
+    """The capture job's compaction of a snapshot it just built (in its own
+    run), then of the tozar's superseded snapshots (their archive written from
+    their rows first when they have none). Never raises: a refusal or a
+    failure leaves the rows in place and is reported."""
+    if not snapshot_key or not snapshot_id or (build or {}).get("status") not in ("built", "unchanged"):
         return {"status": "skipped"}
     try:
-        report = _outcome(compact(repository, snapshot_key, apply=True))
+        report = _outcome(apply_verified(repository, writer, snapshot_key, snapshot_id, caller_run_id=run_id))
+    except CompactionError as failure:
+        return {"status": "failed", "code": failure.code}
     except Exception:  # noqa: BLE001 - reduced to a static code
         return {"status": "failed", "code": "CATALOG_COMPACTION_FAILED"}
     if report["status"] not in ("compacted", "unchanged"):
@@ -103,7 +141,8 @@ def compact_after_build(repository: Any, snapshot_key: str | None, build: Mappin
     for snapshot in older:
         key = str(snapshot["snapshot_key"])
         try:
-            superseded.append({"snapshot_key": key, **_prepared_compaction(repository, snapshot, writer)})
+            superseded.append({"snapshot_key": key,
+                               **_prepared_compaction(repository, snapshot, writer, caller_run_id=run_id)})
         except CompactionError as failure:
             superseded.append({"snapshot_key": key, "status": "failed", "code": failure.code})
         except Exception:  # noqa: BLE001 - reduced to a static code
@@ -113,14 +152,16 @@ def compact_after_build(repository: Any, snapshot_key: str | None, build: Mappin
     return report
 
 
-def _prepared_compaction(repository: Any, snapshot: Mapping[str, Any], writer: Any) -> dict[str, Any]:
+def _prepared_compaction(repository: Any, snapshot: Mapping[str, Any], writer: Any, *,
+                         caller_run_id: Any = None) -> dict[str, Any]:
     """Apply ONE snapshot's compaction, writing its archive from its stored rows
     first only when that is the one precondition left (a dry-run says so)."""
     key = str(snapshot["snapshot_key"])
     if repository.register_snapshot_archive(str(snapshot["id"])) is None \
-            and compact(repository, key, apply=False).get("code") == "CATALOG_COMPACTION_ARCHIVE_MISSING":
+            and compact(repository, key, apply=False, caller_run_id=caller_run_id).get("code") \
+            == "CATALOG_COMPACTION_ARCHIVE_MISSING":
         archive_from_database(repository, snapshot, writer)
-    return _outcome(compact(repository, key, apply=True))
+    return _outcome(apply_verified(repository, writer, key, str(snapshot["id"]), caller_run_id=caller_run_id))
 
 
 # -- the archive of a Prepare snapshot, from its stored rows -------------------------
@@ -183,24 +224,17 @@ def archive_from_database(repository: Any, snapshot: Mapping[str, Any], writer: 
 
 # -- the original record, from the archive ------------------------------------------
 
-def _archive_lines(repository: Any, reader: Any, snapshot_id: str) -> list[dict[str, Any]]:
-    """The snapshot's archive, exactly the recorded object (its sha256)."""
-    archive = repository.register_snapshot_archive(str(snapshot_id))
-    if archive is None:
-        raise CompactionError("CATALOG_ARCHIVE_UNREADABLE")
-    bucket, _, name = str(archive["gcs_uri"]).removeprefix("gs://").partition("/")
-    if reader is None or getattr(reader, "bucket", None) != bucket:
-        raise CompactionError("CATALOG_ARCHIVE_UNREADABLE")
+def archive_lines(repository: Any, reader: Any, snapshot_id: str) -> list[dict[str, Any]]:
+    """The snapshot's archive, exactly the recorded object (size, sha256, lines)."""
     try:
-        data = reader.get(name)
-    except archive_module.ArchiveWriteError:
+        _digest, data = verified_archive(repository, reader, snapshot_id)
+    except CompactionError:
         raise CompactionError("CATALOG_ARCHIVE_UNREADABLE") from None
-    if hashlib.sha256(data).hexdigest() != archive["sha256"]:
-        raise CompactionError("CATALOG_ARCHIVE_UNREADABLE")
     return archive_module.read_lines(data)
 
 
-def source_record(repository: Any, reader: Any, snapshot_id: str, upstream_record_id: str) -> dict[str, Any]:
+def source_record(repository: Any, reader: Any, snapshot_id: str, upstream_record_id: str, *,
+                  lines: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """ONE row's original register record, from its archive line.
 
     The object must be the recorded one (its sha256). An active snapshot's
@@ -208,9 +242,11 @@ def source_record(repository: Any, reader: Any, snapshot_id: str, upstream_recor
     `payload_sha256`). A superseded snapshot kept as skeletons is not browsed
     (CATALOG_SNAPSHOT_ARCHIVED): its record is the archive line of that
     upstream id -- every line was checked against its row before any row was
-    removed, and the object is the one recorded then."""
+    removed, and the object is the one recorded then. `lines`: the snapshot's
+    archive already read and verified (`archive_lines`), for a caller that
+    reads many records of one snapshot."""
     if repository.register_snapshot_archived(str(snapshot_id)):
-        matches = [line for line in _archive_lines(repository, reader, snapshot_id)
+        matches = [line for line in (lines if lines is not None else archive_lines(repository, reader, snapshot_id))
                    if str(line.get("_id")) == str(upstream_record_id)]
         if len(matches) != 1:
             raise CompactionError("CATALOG_ARCHIVE_LINE_MISMATCH")
@@ -220,7 +256,8 @@ def source_record(repository: Any, reader: Any, snapshot_id: str, upstream_recor
     index = ((row or {}).get("source_locator") or {}).get("capture_index")
     if row is None or not isinstance(index, int):
         raise CompactionError("CATALOG_ARCHIVE_UNREADABLE")
-    lines = _archive_lines(repository, reader, snapshot_id)
+    if lines is None:
+        lines = archive_lines(repository, reader, snapshot_id)
     if not 0 <= index < len(lines):
         raise CompactionError("CATALOG_ARCHIVE_LINE_MISMATCH")
     record = lines[index]
@@ -283,13 +320,16 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None, archive_c
             print("RECORD " + archive_module.canonical_line(record).rstrip("\n"))
             return EXIT_OK
         # A snapshot with no archive has it written from its stored rows first,
-        # only once every other precondition holds (_prepared_compaction).
+        # only once every other precondition holds (_prepared_compaction); an
+        # apply reads the archive back and verifies its bytes first.
         archived = snapshot is not None and repo.register_snapshot_archive(str(snapshot["id"])) is not None
         if snapshot is not None and args.apply:
             if not archived \
                     and compact(repo, key, apply=False).get("code") == "CATALOG_COMPACTION_ARCHIVE_MISSING":
                 archive_from_database(repo, snapshot, client)
-        answer = compact(repo, key, apply=bool(args.apply))
+            answer = apply_verified(repo, client, key, str(snapshot["id"]))
+        else:
+            answer = compact(repo, key, apply=bool(args.apply))
     except CompactionError as failure:
         print(f"FAILED {failure.code}: {key}")
         return EXIT_FAILED
@@ -308,8 +348,8 @@ def main(argv: Sequence[str] | None = None, *, repository: Any = None, archive_c
     return EXIT_OK
 
 
-__all__ = ["COMPACTION_REASONS", "CompactionError", "archive_from_database", "compact",
-           "compact_after_build", "default_archive_client", "main", "source_record"]
+__all__ = ["COMPACTION_REASONS", "CompactionError", "apply_verified", "archive_from_database", "archive_lines", "compact",
+           "compact_after_build", "default_archive_client", "main", "source_record", "verified_archive"]
 
 
 if __name__ == "__main__":  # pragma: no cover

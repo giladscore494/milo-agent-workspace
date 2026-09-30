@@ -20,10 +20,16 @@ answer was lost, a crash before the record) it is a success only when the
 object's own recorded sha256 (custom metadata, read with objectViewer) and
 size match. Anything else is a failure, and the snapshot stays inactive
 (``CATALOG_ARCHIVE_WRITE_FAILED``). Nothing here ever deletes an object.
+
+The upload carries the object's ``md5Hash``: Cloud Storage refuses bytes that
+arrive corrupted. PR-L2: before a compaction removes anything, the object is
+read back (``get``) and its length, sha256 and line count checked against its
+record (``compaction.verified_archive``).
 """
 
 from __future__ import annotations
 
+import base64
 import gzip
 import hashlib
 import io
@@ -132,7 +138,10 @@ class GcsArchiveWriter:
         except Exception:
             raise ArchiveWriteError("no storage session") from None
         boundary = f"milo-{uuid.uuid4().hex}"
+        # md5Hash: Cloud Storage checks the bytes it received against it and
+        # rejects a corrupted upload (400) instead of storing it.
         metadata = {"name": name, "contentType": "application/gzip",
+                    "md5Hash": base64.b64encode(hashlib.md5(archive.data).digest()).decode("ascii"),  # noqa: S324 - an integrity check, not security
                     "metadata": {"sha256": archive.sha256, "line_count": str(archive.line_count)}}
         body = (f"--{boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
                 f"{json.dumps(metadata)}\r\n--{boundary}\r\nContent-Type: application/gzip\r\n\r\n"

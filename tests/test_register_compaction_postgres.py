@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import uuid
 from types import SimpleNamespace
 from typing import Any
@@ -130,8 +131,34 @@ def _snapshot(db, world: dict, rows: list[dict], label: str, *, archived: bool =
     return {"id": snapshot, "key": key, "rows": rows, "args": args}
 
 
-def _compact(db, key: str, apply: bool = True) -> dict:
-    return json.loads(_rpc_as_service(db, f"select public.compact_register_snapshot('{key}', {str(apply).lower()})"))
+def _compact(db, key: str, apply: bool = True, *, verified: bool = True, caller: str | None = None) -> dict:
+    """The RPC as the capture job calls it: an apply names the sha256 of the
+    archive bytes it read back (here: the recorded one, as a verified reader
+    would compute it); `verified=False` names none."""
+    sha = "null"
+    if apply and verified:
+        recorded = db.psql("select a.sha256 from public.catalog_register_snapshot_archives a "
+                           "join public.catalog_source_snapshots s on s.id = a.snapshot_id "
+                           f"where s.snapshot_key = '{key}'")
+        sha = f"'{recorded}'" if recorded else "null"
+    run = f"'{caller}'" if caller else "null"
+    return json.loads(_rpc_as_service(
+        db, f"select public.compact_register_snapshot('{key}', {str(apply).lower()}, {sha}, {run})"))
+
+
+def _settle_capture_runs(db) -> None:
+    """End every capture-job run earlier tests left live (a Prepare's run
+    blocks every superseded compaction until it ends)."""
+    db.psql("update public.runs r set status = 'completed' where r.run_identity->>'workflow_key' = 'operator_capture' "
+            "and r.status not in ('completed', 'partial_success', 'failed', 'cancelled', 'timed_out', "
+            "'budget_exhausted')")
+
+
+@pytest.fixture(autouse=True)
+def _no_stray_capture_runs(cdb):
+    """Every test starts with no capture-job run left live by another (each one
+    that needs a live reader makes its own)."""
+    _settle_capture_runs(cdb)
 
 
 def _scalar(db, sql: str) -> int:
@@ -315,6 +342,8 @@ def golden(cdb):
     identity = _identity(cdb, snapshot)
     before = {"readers": readers(cdb, snapshot), "queue": _queue(cdb, snapshot), "coverage": _coverage(cdb, snapshot)}
     counts = _counts(cdb, snapshot)
+    # The plans _queue and _coverage prepared are done: nothing live reads the snapshot.
+    _settle_capture_runs(cdb)
     dry = _compact(cdb, snapshot["key"], apply=False)
     assert dry["status"] == "ready" and dry["raw_rows"] == 21 and dry["mode"] == "active"
     assert _scalar(cdb, f"select count(*) from public.catalog_raw_records where snapshot_id='{snapshot['id']}' "
@@ -497,6 +526,7 @@ def test_every_missing_precondition_is_refused_and_writes_nothing(cdb):
                                f"{_json(pending)})")
     pkey = cdb.psql(f"select snapshot_key from public.catalog_source_snapshots where id = '{pid}'")
     assert _refused(cdb, pkey) == "CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE"
+    cdb.psql(f"update public.runs set status = 'failed' where id = '{pending_world['run_id']}'")
     # Not built, then built only in part.
     unbuilt = _snapshot(cdb, _world(cdb), rows, "unbuilt", marque="בנייה")
     assert _refused(cdb, unbuilt["key"]) == "CATALOG_COMPACTION_BUILD_INCOMPLETE"
@@ -610,14 +640,6 @@ def _plan_on(db, snapshot: dict, marque: str) -> dict:
     prepared = _wsp_prepare(db, args, plan, 1, scope.digest(), units)
     return {"plan": plan, "digest": scope.digest(), "user": user, "capture_run": capture_run,
             "batches": [batch["id"] for batch in prepared["batches"]]}
-
-
-def _settle_capture_runs(db) -> None:
-    """End every capture-job run earlier tests left live (a Prepare's run
-    blocks every superseded compaction until it ends)."""
-    db.psql("update public.runs r set status = 'completed' where r.run_identity->>'workflow_key' = 'operator_capture' "
-            "and r.status not in ('completed', 'partial_success', 'failed', 'cancelled', 'timed_out', "
-            "'budget_exhausted')")
 
 
 def test_a_superseded_snapshot_keeps_its_referenced_rows_as_skeletons(cdb):
@@ -734,16 +756,13 @@ def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
             cdb.psql(f"set role {role}; select count(*) from public.catalog_candidate_variants_resolved")
     assert cdb.psql("select prosecdef::text || '|' || array_to_string(proconfig, ',') from pg_proc "
                     "where proname = 'compact_register_snapshot'") == "true|search_path=pg_catalog"
-    # MAINTAIN (the operator's VACUUM FULL) exists from PostgreSQL 17: granted there to the release
-    # read-only role on exactly the two compacted tables; an older server has no such privilege.
+    # No MAINTAIN for the read-only roles (PostgreSQL 17 has the privilege; older servers have none).
     if int(cdb.psql("select current_setting('server_version_num')")) >= 170000:
-        for table, granted in (("catalog_raw_records", "t"), ("catalog_candidate_variants", "t"),
-                               ("catalog_variants", "f"), ("runs", "f")):
-            assert cdb.psql(f"select has_table_privilege('{RELEASE_RO}', 'public.{table}', 'MAINTAIN')") == granted
-        assert cdb.psql(f"select string_agg(c.oid::regclass::text, ',' order by 1) from pg_class c "
-                        f"join pg_namespace n on n.oid = c.relnamespace where c.relkind in ('r', 'p', 'm') "
-                        f"and n.nspname = 'public' and has_table_privilege('{RELEASE_RO}', c.oid, 'MAINTAIN')") \
-            == "catalog_candidate_variants,catalog_raw_records"
+        for role in (RELEASE_RO, RO_ROLE):
+            assert cdb.psql(f"select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+                            f"where n.nspname = 'public' and c.relkind in ('r', 'p', 'm') "
+                            f"and has_table_privilege('{role}', c.oid, 'MAINTAIN')") == "0"
+    assert not re.search(r"\bmaintain\b", re.sub(r"--[^\n]*", "", COMPACTION_MIGRATION.read_text()), re.I)
     # Neither read-only role can write anywhere, whatever this migration granted.
     for role in (RELEASE_RO, RO_ROLE):
         assert cdb.psql("select count(*) from pg_class c join pg_namespace n on n.oid = c.relnamespace "
@@ -753,9 +772,6 @@ def test_the_read_only_role_reads_what_it_did_and_writes_nothing(golden, cdb):
                         f"or has_table_privilege('{role}', c.oid, 'UPDATE') "
                         f"or has_table_privilege('{role}', c.oid, 'DELETE') "
                         f"or has_table_privilege('{role}', c.oid, 'TRUNCATE'))") == "0"
-    text = COMPACTION_MIGRATION.read_text()
-    assert "current_setting('server_version_num')::integer >= 170000" in text
-    assert "grant maintain on table public.catalog_raw_records, public.catalog_candidate_variants to %I" in text
 
 
 def test_the_migration_is_rerun_safe(cdb):
@@ -857,3 +873,168 @@ def test_bytes_per_register_row_after_compaction_and_the_projections(cdb, capsys
     assert per_row <= register_config.DEFAULT_BYTES_PER_ROW
     assert full <= 360_000_000
     assert steady <= 400_000_000
+
+
+# -- 5b. the should-fixes of the pre-merge review -----------------------------------------
+
+def test_an_apply_removes_nothing_without_the_archive_bytes_verified(cdb):
+    """Blocker 1: the apply names the sha256 of the archive bytes its caller read
+    back; none, or another, removes nothing."""
+    rows = [dict(r, _id=r["_id"] + 700000, degem_cd=r["degem_cd"] + 700000) for r in fixture_rows()]
+    snapshot = _snapshot(cdb, _world(cdb), rows, "verify", marque="אימות")
+    assert _build(cdb, snapshot)["complete"] is True
+    assert _compact(cdb, snapshot["key"], apply=False)["status"] == "ready"
+    for sha in ("null", "'" + "0" * 64 + "'"):
+        answer = json.loads(_rpc_as_service(
+            cdb, f"select public.compact_register_snapshot('{snapshot['key']}', true, {sha}, null)"))
+        assert (answer["status"], answer["code"]) == ("refused", "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED")
+    assert _scalar(cdb, f"select count(*) from public.catalog_raw_records where snapshot_id = '{snapshot['id']}' "
+                        "and payload is null") == 0
+    assert _compact(cdb, snapshot["key"])["status"] == "compacted"
+
+
+def test_an_active_snapshot_something_live_reads_is_not_compacted(cdb):
+    """Should-fix 5: the active mode waits for live readers too -- its writer
+    run (unless that is the caller), a Prepare (any capture-job run that is not
+    a register capture), a live batch run -- and the caller is not its own reader."""
+    rows = [dict(r, _id=r["_id"] + 800000, degem_cd=r["degem_cd"] + 800000) for r in fixture_rows()]
+    world = _world(cdb)
+    snapshot = _snapshot(cdb, world, rows, "live", marque="חי")
+    assert _build(cdb, snapshot)["complete"] is True
+    writer = world["run_id"]
+    cdb.psql(f"update public.runs set status = 'running' where id = '{writer}'")
+    answer = _compact(cdb, snapshot["key"], apply=False)
+    assert (answer["code"], answer["mode"]) == ("CATALOG_COMPACTION_SNAPSHOT_IN_USE", "active")
+    # The capture job compacting in its own run is not waiting for itself.
+    assert _compact(cdb, snapshot["key"], apply=False, caller=writer)["status"] == "ready"
+    cdb.psql(f"update public.runs set status = 'completed' where id = '{writer}'")
+    prepare, _args = _wsp_capture_run(cdb, _ws_world(cdb)[2])
+    assert _compact(cdb, snapshot["key"], apply=False)["code"] == "CATALOG_COMPACTION_SNAPSHOT_IN_USE"
+    _wsb_finish(cdb, prepare, "completed")
+    assert _compact(cdb, snapshot["key"])["status"] == "compacted"
+
+
+def test_every_reader_that_skips_the_readable_gate_refuses_a_skeleton(cdb):
+    """Should-fix 7: coverage decisions, the batch coverage read and the run's
+    batch read refuse a superseded snapshot kept as skeletons (its candidates
+    have no identity left); another snapshot's reads are untouched."""
+    marque = "שלד"
+    rows = [dict(r, _id=r["_id"] + 900000, degem_cd=r["degem_cd"] + 900000) for r in fixture_rows()]
+    old = _snapshot(cdb, _world(cdb), rows, "skel-old", marque=marque)
+    assert _build(cdb, old)["complete"] is True and _compact(cdb, old["key"])["mode"] == "active"
+    plan = _plan_on(cdb, old, marque)
+    run = _wsb_start(cdb, plan, plan["batches"][0], key=f"skel-{old['key'][-8:]}")["run"]["id"]
+    _wsb_finish(cdb, run, "partial_success")
+    cdb.psql(f"update public.catalog_work_scopes set closed_at = now() where id = '{plan['plan']}'")
+    _wsb_finish(cdb, plan["capture_run"], "completed")
+    new = _snapshot(cdb, _world(cdb), [dict(r, koah_sus=(r.get("koah_sus") or 0) + 1) for r in rows], "skel-new",
+                    marque=marque)
+    assert _build(cdb, new)["complete"] is True and _compact(cdb, new["key"])["mode"] == "active"
+    assert _compact(cdb, old["key"])["mode"] == "superseded"
+    for sql in (f"select count(*) from public.catalog_work_scope_coverage_decisions('{old['id']}', null, null, false)",
+                f"select public.catalog_variant_coverage_for_batch('{plan['batches'][0]}', 'register')",
+                f"select public.work_scope_batch_for_run('{run}')"):
+        with pytest.raises(AssertionError, match="CATALOG_SNAPSHOT_ARCHIVED"):
+            _rpc_as_service(cdb, sql)
+    assert int(_rpc_as_service(cdb, "select count(*) from public.catalog_work_scope_coverage_decisions("
+                                    f"'{new['id']}', null, null, false)")) == len(rows)
+
+
+def test_uncompacted_captures_are_counted(cdb):
+    """Should-fix 6: a finished register capture whose snapshot was never
+    compacted is counted (a new capture waits for it); compacted, it is not."""
+    from tests.test_register_migration_postgres import _directory, _request, _scoped_snapshot
+
+    count = "select public.catalog_register_uncompacted_captures()"
+    before = int(_rpc_as_service(cdb, count))
+    tozar = f"לא-דחוס-{uuid.uuid4().hex[:6]}"
+    _user, _project, conversation = _ws_world(cdb)
+    run_id, args = _wsp_capture_run(cdb, conversation)
+    claim = json.loads(_rpc_as_service(cdb, _request(cdb, _directory(cdb, {tozar: 3}), [tozar])))
+    group, unit = claim["group"]["id"], claim["units"][0]["id"]
+    _rpc_as_service(cdb, f"select public.record_register_capture_trigger('{group}', '{run_id}', 'claimed', null)")
+    snapshot, key = _scoped_snapshot(cdb, args, f"unc-{uuid.uuid4().hex[:6]}", 3, marque=tozar)
+    _rpc_as_service(cdb, f"select public.record_register_snapshot_archive({args}, '{snapshot}', "
+                         f"'gs://milo-test-archive/register/{RESOURCE}/{'c' * 16}/{key}.jsonl.gz', 100, "
+                         f"'{'d' * 64}', 3)")
+    _rpc_as_service(cdb, f"select public.record_register_unit_status({args}, '{unit}', 'captured', null, "
+                         f"'{snapshot}', 3, 3, true)")
+    assert int(_rpc_as_service(cdb, count)) == before + 1
+    cdb.psql("insert into public.catalog_register_snapshot_compactions (snapshot_id, snapshot_key, readers, "
+             "mapper_version, raw_rows, kept_rows, bytes_before, bytes_after) values "
+             f"('{snapshot}', '{key}', 'variants', public.catalog_variant_mapper_version(), 3, 3, 0, 0)")
+    assert int(_rpc_as_service(cdb, count)) == before
+
+
+# -- 6. the readers' plans and timings, before and after compaction --------------------
+
+READER_ROWS = 6000
+
+
+def _ms(db, sql: str, repeat: int = 3) -> float:
+    """The median execution time of one statement (EXPLAIN ANALYZE), in ms."""
+    times = sorted(json.loads(db.psql(f"explain (analyze, format json) {sql}"))[0]["Execution Time"]
+                   for _ in range(repeat))
+    return times[len(times) // 2]
+
+
+def _scans(db, sql: str) -> list[tuple[str, str]]:
+    """Every (node type, relation) of the statement's plan."""
+    found: list[tuple[str, str]] = []
+
+    def walk(node: dict) -> None:
+        found.append((node["Node Type"], node.get("Relation Name", "")))
+        for child in node.get("Plans") or []:
+            walk(child)
+    walk(json.loads(db.psql(f"explain (format json) {sql}"))[0]["Plan"])
+    return found
+
+
+def test_readers_keep_their_indexes_after_compaction(cdb, capsys):
+    """A model filter reaches an index on both sides of the resolved view: the
+    rows that still state their identity through the partial identity
+    indexes, a compacted snapshot's through its variant rows. Timings are
+    printed (6,000 rows, before and after compaction)."""
+    marque = "קריאה-מדידה"
+    _settle_capture_runs(cdb)
+    base = fixture_rows()
+    rows = []
+    for index in range(READER_ROWS):
+        row = copy.deepcopy(base[index % len(base)])
+        row.update(_id=3_000_000 + index, tozar=marque, kinuy_mishari=f"{row['kinuy_mishari']}-{index % 40}",
+                   degem_cd=row["degem_cd"] + index)
+        rows.append(row)
+    snapshot = _bulk_snapshot(cdb, rows, marque)
+    snapshot.update(key=cdb.psql(f"select snapshot_key from public.catalog_source_snapshots where id='{snapshot['id']}'"))
+    for first in range(0, READER_ROWS, mapper.BUILD_BATCH_ROWS):
+        _build(cdb, snapshot, rows[first:first + mapper.BUILD_BATCH_ROWS])
+    run = cdb.psql(f"select created_by_run_id from public.catalog_source_snapshots where id='{snapshot['id']}'")
+    cdb.psql("insert into public.catalog_register_snapshot_archives (snapshot_id, snapshot_key, gcs_uri, "
+             f"byte_size, sha256, line_count, recorded_by_run_id) values ('{snapshot['id']}', '{snapshot['key']}', "
+             f"'gs://milo-test-archive/register/{RESOURCE}/{'3' * 16}/{snapshot['key']}.jsonl.gz', 10, "
+             f"'{'a' * 64}', {READER_ROWS}, '{run}'); update public.runs set status = 'completed' where id = '{run}'")
+    sid, model = snapshot["id"], rows[0]["kinuy_mishari"]
+    queries = {
+        "coverage_decisions": f"select count(*) from public.catalog_work_scope_coverage_decisions('{sid}', null, null, false)",
+        "candidate_page": f"select count(*) from public.catalog_candidate_variant_page('{sid}', p_manufacturer => "
+                          f"'{marque}', p_commercial_model => '{model}', p_limit => 50)",
+        "identity_lookup": "select count(*) from public.catalog_candidate_variants_resolved "
+                           f"where snapshot_id = '{sid}' and manufacturer = '{marque}' and commercial_model = '{model}'",
+    }
+    cdb.psql("analyze public.catalog_candidate_variants; analyze public.catalog_variants; "
+             "analyze public.catalog_raw_records")
+    large = {"catalog_candidate_variants", "catalog_raw_records", "catalog_variants"}
+    # A model filter never reads the whole snapshot: no sequential scan of the three large tables,
+    # before compaction (the partial identity indexes) and after (the variant rows).
+    assert not [s for s in _scans(cdb, queries["identity_lookup"]) if s[0] == "Seq Scan" and s[1] in large]
+    before = {name: _ms(cdb, sql) for name, sql in queries.items()}
+    answers = {name: cdb.psql(sql) for name, sql in queries.items()}
+    assert _compact(cdb, snapshot["key"], verified=True)["status"] == "compacted"
+    cdb.psql("analyze public.catalog_candidate_variants; analyze public.catalog_variants; "
+             "analyze public.catalog_raw_records")
+    after = {name: _ms(cdb, sql) for name, sql in queries.items()}
+    assert {name: cdb.psql(sql) for name, sql in queries.items()} == answers
+    with capsys.disabled():
+        print(f"\nPR-L2 reader timings ({READER_ROWS:,} rows, ms, before -> after compaction): "
+              + ", ".join(f"{name} {before[name]:.1f} -> {after[name]:.1f}" for name in queries))
+    assert not [s for s in _scans(cdb, queries["identity_lookup"]) if s[0] == "Seq Scan" and s[1] in large]

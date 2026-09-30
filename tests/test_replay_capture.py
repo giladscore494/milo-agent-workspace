@@ -476,3 +476,32 @@ def test_the_export_refuses_another_runs_checkpoint(monkeypatch):
 
     with pytest.raises(export.ExportRefused, match="CHECKPOINT_RUN_MISMATCH"):
         export.build_manifest(Mislabelled(), str(run_id), name="x")
+
+
+def test_the_export_reads_a_skeleton_snapshots_rows_from_its_archive(monkeypatch):
+    """PR-L2 should-fix 8: a superseded snapshot kept as skeletons may no longer
+    hold the row; its record is the archive line (compaction.source_record),
+    even when the row itself is gone."""
+    from backend.catalog.register import compaction
+
+    export = _export_module()
+    repository, run_id, _checkpoints, _ = _run(monkeypatch, capture=True)
+    expected = export.build_manifest(repository, str(run_id), name="x")["snapshot_rows"]
+    by_id = {str(row["_id"]): row for row in expected}
+    asked: list[str] = []
+    monkeypatch.setattr(repository, "register_snapshot_archived", lambda _sid: True, raising=False)
+    monkeypatch.setattr(repository, "catalog_raw_record_by_upstream_id",
+                        lambda *_a, **_k: pytest.fail("a skeleton snapshot's row is never read"))
+    reads: list[str] = []
+    monkeypatch.setattr(compaction, "archive_lines", lambda _repo, _reader, sid: reads.append(sid) or ["lines"])
+    monkeypatch.setattr(compaction, "source_record",
+                        lambda _repo, _reader, _sid, record_id, lines: (
+                            lines == ["lines"] and asked.append(record_id)) or by_id[record_id])
+    assert export.build_manifest(repository, str(run_id), name="x", archive_client=object())["snapshot_rows"] \
+        == expected
+    assert sorted(asked) == sorted(by_id)
+    assert len(reads) == 1  # the archive is read (and verified) once per snapshot
+    monkeypatch.setattr(compaction, "archive_lines",
+                        lambda *_a: (_ for _ in ()).throw(compaction.CompactionError("CATALOG_ARCHIVE_UNREADABLE")))
+    with pytest.raises(export.ExportRefused, match="SNAPSHOT_ROW_UNREADABLE"):
+        export.build_manifest(repository, str(run_id), name="x", archive_client=object())

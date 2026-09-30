@@ -317,10 +317,17 @@ def _request_capture(repo: Any, user_id: UUID, project_id: UUID, *, register_ver
     # Fail closed on the image BEFORE anything durable is written.
     _release_gate(trigger)
     config = register_config.load(environment)
+    # The estimate counts COMPACTED rows. While a finished capture's snapshot
+    # is not compacted (a refused or failed compaction: its rows are full
+    # size), the incoming rows are priced as they land, uncompacted -- never a
+    # refusal with no way out (its re-capture supersedes and archives it).
+    per_row = config.bytes_per_row
+    if repo.catalog_register_uncompacted_captures() > 0:
+        per_row = max(per_row, register_config.UNCOMPACTED_BYTES_PER_ROW)
     try:
         claim = repo.request_register_capture(
             register_version, names, user_id, group_max_rows=config.group_max_rows,
-            capacity_limit_bytes=config.capacity_limit_bytes, bytes_per_row=config.bytes_per_row,
+            capacity_limit_bytes=config.capacity_limit_bytes, bytes_per_row=per_row,
             grace_seconds=START_GRACE_SECONDS)
     except AppError as refused:
         raise _map_claim_refusal(refused) from None

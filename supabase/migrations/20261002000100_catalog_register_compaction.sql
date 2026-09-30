@@ -51,8 +51,8 @@
 --   * A new raw record still needs its payload, a new candidate its
 --     manufacturer and model (before-insert triggers), and no variant is
 --     written for a compacted snapshot.
---   * The release read-only role may VACUUM (MAINTAIN, PostgreSQL 17) the two
---     tables compaction shrinks: the operator's space reclamation.
+--   * The read-only roles gain reads only: the operator's space reclamation
+--     (VACUUM FULL) rewrites the two tables as their owner.
 --
 -- A compacted snapshot is not rebuilt under a new mapper version: a mapper
 -- bump is refused until a rebuild-from-archive exists (the deployed gate's
@@ -178,11 +178,12 @@ create trigger catalog_register_snapshot_compactions_append_only
 -- ---------------------------------------------------------------------------
 
 -- `payload->>field` for the register codes `tozeret_cd`, `degem_cd`, `sug_degem`.
+-- The two helpers carry no `set search_path` (every name is qualified): no
+-- per-call search_path switch in the readers that call them per row.
 create or replace function public.catalog_raw_record_code(p_record public.catalog_raw_records, p_field text)
 returns text
 language sql
 stable
-set search_path = pg_catalog
 as $$
   select case when p_record.payload is not null then p_record.payload->>p_field
          else (select case p_field when 'tozeret_cd' then v.tozeret_cd::text
@@ -200,7 +201,6 @@ create or replace function public.catalog_raw_record_content_sha256(p_record pub
 returns text
 language sql
 stable
-set search_path = pg_catalog
 as $$
   select case when p_record.payload is not null then public.catalog_variant_content_sha256(p_record.payload)
          else (select v.content_sha256
@@ -254,28 +254,69 @@ $$;
 -- stating its identity (every uncompacted one) is read as stored.
 create or replace view public.catalog_candidate_variants_resolved
 with (security_invoker = true) as
+-- (a) Every candidate still stating its identity, read as stored: a filter on
+--     it reaches the partial identity indexes (`manufacturer is not null`).
+select c.id, c.snapshot_id, c.raw_record_id, c.manufacturer, c.commercial_model, c.model_year_start,
+       c.model_year_end, c.official_model_code, c.trim, c.identity_dimensions, c.status, c.candidate_key,
+       c.created_at
+  from public.catalog_candidate_variants c
+ where c.manufacturer is not null
+union all
+-- (b) A compacted candidate, its identity its variant row's reading
+--     (catalog_variant_candidate_reading, spelled out so a filter reaches
+--     catalog_variants_reading_idx).
 select c.id, c.snapshot_id, c.raw_record_id,
-       coalesce(c.manufacturer, x.manufacturer) as manufacturer,
-       coalesce(c.commercial_model, x.commercial_model) as commercial_model,
-       case when c.manufacturer is null then x.model_year else c.model_year_start end as model_year_start,
-       case when c.manufacturer is null then x.model_year else c.model_year_end end as model_year_end,
-       case when c.manufacturer is null then x.official_model_code else c.official_model_code end
-         as official_model_code,
-       case when c.manufacturer is null then x.trim else c.trim end as trim,
-       case when c.manufacturer is null then coalesce(x.identity_dimensions, c.identity_dimensions)
-            else c.identity_dimensions end as identity_dimensions,
+       nullif(btrim(v.tozar), ''), nullif(btrim(v.kinuy_mishari), ''), v.shnat_yitzur, v.shnat_yitzur,
+       nullif(btrim(v.degem_nm), ''), nullif(btrim(v.ramat_gimur), ''),
+       jsonb_strip_nulls(jsonb_build_object(
+         'body_style', v.norm_body_style, 'drivetrain', v.norm_drivetrain,
+         'fuel_type', v.norm_fuel_type, 'propulsion_technology', v.norm_propulsion_technology)),
        c.status, c.candidate_key, c.created_at
   from public.catalog_candidate_variants c
-  left join lateral (
-    select y.*
-      from public.catalog_register_snapshot_compactions k
-      join public.catalog_raw_records r on r.id = c.raw_record_id
-      join public.catalog_variants v
-        on v.snapshot_id = k.snapshot_id and v.mapper_version = k.mapper_version
-       and v.upstream_record_id = r.upstream_record_id
-      cross join lateral public.catalog_variant_candidate_reading(v) y
-     where c.manufacturer is null and k.snapshot_id = c.snapshot_id and k.readers = 'variants'
-  ) x on true;
+  join public.catalog_register_snapshot_compactions k on k.snapshot_id = c.snapshot_id and k.readers = 'variants'
+  join public.catalog_raw_records r on r.id = c.raw_record_id and r.snapshot_id = c.snapshot_id
+  join public.catalog_variants v
+    on v.snapshot_id = c.snapshot_id and v.mapper_version = k.mapper_version
+   and v.upstream_record_id = r.upstream_record_id
+ where c.manufacturer is null
+union all
+-- (c) A compacted candidate whose variant row is gone (a superseded
+--     skeleton): still a row, its identity unknown. A filter on the identity
+--     never reaches this branch.
+select c.id, c.snapshot_id, c.raw_record_id, null::text, null::text, null::integer, null::integer,
+       null::text, null::text, c.identity_dimensions, c.status, c.candidate_key, c.created_at
+  from public.catalog_candidate_variants c
+  left join public.catalog_register_snapshot_compactions k
+    on k.snapshot_id = c.snapshot_id and k.readers = 'variants'
+  left join public.catalog_raw_records r on r.id = c.raw_record_id and r.snapshot_id = c.snapshot_id
+  left join public.catalog_variants v
+    on v.snapshot_id = c.snapshot_id and v.mapper_version = k.mapper_version
+   and v.upstream_record_id = r.upstream_record_id
+ where c.manufacturer is null and v.id is null;
+
+-- A superseded snapshot kept as skeletons is never read as a catalog: its
+-- candidates have no identity left (their variants are gone). Every reader
+-- that does not go through catalog_readable_snapshot calls this on the
+-- snapshot it reads, and refuses the same way.
+create or replace function public.catalog_snapshot_not_archived(p_snapshot_id uuid)
+returns boolean
+language plpgsql
+stable
+set search_path = pg_catalog
+as $$
+begin
+  if exists (select 1 from public.catalog_register_snapshot_compactions k
+              where k.snapshot_id = p_snapshot_id and k.readers = 'archive') then
+    raise exception 'CATALOG_SNAPSHOT_ARCHIVED: the snapshot is kept as referenced rows; its archive is the record'
+      using errcode = '55000';
+  end if;
+  return true;
+end;
+$$;
+
+-- The compacted side's model filter (the view's reading of kinuy_mishari).
+create index if not exists catalog_variants_reading_idx
+  on public.catalog_variants (snapshot_id, mapper_version, (nullif(btrim(kinuy_mishari), '')), shnat_yitzur);
 
 -- ---------------------------------------------------------------------------
 -- 4. The losslessness check: does the typed variant read EXACTLY as the
@@ -360,7 +401,15 @@ as $$
                             'bytes_before', p_done.bytes_before, 'bytes_after', p_done.bytes_after)
 $$;
 
-create or replace function public.compact_register_snapshot(p_snapshot_key text, p_apply boolean)
+-- p_verified_sha256: the sha256 the caller computed of the archive object's
+-- BYTES, just read back from Cloud Storage (compaction.verified_archive). An
+-- apply that removes anything needs it to equal the recorded sha256.
+-- p_caller_run_id: the run compacting (a capture job's own run), never a
+-- reader it waits for.
+drop function if exists public.compact_register_snapshot(text, boolean);
+create or replace function public.compact_register_snapshot(
+  p_snapshot_key text, p_apply boolean, p_verified_sha256 text default null, p_caller_run_id uuid default null
+)
 returns jsonb
 language plpgsql
 security definer
@@ -385,6 +434,7 @@ declare
   v_after bigint;
   v_updated bigint;
   v_kept bigint;
+  v_in_use boolean;
 begin
   if p_snapshot_key is null or p_snapshot_key !~ '^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$' or p_apply is null then
     raise exception 'CATALOG_COMPACTION_REQUEST_INVALID: one snapshot key and apply true/false'
@@ -393,7 +443,10 @@ begin
   if p_apply then
     -- A prune, a build and another compaction wait (and are waited for). The
     -- prune's order, raw records first: a raw-record writer inserts there
-    -- before it updates its snapshot, so no order here can deadlock it.
+    -- before it updates its snapshot, so no order here can deadlock it. At
+    -- most 5 s: a compaction never queues behind a long transaction while
+    -- every reader of these tables queues behind it.
+    perform set_config('lock_timeout', '5s', true);
     lock table public.catalog_raw_records, public.catalog_source_snapshots, public.catalog_candidate_variants,
                public.catalog_variant_builds, public.catalog_variants,
                public.catalog_register_snapshot_compactions in share row exclusive mode;
@@ -423,6 +476,8 @@ begin
   -- desc, then id), as the variant build ranks it.
   select s.id into v_active from public.catalog_source_snapshots s
    where s.source_family = 'government' and s.activated_at is not null
+     -- Per tozar, whatever the resource: exactly the variant build's rank-1
+     -- rule and retention's (one ranking; the register is one resource).
      and s.retrieval_metadata->'capture_scope'->'filters'->>'tozar' = v_filters->>'tozar'
    order by s.activated_at desc, s.id limit 1;
   v_superseded := v_active is distinct from v_snapshot.id;
@@ -445,6 +500,38 @@ begin
                               'snapshot_key', p_snapshot_key);
   end if;
 
+  -- Nothing live may be reading it, in either mode: a run that created,
+  -- adopted or prepared from it, a run on one of its batches, a run whose
+  -- checkpoint names it, a reservation a live run holds, and any capture-job
+  -- run that is not a register capture (a Prepare can be reading it for reuse
+  -- before it records a unit). The caller's own run is not a reader.
+  v_in_use :=
+       exists (select 1 from public.runs r where r.id = v_snapshot.created_by_run_id
+                  and r.id is distinct from p_caller_run_id and r.status <> all (v_terminal))
+    or exists (select 1 from public.catalog_snapshot_adoptions a join public.runs r on r.id = a.adopted_by_run_id
+                where a.snapshot_id = v_snapshot.id and r.id is distinct from p_caller_run_id
+                  and r.status <> all (v_terminal))
+    or exists (select 1 from public.catalog_work_scope_units u
+                 join public.catalog_work_scope_preparations wp on wp.id = u.preparation_id
+                 join public.runs r on r.id = wp.prepared_by_run_id
+                where u.snapshot_id = v_snapshot.id and r.id is distinct from p_caller_run_id
+                  and r.status <> all (v_terminal))
+    or exists (select 1 from public.catalog_work_scope_batches b
+                 join public.catalog_work_scope_batch_runs br on br.batch_id = b.id
+                 join public.runs r on r.id = br.run_id
+                where b.snapshot_id = v_snapshot.id and r.status <> all (v_terminal))
+    or exists (select 1 from public.run_checkpoints rc join public.runs r on r.id = rc.run_id
+                where rc.artifacts->'government'->>'snapshot_key' = v_snapshot.snapshot_key
+                  and r.id is distinct from p_caller_run_id and r.status <> all (v_terminal))
+    or exists (select 1 from public.catalog_variant_reservations vr
+                 join public.catalog_candidate_variants c on c.id = vr.candidate_id
+                 join public.runs r on r.id = vr.run_id
+                where c.snapshot_id = v_snapshot.id and r.status <> all (v_terminal))
+    or exists (select 1 from public.runs r
+                where r.run_identity->>'workflow_key' = 'operator_capture' and r.status <> all (v_terminal)
+                  and r.id is distinct from p_caller_run_id
+                  and not exists (select 1 from public.catalog_register_capture_groups g where g.run_id = r.id));
+
   if v_superseded then
     -- The active snapshot serves the tozar (its build under the current mapper
     -- is complete), and nothing live can still read this one.
@@ -453,16 +540,9 @@ begin
       return jsonb_build_object('status', 'refused', 'code', 'CATALOG_COMPACTION_BUILD_INCOMPLETE',
                                 'snapshot_key', p_snapshot_key, 'mode', 'superseded');
     end if;
-    if exists (select 1 from public.runs r where r.id = v_snapshot.created_by_run_id
-                  and r.status <> all (v_terminal))
-       or exists (select 1 from public.catalog_snapshot_adoptions a join public.runs r on r.id = a.adopted_by_run_id
-                   where a.snapshot_id = v_snapshot.id and r.status <> all (v_terminal))
-       or exists (select 1 from public.catalog_work_scope_units u
-                    join public.catalog_work_scope_preparations wp on wp.id = u.preparation_id
-                    join public.runs r on r.id = wp.prepared_by_run_id
-                   where u.snapshot_id = v_snapshot.id and r.status <> all (v_terminal))
-       -- A batch its plan can still start (the head revision of an open plan,
-       -- never completed), or a run on one of its batches still going.
+    if v_in_use
+       -- Superseded only: a batch its plan can still start (the head revision
+       -- of an open plan, never completed), or any reservation at all.
        or exists (select 1 from public.catalog_work_scope_batches b
                     join public.catalog_work_scopes w on w.id = b.work_scope_id
                    where b.snapshot_id = v_snapshot.id and w.closed_at is null
@@ -470,18 +550,6 @@ begin
                      and not exists (select 1 from public.catalog_work_scope_batch_runs br
                                        join public.runs r on r.id = br.run_id
                                       where br.batch_id = b.id and r.status in ('completed', 'partial_success')))
-       or exists (select 1 from public.catalog_work_scope_batches b
-                    join public.catalog_work_scope_batch_runs br on br.batch_id = b.id
-                    join public.runs r on r.id = br.run_id
-                   where b.snapshot_id = v_snapshot.id and r.status <> all (v_terminal))
-       or exists (select 1 from public.run_checkpoints rc join public.runs r on r.id = rc.run_id
-                   where rc.artifacts->'government'->>'snapshot_key' = v_snapshot.snapshot_key
-                     and r.status <> all (v_terminal))
-       -- A capture-job run that is not a register capture: a Prepare can be
-       -- reading this snapshot for reuse before it records any unit.
-       or exists (select 1 from public.runs r
-                   where r.run_identity->>'workflow_key' = 'operator_capture' and r.status <> all (v_terminal)
-                     and not exists (select 1 from public.catalog_register_capture_groups g where g.run_id = r.id))
        or exists (select 1 from public.catalog_variant_reservations vr
                     join public.catalog_candidate_variants c on c.id = vr.candidate_id
                    where c.snapshot_id = v_snapshot.id) then
@@ -496,6 +564,10 @@ begin
     select coalesce(sum(pg_column_size(r.payload)), 0) into v_payload
       from public.catalog_raw_records r where r.snapshot_id = v_snapshot.id;
   else
+    if v_in_use then
+      return jsonb_build_object('status', 'refused', 'code', 'CATALOG_COMPACTION_SNAPSHOT_IN_USE',
+                                'snapshot_key', p_snapshot_key, 'mode', 'active');
+    end if;
     select * into v_build from public.catalog_variant_builds
      where snapshot_id = v_snapshot.id and mapper_version = v_mapper;
     select count(*) into v_variants from public.catalog_variants
@@ -534,6 +606,13 @@ begin
   if v_archive.id is null or v_archive.sha256 !~ '^[0-9a-f]{64}$' or v_archive.byte_size <= 0
      or v_archive.line_count <> v_raw then
     return jsonb_build_object('status', 'refused', 'code', 'CATALOG_COMPACTION_ARCHIVE_MISSING',
+                              'snapshot_key', p_snapshot_key,
+                              'mode', case when v_superseded then 'superseded' else 'active' end);
+  end if;
+  -- Nothing is removed unless the caller has just read the archive object's
+  -- bytes back and hashed them to the recorded sha256.
+  if p_apply and p_verified_sha256 is distinct from v_archive.sha256 then
+    return jsonb_build_object('status', 'refused', 'code', 'CATALOG_COMPACTION_ARCHIVE_UNVERIFIED',
                               'snapshot_key', p_snapshot_key,
                               'mode', case when v_superseded then 'superseded' else 'active' end);
   end if;
@@ -808,6 +887,7 @@ begin
   if v_batch.id is null then
     return null;
   end if;
+  perform public.catalog_snapshot_not_archived(v_batch.snapshot_id);
   select coalesce(rev.scope->'include_unresolved' = 'true'::jsonb, false) into v_include
     from public.catalog_work_scope_revisions rev
    where rev.work_scope_id = v_batch.work_scope_id and rev.revision = v_batch.revision;
@@ -1222,12 +1302,13 @@ end;
 $$;
 
 -- catalog_work_scope_coverage_decisions: restated from 20260930000200.
+-- No `set search_path` (every name is qualified): an inlinable SQL function,
+-- planned with its caller's values instead of a generic plan.
 create or replace function public.catalog_work_scope_coverage_decisions(
   p_snapshot_id uuid, p_from integer, p_to integer, p_include_unresolved boolean
 ) returns table (candidate_id uuid, upstream_record_id text, decision text)
 language sql
 stable
-set search_path = pg_catalog
 as $$
   select c.id, r.upstream_record_id,
          -- P27: a placeholder source record is never queued, whatever the ledger says.
@@ -1246,6 +1327,8 @@ as $$
            c.official_model_code, c.trim, public.catalog_raw_record_code(r, 'tozeret_cd'), public.catalog_raw_record_code(r, 'degem_cd'),
            public.catalog_raw_record_code(r, 'sug_degem'), c.identity_dimensions)
    where c.snapshot_id = p_snapshot_id and c.status = 'candidate'
+     -- Evaluated once (it reads the parameter only).
+     and public.catalog_snapshot_not_archived(p_snapshot_id)
      and (p_from is null or c.model_year_start >= p_from)
      and (p_to is null or c.model_year_end <= p_to);
 $$;
@@ -1600,6 +1683,10 @@ begin
         on cand.snapshot_id = l.snapshot_id
        and cand.raw_record_id = l.raw_record_id
      where cand.status in ('candidate', 'ready_for_review')
+       -- A skeleton's candidate has no identity: its `{}` scope must never
+       -- match. Evaluated on matched pairs only (it names both sides).
+       and case when cand.raw_record_id = l.raw_record_id
+                then public.catalog_snapshot_not_archived(l.snapshot_id) end
        and public.catalog_candidate_identity_scope(
              cand.identity_dimensions, cand.official_model_code, cand.trim)
            = l.identity_scope
@@ -1650,7 +1737,10 @@ as $$
                       where i.batch_id = b.id), '[]'::jsonb))
     from public.catalog_work_scope_batch_runs br
     join public.catalog_work_scope_batches b on b.id = br.batch_id
-   where br.run_id = p_run_id;
+   where br.run_id = p_run_id
+     -- On the run's own batch only (it names both rows, so it is never
+     -- evaluated for another batch).
+     and case when br.batch_id = b.id then public.catalog_snapshot_not_archived(b.snapshot_id) end;
 $$;
 
 -- prepare_work_scope_queue: restated from 20260930000200; only its candidate reads go through catalog_candidate_variants_resolved.
@@ -2704,6 +2794,26 @@ as $$
                                              where u.group_id = g.id and u.status in ('requested', 'capturing'))))
 $$;
 
+-- The finished register captures whose snapshot was never compacted: rows
+-- still at their full, uncompacted size (a refused or failed compaction).
+-- While there is one, the capture gate prices incoming rows uncompacted
+-- (register.config.UNCOMPACTED_BYTES_PER_ROW): the estimate counts compacted
+-- rows.
+create or replace function public.catalog_register_uncompacted_captures()
+returns integer
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  select count(distinct u.snapshot_id)::integer
+    from public.catalog_register_capture_units u
+    join public.catalog_source_snapshots s on s.id = u.snapshot_id and s.activated_at is not null
+   where u.status = 'captured'
+     and not exists (select 1 from public.catalog_register_capture_units live
+                      where live.group_id = u.group_id and live.status in ('requested', 'capturing'))
+     and not exists (select 1 from public.catalog_register_snapshot_compactions k where k.snapshot_id = s.id)
+$$;
+
 create or replace function public.catalog_register_compaction_mapper_mismatches()
 returns integer
 language sql
@@ -2735,16 +2845,18 @@ declare
     'public.catalog_candidate_reads_as_variant(public.catalog_candidate_variants,public.catalog_variants)',
     'public.catalog_compaction_answer(text,public.catalog_register_snapshot_compactions)',
     'public.catalog_candidate_referenced(uuid)',
+    'public.catalog_snapshot_not_archived(uuid)',
     'public.catalog_register_superseded_snapshots(text)',
     'public.catalog_raw_record_lines_mismatched(uuid,integer,text[])',
     'public.catalog_register_snapshot_archivable(uuid)',
     'public.catalog_register_maintenance_blockers()',
+    'public.catalog_register_uncompacted_captures()',
     'public.catalog_register_compaction_mapper_mismatches()',
     'public.catalog_raw_record_code(public.catalog_raw_records,text)',
     'public.catalog_raw_record_content_sha256(public.catalog_raw_records)',
     'public.catalog_variant_field_reads_as(jsonb,text,boolean,boolean)',
     'public.catalog_variant_reads_as_payload(jsonb,public.catalog_variants)',
-    'public.compact_register_snapshot(text,boolean)',
+    'public.compact_register_snapshot(text,boolean,text,uuid)',
     'public.catalog_compacted_record_reading(uuid,text,boolean)',
     'public.catalog_raw_record_payload_matches(uuid,text)',
     'public.record_register_snapshot_archive_from_database(uuid,text,bigint,text,integer)'];
@@ -2811,13 +2923,7 @@ begin
     execute format('grant execute on function public.catalog_register_maintenance_blockers() to %I', ro.rolname);
     execute format('grant execute on function public.catalog_register_compaction_mapper_mismatches() to %I',
                    ro.rolname);
-    -- The operator's space reclamation (register-retention, operation
-    -- vacuum-full) runs VACUUM (FULL, ANALYZE) as the release read-only role:
-    -- MAINTAIN on exactly the two tables compaction shrinks (PostgreSQL 17;
-    -- older servers have no such privilege and are left as they are).
-    if ro.rolname like 'milo\_release\_readonly\_%' and current_setting('server_version_num')::integer >= 170000 then
-      execute format('grant maintain on table public.catalog_raw_records, public.catalog_candidate_variants to %I',
-                     ro.rolname);
-    end if;
+    -- Reads only: the space reclamation (register-retention, operation
+    -- vacuum-full) rewrites the tables as their owner, never as this role.
   end loop;
 end $$;

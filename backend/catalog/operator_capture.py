@@ -1657,7 +1657,10 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         reason = _classify(failure)
         supervisor.stop()
         _finalize(repository, lease, document={}, reason_code=reason, cancelled=False)
-        return EXIT_FAILED, _envelope("failed", reason)
+        # A source refusal's structured detail (the numeric HTTP status of an
+        # unexpected answer, nothing else) is reported with its code.
+        detail = failure.detail if isinstance(failure, GovernmentSourceError) else {}
+        return EXIT_FAILED, _envelope("failed", reason, **({"detail": detail} if detail else {}))
     supervisor.stop()
 
     if register_document is not None:
@@ -1670,8 +1673,12 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
             # of being refused by it for good.
             _finalize(repository, lease, document=register_document,
                       reason_code="CATALOG_REGISTER_CAPTURE_FAILED", cancelled=False)
+            # The failed units' HTTP statuses (numbers only), for the log line.
+            statuses = sorted({unit["http_status"] for unit in group.get("units") or []
+                               if unit.get("http_status") is not None})
             return EXIT_FAILED, _envelope("failed", "CATALOG_REGISTER_CAPTURE_FAILED",
-                                          register=register_document)
+                                          register=register_document,
+                                          **({"detail": {"http_statuses": statuses}} if statuses else {}))
         _finalize(repository, lease, document=register_document, reason_code="", cancelled=False)
         return EXIT_OK, _envelope("succeeded", "", register=register_document)
     if preparation is not None:
@@ -1709,7 +1716,9 @@ def main(argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = N
         print(safe_message("CAPTURE_REPORT_NOT_WRITTEN"), file=sys.stderr)
         return EXIT_FAILED if status == EXIT_OK else status
     if document["reason_code"]:
-        print(f'{document["reason_code"]}: {document["reason"]}', file=sys.stderr)
+        detail = "".join(f" {key}={','.join(map(str, value)) if isinstance(value, list) else value}"
+                         for key, value in sorted((document.get("detail") or {}).items()))
+        print(f'{document["reason_code"]}: {document["reason"]}{detail}', file=sys.stderr)
     return status
 
 

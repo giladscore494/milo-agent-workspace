@@ -7,12 +7,12 @@ environment -- never hard-coded at a call site -- with the reviewed defaults.
     MILO_DB_CAPACITY_THRESHOLD           default 0.80
     MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE  default 3000: every register row costs,
                                          once compacted (PR-L2), its raw record
-                                         skeleton (603 B), candidate keys
+                                         skeleton (605 B), candidate keys
                                          (431 B; the identity is read from the
                                          variant, the identity indexes skip it),
-                                         variant (983 B) and two ledger levels
+                                         variant (993 B) and two ledger levels
                                          (903 B), tables + TOAST + indexes:
-                                         2,920 B measured (tests/
+                                         2,931 B measured (tests/
                                          test_register_compaction_postgres.py),
                                          rounded up to the next 500
     MILO_REGISTER_GROUP_MAX_ROWS         default 10000 (one request's cap)
@@ -48,6 +48,10 @@ DEFAULT_GROUP_MAX_ROWS = 10_000
 NON_REGISTER_BASE_BYTES = 25_000_000
 #: The register's rows (the latest directory's total, production 2026-09-30).
 FULL_REGISTER_ROWS = 101_686
+#: A register row as it lands, before its build and compaction (5,256 B
+#: measured, rounded up): the capture gate's price for incoming rows while a
+#: finished capture's snapshot is still uncompacted.
+UNCOMPACTED_BYTES_PER_ROW = 5_500
 
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 
@@ -102,4 +106,4 @@ def load(env: Mapping[str, str] | None = None) -> RegisterConfig:
 __all__ = ["ARCHIVE_BUCKET_ENV", "BYTES_PER_ROW_ENV", "CAPACITY_BYTES_ENV", "CAPACITY_THRESHOLD_ENV",
            "DEFAULT_BYTES_PER_ROW", "DEFAULT_CAPACITY_BYTES", "DEFAULT_CAPACITY_THRESHOLD",
            "DEFAULT_GROUP_MAX_ROWS", "FULL_REGISTER_ROWS", "GROUP_MAX_ROWS_ENV", "NON_REGISTER_BASE_BYTES",
-           "RegisterConfig", "load"]
+           "RegisterConfig", "UNCOMPACTED_BYTES_PER_ROW", "load"]

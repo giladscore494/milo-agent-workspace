@@ -173,6 +173,17 @@ class VariantsMemoryMixin:
     def register_snapshot_archived(self, snapshot_id: str) -> bool:
         return str(snapshot_id) in self._skeletons()
 
+    def catalog_register_uncompacted_captures(self) -> int:
+        """Mirror: finished register captures whose snapshot was never compacted."""
+        units = list(self._register_state()["units"].values())
+        live = {str(u["group_id"]) for u in units if u.get("status") in ("requested", "capturing")}
+        activated = {str(s["id"]) for s in self.catalog_snapshots.values() if s.get("activated_at")}
+        return len({str(u["snapshot_id"]) for u in units
+                    if u.get("status") == "captured" and str(u.get("group_id")) not in live
+                    and str(u.get("snapshot_id")) in activated
+                    and str(u["snapshot_id"]) not in self._compactions()
+                    and str(u["snapshot_id"]) not in self._skeletons()})
+
     def _compacted_variant(self, record: dict[str, Any]) -> dict[str, Any] | None:
         done = self._compactions().get(str(record["snapshot_id"]))
         if done is None:
@@ -242,11 +253,13 @@ class VariantsMemoryMixin:
                    if (row := by_index.get(first_index + offset)) is None or row.get("payload") is None
                    or not self.catalog_raw_record_payload_matches(str(row["id"]), line))
 
-    def compact_register_snapshot(self, snapshot_key: str, apply: bool) -> dict[str, Any]:
+    def compact_register_snapshot(self, snapshot_key: str, apply: bool, *, verified_sha256: str | None = None,
+                                  caller_run_id: str | None = None) -> dict[str, Any]:
         """Mirror of `compact_register_snapshot` (the candidates' identity stays:
-        the in-memory readers read the candidate rows themselves); its
-        losslessness check is the Python readers' own: the typed reading
-        answers exactly as the payload."""
+        the in-memory readers read the candidate rows themselves -- candidate
+        slimming is covered by the Postgres suite only); its losslessness check
+        is the Python readers' own: the typed reading answers exactly as the
+        payload. An apply needs the archive's bytes verified (the sha256)."""
         with self.lock:
             snapshot = next((s for s in self.catalog_snapshots.values()
                              if s.get("snapshot_key") == snapshot_key and s.get("source_family") == "government"), None)
@@ -271,7 +284,13 @@ class VariantsMemoryMixin:
                     or int(snapshot.get("stored_record_count") or 0) != len(records):
                 return {**refused, "code": "CATALOG_COMPACTION_COUNT_UNVERIFIED"}
             if active["id"] != snapshot["id"]:
-                return self._compact_superseded(snapshot, active, records, units, apply)
+                return self._compact_superseded(snapshot, active, records, units, apply, verified_sha256)
+            # Active mode waits for live readers too (the mirror models reservations).
+            mine = {str(c["id"]) for c in self.catalog_candidates.values() if str(c["snapshot_id"]) == sid}
+            if any(str(r.get("candidate_id")) in mine and (self.runs.get(str(r.get("run_id"))) or {}).get("status")
+                   not in (None, "completed", "partial_success", "failed", "cancelled", "timed_out", "budget_exhausted")
+                   for r in self.catalog_variant_reservations.values()):
+                return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_IN_USE", "mode": "active"}
             build = self._variants_state()["builds"].get((sid, mapper.MAPPER_VERSION))
             rows = self._variants_state()["rows"]
             variants = {r["upstream_record_id"]: rows.get((sid, r["upstream_record_id"], mapper.MAPPER_VERSION))
@@ -284,6 +303,8 @@ class VariantsMemoryMixin:
             archive = self._register_state()["archives"].get(sid)
             if archive is None or int(archive["line_count"]) != len(records):
                 return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_MISSING"}
+            if apply and verified_sha256 != archive["sha256"]:
+                return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED"}
             before = self._snapshot_bytes(sid)
             if not apply:
                 return {"status": "ready", "snapshot_key": snapshot_key, "raw_rows": len(records),
@@ -299,7 +320,8 @@ class VariantsMemoryMixin:
             return {"status": "compacted", "snapshot_key": snapshot_key, "payloads_removed": len(records), **done}
 
     def _compact_superseded(self, snapshot: dict[str, Any], active: dict[str, Any], records: list[dict[str, Any]],
-                            units: list[dict[str, Any]], apply: bool) -> dict[str, Any]:
+                            units: list[dict[str, Any]], apply: bool,
+                            verified_sha256: str | None = None) -> dict[str, Any]:
         """The superseded mode: referenced rows kept as skeletons, the rest and
         every variant dropped, the archive the record (the SQL's in-use checks
         mirrored for what this repository models: open reservations)."""
@@ -317,6 +339,8 @@ class VariantsMemoryMixin:
         archive = self._register_state()["archives"].get(sid)
         if archive is None or int(archive["line_count"]) != len(records):
             return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_MISSING"}
+        if apply and verified_sha256 != archive["sha256"]:
+            return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_UNVERIFIED"}
         before = self._snapshot_bytes(sid)
         if not apply:
             return {"status": "ready", "snapshot_key": key, "mode": "superseded", "raw_rows": len(records),

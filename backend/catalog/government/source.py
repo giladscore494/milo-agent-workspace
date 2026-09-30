@@ -209,15 +209,27 @@ class GovernmentSourceError(ValueError):
     The rejected URL, the response body and the row that failed never travel
     with the classification, so the safe representation is fit for a durable
     task result, a run event and telemetry alike.
+
+    `detail` is the one structured addition: the numeric HTTP status of a
+    ``GOV_HTTP_STATUS_UNEXPECTED`` answer (an integer, never the body, a
+    header or the URL), so an unexpected status can be diagnosed from the log.
     """
 
-    def __init__(self, reason_code: str, *, retryable: bool = False):
+    def __init__(self, reason_code: str, *, retryable: bool = False,
+                 http_status: int | None = None):
         if reason_code not in GOVERNMENT_SOURCE_REASONS:
             raise ValueError("government source reason must come from the static allowlist")
         self.reason_code = reason_code
         self.retryable = retryable
         self.safe_message = GOVERNMENT_SOURCE_REASONS[reason_code]
+        self.http_status = (http_status if reason_code == "GOV_HTTP_STATUS_UNEXPECTED"
+                            and isinstance(http_status, int) and not isinstance(http_status, bool)
+                            and 100 <= http_status <= 599 else None)
         super().__init__(self.safe_message)
+
+    @property
+    def detail(self) -> dict[str, int]:
+        return {} if self.http_status is None else {"http_status": self.http_status}
 
 
 def action_url(action: str) -> str:
