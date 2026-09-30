@@ -34,8 +34,13 @@ Every request goes through `DataGovClient._request` -- the same allowlisted
 host, action, envelope, size, redirect and retry rules as a capture -- and the
 whole discovery runs under two HARD caps: a request count
 (`MILO_REGISTER_DIRECTORY_MAX_REQUESTS`) and a wall-clock time
-(`MILO_REGISTER_DIRECTORY_MAX_SECONDS`). Exceeding either refuses the whole
-directory; nothing partial is ever recorded.
+(`MILO_REGISTER_DIRECTORY_MAX_SECONDS`). Every RETRY the client makes counts
+as a request, and its wait must end inside the time cap before it is taken
+(P51: the firewall's 403 is retried after 60 s, 180 s and 300 s). The
+client paces every send (`MIN_REQUEST_INTERVAL_SECONDS`, 1 s): a full
+directory of ~240 requests takes >= ~4 minutes, inside the 3000 s cap.
+Exceeding either cap refuses the whole directory; nothing partial is ever
+recorded.
 
 A unit is always capturable: a value `CaptureScope` would refuse (padded,
 over-long, a control or format character) is counted with the unfilterable
@@ -161,6 +166,15 @@ class _Budget:
             raise GovernmentSourceError("GOV_DIRECTORY_TIME_BUDGET_EXCEEDED")
         self.used += 1
 
+    def retry(self, wait: float) -> None:
+        """A retry the client is about to make after `wait` seconds: one more
+        request, and its wait must end inside the time cap."""
+        if self.used >= self.max_requests:
+            raise GovernmentSourceError("GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED")
+        if self.clock() + wait - self.started > self.max_seconds:
+            raise GovernmentSourceError("GOV_DIRECTORY_TIME_BUDGET_EXCEEDED")
+        self.used += 1
+
 
 def discover_directory(client: DataGovClient, *, resource_id: str = src.WLTP_RESOURCE_ID,
                        max_requests: int | None = None, max_seconds: float | None = None,
@@ -187,11 +201,12 @@ def discover_directory(client: DataGovClient, *, resource_id: str = src.WLTP_RES
 
 def _search(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -> Mapping[str, Any]:
     budget.spend()
-    return _answer(client, params)
+    return _answer(client, params, budget)
 
 
-def _answer(client: DataGovClient, params: Mapping[str, str]) -> Mapping[str, Any]:
-    document, _response, _url = client._request(src.DATASTORE_SEARCH, params)  # noqa: SLF001 - same package seam
+def _answer(client: DataGovClient, params: Mapping[str, str], budget: _Budget) -> Mapping[str, Any]:
+    document, _response, _url = client._request(  # noqa: SLF001 - same package seam
+        src.DATASTORE_SEARCH, params, before_retry=budget.retry)
     result = document["result"]
     if str(result.get("resource_id")) != str(params["resource_id"]):
         raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
@@ -213,7 +228,7 @@ def _distinct_total(client: DataGovClient, resource_id: str, budget: _Budget) ->
     budget.spend()
     try:
         result = _answer(client, {"resource_id": resource_id, "fields": TOZAR_FIELD,
-                                  "distinct": "true", "limit": "0"})
+                                  "distinct": "true", "limit": "0"}, budget)
         return _exact_total(result)
     except GovernmentSourceError:
         return None
@@ -306,7 +321,9 @@ def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLT
     ``limit=0`` request (one request, no row payload). Register capture takes
     it at the END of a capture to verify the stored rows independently of the
     capture's own reported total."""
-    budget = _Budget(max_requests=1, max_seconds=DEFAULT_MAX_SECONDS, clock=clock)
+    # The one count, and the retries the client may make for it.
+    budget = _Budget(max_requests=src.MAX_ATTEMPTS_PER_REQUEST + len(src.THROTTLE_BACKOFF_SECONDS),
+                     max_seconds=DEFAULT_MAX_SECONDS, clock=clock)
     return _count(client, src.require_allowed_resource(resource_id), tozar, budget)
 
 

@@ -39,6 +39,8 @@ here that could attach an authorization header.
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Any, Mapping
 from urllib.parse import quote, urlsplit
 
@@ -121,9 +123,30 @@ READ_TIMEOUT_SECONDS = 30.0
 #: identity failure, a validation failure -- is deterministic: retrying it
 #: would produce the same answer, so it is raised on the first occurrence.
 MAX_ATTEMPTS_PER_REQUEST = 3
-RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
+RETRYABLE_STATUS_CODES: frozenset[int] = frozenset({500, 502, 503, 504})
 #: Backoff before attempt 2 and attempt 3. Fixed, finite and in this order.
 RETRY_BACKOFF_SECONDS: tuple[float, ...] = (1.0, 4.0)
+
+#: P51: data.gov.il's web application firewall rate-limits bursts. From Cloud
+#: Run (production, 2026-09-30) ~90 back-to-back requests were answered 200 and
+#: the next one 403 with an HTML block page, after which the address stayed
+#: blocked for a while. Two answers to that, both in the ONE request path every
+#: reader shares (directory, capture, counts):
+#:
+#: * PACING -- at least this many seconds between the START of one request of a
+#:   client and the start of its next (<= 60 requests a minute). Overridable by
+#:   MIN_REQUEST_INTERVAL_ENV within [MIN_REQUEST_INTERVAL_FLOOR,
+#:   MIN_REQUEST_INTERVAL_CEILING]; anything else keeps the default.
+MIN_REQUEST_INTERVAL_SECONDS = 1.0
+MIN_REQUEST_INTERVAL_ENV = "MILO_DATA_GOV_MIN_REQUEST_INTERVAL_SECONDS"
+MIN_REQUEST_INTERVAL_FLOOR = 0.5
+MIN_REQUEST_INTERVAL_CEILING = 30.0
+#: * A LONG BACKOFF for the firewall's answer -- HTTP 403 with an HTML body
+#:   (`WAF_BLOCK_MEDIA_TYPES`), or HTTP 429 -- one retry per entry, so at most
+#:   four sends. A 403 in any other media type (CKAN's own JSON refusal) is
+#:   final, as is every other 4xx.
+THROTTLE_BACKOFF_SECONDS: tuple[float, ...] = (60.0, 180.0, 300.0)
+WAF_BLOCK_MEDIA_TYPES: tuple[str, ...] = ("text/html",)
 
 #: The JSON media types a CKAN action response may carry.
 JSON_CONTENT_TYPES: tuple[str, ...] = ("application/json", "text/json")
@@ -232,6 +255,21 @@ class GovernmentSourceError(ValueError):
         return {} if self.http_status is None else {"http_status": self.http_status}
 
 
+def configured_min_request_interval(env: Mapping[str, str] | None = None) -> float:
+    """The pacing interval: MIN_REQUEST_INTERVAL_ENV when it is a number inside
+    [FLOOR, CEILING], else the code-owned default -- a malformed or out-of-range
+    value never loosens it below the floor."""
+    source = os.environ if env is None else env
+    raw = str(source.get(MIN_REQUEST_INTERVAL_ENV) or "").strip()
+    try:
+        value = float(raw) if raw else MIN_REQUEST_INTERVAL_SECONDS
+    except ValueError:
+        return MIN_REQUEST_INTERVAL_SECONDS
+    if not math.isfinite(value) or not MIN_REQUEST_INTERVAL_FLOOR <= value <= MIN_REQUEST_INTERVAL_CEILING:
+        return MIN_REQUEST_INTERVAL_SECONDS
+    return value
+
+
 def action_url(action: str) -> str:
     """The one URL an allowlisted action can resolve to.
 
@@ -302,7 +340,9 @@ __all__ = ["ALLOWED_ACTIONS", "ALLOWED_PACKAGE_IDS", "ALLOWED_RESOURCE_IDS",
            "GOVERNMENT_SOURCE_REASONS", "GovernmentSourceError", "JSON_CONTENT_TYPES",
            "MAX_ATTEMPTS_PER_REQUEST", "MAX_INLINE_PAGE_CHECKSUMS", "MAX_PAGES_PER_CAPTURE",
            "MAX_PAGE_LIMIT", "MAX_RECORDS_PER_CAPTURE", "MAX_RESPONSE_BYTES",
-           "MAX_RETRIEVAL_METADATA_CHARS", "PACKAGE_SHOW", "QUANTITY_RESOURCE_ID",
-           "READ_TIMEOUT_SECONDS", "RETRYABLE_STATUS_CODES", "RETRY_BACKOFF_SECONDS",
-           "WLTP_RESOURCE_ID", "action_url", "canonical_request_url", "is_approved_url",
-           "require_allowed_package", "require_allowed_resource"]
+           "MAX_RETRIEVAL_METADATA_CHARS", "MIN_REQUEST_INTERVAL_CEILING", "MIN_REQUEST_INTERVAL_ENV",
+           "MIN_REQUEST_INTERVAL_FLOOR", "MIN_REQUEST_INTERVAL_SECONDS", "PACKAGE_SHOW", "QUANTITY_RESOURCE_ID",
+           "READ_TIMEOUT_SECONDS", "RETRYABLE_STATUS_CODES", "RETRY_BACKOFF_SECONDS", "THROTTLE_BACKOFF_SECONDS",
+           "WAF_BLOCK_MEDIA_TYPES", "WLTP_RESOURCE_ID", "action_url", "canonical_request_url",
+           "configured_min_request_interval", "is_approved_url", "require_allowed_package",
+           "require_allowed_resource"]

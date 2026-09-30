@@ -246,7 +246,8 @@ class DirectoryClient:
     def scans(self) -> list[dict[str, str]]:
         return [c for c in self.calls if "filters" not in c and c.get("distinct") != "true"]
 
-    def _request(self, action: str, params: Mapping[str, str]):
+    def _request(self, action: str, params: Mapping[str, str], *, before_retry: Any = None):
+        # `before_retry`: the directory's cap hook (P51); this fake never retries.
         assert action == src.DATASTORE_SEARCH
         if self.drop_threshold:
             params = {k: v for k, v in params.items() if k != "total_estimation_threshold"}
@@ -402,10 +403,12 @@ class StatusTransport:
                             final_url=src.canonical_request_url(str(url).rsplit("/", 1)[-1], params))
 
 
-@pytest.mark.parametrize(("status", "attempts"), [(403, 1), (404, 1), (503, 3)])
+@pytest.mark.parametrize(("status", "attempts"), [(403, 4), (429, 4), (404, 1), (503, 3)])
 def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
-    # The retry policy is unchanged: only 429/5xx are retried (3 attempts).
-    assert src.RETRYABLE_STATUS_CODES == frozenset({429, 500, 502, 503, 504})
+    # The retry policy: a transient 5xx 3 sends; P51, the firewall's answer
+    # (this transport's HTML 403, or a 429) 4 sends; every other 4xx one.
+    assert src.RETRYABLE_STATUS_CODES == frozenset({500, 502, 503, 504})
+    assert src.THROTTLE_BACKOFF_SECONDS == (60.0, 180.0, 300.0)
     transport = StatusTransport(status)
     client = DataGovClient(transport, sleep_fn=lambda _s: None)
     with pytest.raises(GovernmentSourceError) as refused:
@@ -424,7 +427,8 @@ def test_an_unexpected_status_is_reported_by_its_number_only(status, attempts):
 
 
 @pytest.mark.parametrize(("statuses", "reported", "calls"), [
-    ((503, 404), 404, 2), ((503, 502, 429), 429, 3), ((429, 200), None, 2)])
+    # P51: the firewall's 403/429 has its own schedule (1 + 3 sends) beside the transient one (3 sends).
+    ((503, 404), 404, 2), ((503, 502, 503), 503, 3), ((503, 502, 429), 429, 6), ((429, 200), None, 2)])
 def test_a_retried_request_reports_the_status_of_its_last_attempt(statuses, reported, calls):
     transport = StatusTransport(*statuses)
     client = DataGovClient(transport, sleep_fn=lambda _s: None)
@@ -450,6 +454,9 @@ def test_the_capture_job_logs_the_status_of_a_failed_directory_refresh(capsys, m
     run_id = args[args.index("--run-id") + 1]
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    # P51: the firewall's 403 is retried 60 s, 180 s and 300 s apart; not waited out here.
+    monkeypatch.setattr(entrypoint, "DataGovClient",
+                        lambda *a, **k: DataGovClient(*a, sleep_fn=lambda _s: None, **k))
     env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
     status = entrypoint.main(authorized_argv(run_id, **{"--register-directory": True}), env=env)
     out, err = capsys.readouterr()
@@ -778,6 +785,9 @@ def test_the_capture_job_logs_the_statuses_of_a_group_s_failed_units(capsys, mon
     run_id = args[args.index("--run-id") + 1]
     monkeypatch.setattr(entrypoint, "_open_repository", lambda: repo)
     monkeypatch.setattr(entrypoint, "_open_transport", lambda: StatusTransport(403))
+    # P51: the firewall's 403 is retried 60 s, 180 s and 300 s apart; not waited out here.
+    monkeypatch.setattr(entrypoint, "DataGovClient",
+                        lambda *a, **k: DataGovClient(*a, sleep_fn=lambda _s: None, **k))
     monkeypatch.setattr(entrypoint, "_open_archive_writer", lambda env: FakeWriter())
     env = capture_env(MILO_RELEASE_SHA=RELEASE_SHA, MILO_ENABLE_REGISTER_CAPTURE_JOB="true")
     status = entrypoint.main(authorized_argv(run_id, **{"--register-group-id": answer["group_id"]}), env=env)
