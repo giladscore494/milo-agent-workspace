@@ -265,6 +265,20 @@ REQUIRED_PER_FILE["20261001000100_catalog_variant_retention.sql"] = [
     "not public.catalog_variant_equipment_valid(coalesce(t.equipment, '{}'::jsonb))",
     "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
 ]
+REQUIRED_PER_FILE["20261002000100_catalog_register_compaction.sql"] = [
+    # PR-L2: the raw payload leaves the database only through the one guarded
+    # compaction (append-only trigger suspended there only and re-enabled),
+    # a new record still needs its payload, and every reader that took facts
+    # from the payload reads them through the two helpers.
+    "alter table public.catalog_raw_records disable trigger catalog_raw_records_append_only;",
+    "alter table public.catalog_raw_records enable trigger catalog_raw_records_append_only;",
+    "catalog_raw_record_payload_required",
+    "security definer",
+    "catalog_compaction_typed_mismatch",
+    "public.catalog_raw_record_code(r, 'tozeret_cd')",
+    "public.catalog_raw_record_content_sha256(r)",
+    "pg_has_role(r.oid, 'pg_read_all_data', 'member')",
+]
 REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
     # P27: the queue build leaves PR-U's placeholder records out (never
     # eligible, never queued), records each with its reason and counts them.

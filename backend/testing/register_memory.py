@@ -255,10 +255,11 @@ class RegisterMemoryMixin:
 
     def record_register_snapshot_archive(self, run_id: UUID, snapshot_id: str, gcs_uri: str, byte_size: int,
                                          sha256: str, line_count: int, *, worker_id: str, attempt: int,
-                                         lease_token: str) -> dict[str, Any]:
+                                         lease_token: str, _leased: bool = True) -> dict[str, Any]:
         state = self._register_state()
         with self.lock:
-            self._catalog_lease(run_id, worker_id, attempt, lease_token)
+            if _leased:
+                self._catalog_lease(run_id, worker_id, attempt, lease_token)
             snapshot = self._snapshot_by_id(snapshot_id)
             if snapshot is None:
                 raise AppError("CATALOG_REGISTER_REQUEST_INVALID", "unknown snapshot", 409)

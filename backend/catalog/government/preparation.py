@@ -102,7 +102,7 @@ from backend.catalog.contracts import MAX_PROMOTIONS_PER_RUN
 from backend.catalog.government import source as src
 from backend.catalog.government.projection import (GovernmentProjectionError,
                                                    resolve_active_snapshot)
-from backend.catalog.government.query import GovernmentCatalogQuery
+from backend.catalog.government.query import REGISTER_CODE_FIELDS, GovernmentCatalogQuery
 from backend.errors import AppError
 from backend.runtime import CancellationRequested
 
@@ -737,26 +737,44 @@ def _same_variant_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _same_variant_rows(query: GovernmentCatalogQuery, own: Any, rows: Sequence[Any],
-                       payloads: dict[str, Mapping[str, Any]]) -> list[str]:
+                       payloads: dict[str, tuple[str, Mapping[str, Any], Any]]) -> list[str]:
     """PR-Z2: the register ids of `rows` that are the SAME variant as `own`.
 
     The same variant identity key and identical content minus `_id`, each
     proven from the stored register row (one single-row read per row, cached
     per preparation). A row whose key cannot be taken is no one's duplicate.
+    PR-L2: a compacted snapshot's row states its register codes and content
+    hash through its typed reading instead. The two forms are never compared
+    with each other (a payload and the database's content hash are not the
+    same kind of fact): compaction is one-way, so once any row reads compacted,
+    every row cached from its payload is read again, compacted.
     """
-    def facts(row: Any) -> tuple[str, dict[str, Any]] | None:
+    def read(record_id: str) -> tuple[str, Mapping[str, Any], Any]:
+        stored = query.raw_record(record_id)
+        payload = stored.get("payload") if isinstance(stored, Mapping) else None
+        if payload is None and isinstance(stored, Mapping):
+            reading = query.compacted_reading(record_id)
+            fields = reading.get("fields") or {}
+            return ("compacted", {field: fields.get(field) for _name, field in REGISTER_CODE_FIELDS},
+                    reading.get("content_sha256"))
+        payload = payload if isinstance(payload, Mapping) else {}
+        return "payload", payload, _same_variant_payload(payload)
+
+    def facts(row: Any) -> tuple[str, str, Any] | None:
         record_id = str(row.upstream_record_id)
         if record_id not in payloads:
-            stored = query.raw_record(record_id)
-            payload = stored.get("payload") if isinstance(stored, Mapping) else None
-            payloads[record_id] = payload if isinstance(payload, Mapping) else {}
-        payload = payloads[record_id]
+            payloads[record_id] = read(record_id)
+        form, codes, content = payloads[record_id]
         try:
-            return (catalog_coverage.candidate_identity_key(row, payload),
-                    _same_variant_payload(payload))
+            return catalog_coverage.candidate_identity_key(row, codes), form, content
         except (KeyError, ValueError):
             return None
 
+    for row in (own, *rows):
+        facts(row)
+    if {entry[0] for entry in payloads.values()} == {"payload", "compacted"}:
+        for record_id in [rid for rid, entry in payloads.items() if entry[0] == "payload"]:
+            del payloads[record_id]
     mine = facts(own)
     if mine is None:
         return []
@@ -794,7 +812,7 @@ def _annotate_duplicate_identities(repository: Any, snapshot_key: str,
     """
     query = query or _pinned_query(repository, snapshot_key, cancellation_checker)
     pages: dict[tuple[Any, ...], Any] = {}
-    payloads: dict[str, Mapping[str, Any]] = {}
+    payloads: dict[str, tuple[str, Mapping[str, Any], Any]] = {}
     annotated: list[GovernmentWorkItem] = []
     try:
         for item in queue:

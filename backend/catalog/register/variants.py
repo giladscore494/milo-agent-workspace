@@ -156,6 +156,8 @@ VARIANT_REASONS: Mapping[str, str] = {
     "CATALOG_VARIANT_MAPPER_MISMATCH": "the database's mapper version is not this code's",
     "CATALOG_VARIANT_ROWS_INVALID": "the database refused a variant batch",
     "CATALOG_VARIANT_BUILD_FAILED": "the variant build did not complete",
+    # PR-L2: a compacted snapshot's payloads are in its archive only.
+    "CATALOG_VARIANT_SNAPSHOT_COMPACTED": "a compacted snapshot is not rebuilt from the database",
 }
 #: The database's refusal codes the repository maps (a subset of the above).
 DATABASE_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CATALOG_VARIANT_SNAPSHOT_SUPERSEDED",
@@ -163,7 +165,7 @@ DATABASE_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CA
                                       "CATALOG_VARIANT_EQUIPMENT_KEY_UNKNOWN")
 #: The refusals the backfill reports as REFUSED (exit 2), not FAILED.
 BACKFILL_REFUSALS: tuple[str, ...] = ("CATALOG_VARIANT_SNAPSHOT_INELIGIBLE", "CATALOG_VARIANT_SNAPSHOT_SUPERSEDED",
-                                      "CATALOG_VARIANT_MAPPER_MISMATCH")
+                                      "CATALOG_VARIANT_MAPPER_MISMATCH", "CATALOG_VARIANT_SNAPSHOT_COMPACTED")
 
 
 class VariantMappingError(ValueError):
@@ -305,6 +307,10 @@ def build_snapshot_variants(repository: Any, snapshot_id: Any, *,
         page = repository.list_catalog_raw_records(snapshot_id, limit=bound, offset=offset)
         if not page and offset:
             break
+        # PR-L2: a compacted snapshot (payloads removed after a complete
+        # build) is answered `unchanged` above; any other build of it is refused.
+        if any(record.get("payload") is None for record in page):
+            raise VariantMappingError("CATALOG_VARIANT_SNAPSHOT_COMPACTED")
         # An empty snapshot still records its (complete) build: one empty batch.
         rows = [map_record(record["payload"]) for record in page]
         answer = repository.record_catalog_variants(str(snapshot_id), MAPPER_VERSION, rows)

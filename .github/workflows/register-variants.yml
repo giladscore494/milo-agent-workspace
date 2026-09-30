@@ -5,6 +5,8 @@ name: Register variants
 # coverage ledger levels identity / government_fields) of ONE active,
 # count-verified, whole-tozar Government snapshot, on the capture job's image
 # and identity. Idempotent: an already built snapshot is answered unchanged.
+# PR-L2: `compact = dry-run | apply` instead compacts ONE already built
+# snapshot (its raw payloads leave the database; dry-run first).
 # $0: no Government request, no model, no run. Runs in the `production`
 # environment, whose required reviewers approve each dispatch before it starts.
 
@@ -15,6 +17,15 @@ on:
         description: "The active snapshot to build (e.g. cs1.<32 hex>)"
         required: true
         type: string
+      compact:
+        description: "none = build the variants; dry-run / apply = compact an already built snapshot (PR-L2)"
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - dry-run
+          - apply
 
 permissions:
   contents: read
@@ -84,7 +95,14 @@ jobs:
           MILO_OPERATOR_CONFIG_TEXT: ${{ vars.MILO_OPERATOR_CONFIG }}
         run: bash scripts/ops/write-operator-config.sh
 
-      - name: Build the snapshot's variants
+      - name: Build the snapshot's variants (or compact it)
         env:
           SNAPSHOT_KEY_INPUT: ${{ inputs.snapshot_key }}
-        run: bash scripts/ops/register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}"
+          COMPACT_INPUT: ${{ inputs.compact }}
+        run: |
+          set -euo pipefail
+          case "${COMPACT_INPUT}" in
+            none) bash scripts/ops/register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}" ;;
+            dry-run | apply) bash scripts/ops/register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}" --compact "${COMPACT_INPUT}" ;;
+            *) echo "compact must be none, dry-run or apply."; exit 1 ;;
+          esac

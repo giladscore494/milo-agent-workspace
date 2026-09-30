@@ -331,7 +331,8 @@ year_coverage() {
              count(*) filter (where c.status <> 'ambiguous') as readable,
              count(*) filter (where c.status = 'ambiguous') as ambiguous,
              count(*) filter (where c.status = 'candidate') as eligible
-        from public.catalog_candidate_variants c
+        -- A compacted candidate's identity is read from its variant (PR-L2).
+        from public.catalog_candidate_variants_resolved c
         join public.catalog_source_snapshots s on s.id = c.snapshot_id
        where s.snapshot_key = :'snapshot_key' and c.model_year_start is not null
        group by c.model_year_start)

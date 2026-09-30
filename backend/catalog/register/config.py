@@ -5,14 +5,16 @@ environment -- never hard-coded at a call site -- with the reviewed defaults.
                                          plan's database size; decimal, the lower
                                          reading of "500 MB")
     MILO_DB_CAPACITY_THRESHOLD           default 0.80
-    MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE  default 6000: every register row costs
-                                         its raw record + candidate (3,512 B,
-                                         measured in production), its variant
-                                         (975-1,039 B across runs) and two
-                                         ledger levels (~996 B), tables and
-                                         indexes: 5,547 at the upper reading,
-                                         rounded up to the next 500 (PR-L1b;
-                                         PR-L2 lowers it)
+    MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE  default 3000: every register row costs,
+                                         once compacted (PR-L2), its raw record
+                                         skeleton (605 B), candidate keys
+                                         (431 B; the identity is read from the
+                                         variant, the identity indexes skip it),
+                                         variant (993 B) and two ledger levels
+                                         (903 B), tables + TOAST + indexes:
+                                         2,931 B measured (tests/
+                                         test_register_compaction_postgres.py),
+                                         rounded up to the next 500
     MILO_REGISTER_GROUP_MAX_ROWS         default 10000 (one request's cap)
     MILO_REGISTER_ARCHIVE_BUCKET         no default (the capture job's archive)
 
@@ -35,8 +37,21 @@ ARCHIVE_BUCKET_ENV = "MILO_REGISTER_ARCHIVE_BUCKET"
 
 DEFAULT_CAPACITY_BYTES = 500_000_000
 DEFAULT_CAPACITY_THRESHOLD = 0.80
-DEFAULT_BYTES_PER_ROW = 6000
+DEFAULT_BYTES_PER_ROW = 3000
 DEFAULT_GROUP_MAX_ROWS = 10_000
+
+#: Planning constants for the full-register projection (PR-L2, asserted in
+#: tests/test_register_compaction_postgres.py). The database without the
+#: register's four tables: production 2026-09-30, pg_database_size 144.5 MB
+#: minus catalog_raw_records + catalog_candidate_variants + catalog_variants +
+#: catalog_variant_coverage (121.0 MB) = 23.6 MB, rounded up to 25 MB.
+NON_REGISTER_BASE_BYTES = 25_000_000
+#: The register's rows (the latest directory's total, production 2026-09-30).
+FULL_REGISTER_ROWS = 101_686
+#: A register row as it lands, before its build and compaction (5,256 B
+#: measured, rounded up): the capture gate's price for incoming rows while a
+#: finished capture's snapshot is still uncompacted.
+UNCOMPACTED_BYTES_PER_ROW = 5_500
 
 _BUCKET = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 
@@ -90,4 +105,5 @@ def load(env: Mapping[str, str] | None = None) -> RegisterConfig:
 
 __all__ = ["ARCHIVE_BUCKET_ENV", "BYTES_PER_ROW_ENV", "CAPACITY_BYTES_ENV", "CAPACITY_THRESHOLD_ENV",
            "DEFAULT_BYTES_PER_ROW", "DEFAULT_CAPACITY_BYTES", "DEFAULT_CAPACITY_THRESHOLD",
-           "DEFAULT_GROUP_MAX_ROWS", "GROUP_MAX_ROWS_ENV", "RegisterConfig", "load"]
+           "DEFAULT_GROUP_MAX_ROWS", "FULL_REGISTER_ROWS", "GROUP_MAX_ROWS_ENV", "NON_REGISTER_BASE_BYTES",
+           "RegisterConfig", "UNCOMPACTED_BYTES_PER_ROW", "load"]

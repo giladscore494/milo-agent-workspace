@@ -197,8 +197,9 @@ def test_every_sug_degem_in_the_fixtures_maps_and_unknown_is_unknown():
 # =============================================================================
 
 def built_world():
-    """A captured Toyota unit of the 16 real rows; the capture job built it."""
-    repo, w, _version, report, _writer = captured_world(fixture_rows())
+    """A captured Toyota unit of the 16 real rows; the capture job built it
+    (and kept its payloads: PR-L2's compaction has its own tests)."""
+    repo, w, _version, report, _writer = captured_world(fixture_rows(), compact=False)
     snapshot = snapshot_by_key(repo, report.units[0].snapshot_key)
     return repo, w, report, snapshot
 
@@ -303,7 +304,7 @@ def test_a_changed_content_updates_the_ledger_and_a_collision_fails_the_key():
 
 
 def test_a_failed_build_leaves_the_unit_captured():
-    repo, w, _version, report, _writer = captured_world(fixture_rows())
+    repo, w, _version, report, _writer = captured_world(fixture_rows(), compact=False)
     broken = MemoryRepository.record_catalog_variants
 
     def refuse(self, *args, **kwargs):

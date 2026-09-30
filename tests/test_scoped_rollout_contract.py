@@ -1426,3 +1426,17 @@ def test_the_pre_open_gate_needs_run_starts_proved_closed(tmp_path):
     for gate in ("armed", "active"):
         result = unknown.run("production-verify.sh", "--gate", gate, *WS_ARGS, env=env)
         assert result.returncode == 1 and _verdict(result.stdout)["RUN_START_PATH"] == "UNVERIFIED"
+
+
+@pytest.mark.parametrize(("answer", "expected"), [("0", "VERIFIED"), ("2", "NO"), ("fail", "UNVERIFIED")])
+def test_the_deployed_gate_reads_the_compaction_mapper_through_the_read_only_connection(tmp_path, answer, expected):
+    """PR-L2: a compacted snapshot compacted under another variant mapper is NOT ready; a
+    connection that cannot answer the check does not prove the database ready either."""
+    tree = _verify_tree(tmp_path, readiness=READY, website=SITE_OFF, migration_detail=DB_OK)
+    reply = "exit 1" if answer == "fail" else f"echo {answer}"
+    tree.tool("psql", "#!/usr/bin/env bash\n"
+                      f'case "$*" in *catalog_register_compaction_mapper_mismatches*) {reply} ;; *) echo 0 ;; esac\n')
+    result = tree.run("production-verify.sh", "--gate", "deployed",
+                      env={"MILO_TEST_RO_DB_URL": "postgresql://read-only@db.test/postgres"})
+    assert _verdict(result.stdout)["DATABASE_READY"] == expected, result.stdout
+    assert result.returncode == (0 if expected == "VERIFIED" else 1)

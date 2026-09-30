@@ -252,12 +252,36 @@ else
 fi
 
 # --- informational: the whole-register snapshot (NOT batch readiness) ----
+# The connection check-migration-state.sh read (its default when unnamed).
+DB_URL_NAME="${DB_ENV:-MILO_READONLY_DB_URL}"
 DB_URL=""
-[[ -n "$DB_ENV" && "$DB_ENV" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && DB_URL="${!DB_ENV:-}"
+[[ "$DB_URL_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] && DB_URL="${!DB_URL_NAME:-}"
 psql_value() {
   [[ -n "$DB_URL" ]] && command -v psql > /dev/null 2>&1 || return 1
   psql "$DB_URL" -X -At -v ON_ERROR_STOP=1 -c "$1" 2> /dev/null
 }
+
+# --- PR-L2: a compacted snapshot is read through its compaction's mapper ----
+# version. A database whose variant mapper (a migration) differs from the one
+# a live compacted snapshot was compacted under would hide that tozar, and no
+# path rebuilds a compacted snapshot yet (a rebuild-from-archive must land
+# before any variant mapper bump), so the database is NOT ready.
+if [[ "${FACTS[DATABASE_READY]:-}" == "VERIFIED" ]]; then
+  if mismatches="$(psql_value "select public.catalog_register_compaction_mapper_mismatches();")" \
+     && [[ "$mismatches" =~ ^[0-9]+$ ]]; then
+    printf 'CATALOG_COMPACTION_MAPPER=%s\n' "$([[ "$mismatches" -eq 0 ]] && printf 'VERIFIED' || printf 'NO (%s)' "$mismatches")"
+    if [[ "$mismatches" -gt 0 ]]; then
+      fact DATABASE_READY NO "CATALOG_COMPACTION_MAPPER: ${mismatches} compacted snapshot(s) were compacted under another variant mapper version; no path rebuilds a compacted snapshot yet (a rebuild-from-archive must land before any variant mapper bump)"
+    fi
+  elif [[ -n "$DB_URL" ]]; then
+    # Connected, yet unanswered (a read-only role without EXECUTE on it):
+    # the database is not proved ready.
+    printf 'CATALOG_COMPACTION_MAPPER=UNVERIFIED (not readable with the read-only connection)\n'
+    fact DATABASE_READY UNVERIFIED "CATALOG_COMPACTION_MAPPER: catalog_register_compaction_mapper_mismatches() is not readable with the read-only connection"
+  else
+    printf 'CATALOG_COMPACTION_MAPPER=UNVERIFIED (no read-only connection)\n'
+  fi
+fi
 if register="$(psql_value "select count(*) from public.catalog_source_snapshots s
      where s.source_family = 'government' and s.activated_at is not null
        and not (s.retrieval_metadata ? 'capture_scope');")"; then

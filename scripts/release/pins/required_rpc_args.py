@@ -56,10 +56,16 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_candidate_models": {"p_manufacturer", "p_snapshot_id"},
     "catalog_candidate_variant_page": {"p_snapshot_id"},
     "catalog_canonical_manufacturer_coverage": {"p_manufacturers"},
+    "catalog_compacted_record_reading": {"p_snapshot_id", "p_upstream_record_id"},
     "catalog_raw_record_by_upstream_id": {"p_snapshot_id", "p_upstream_record_id"},
+    "catalog_raw_record_lines_mismatched": {"p_first", "p_lines", "p_snapshot_id"},
+    "catalog_raw_record_payload_matches": {"p_line", "p_raw_record_id"},
     "catalog_register_database_bytes": set(),
     "catalog_register_latest_directory": set(),
     "catalog_register_prunable_list": set(),
+    "catalog_register_snapshot_archivable": {"p_snapshot_id"},
+    "catalog_register_superseded_snapshots": {"p_snapshot_key"},
+    "catalog_register_uncompacted_captures": set(),
     "catalog_register_unit_states": set(),
     "catalog_run_pending_promotions": {"p_run_id", "p_tool_operation"},
     "catalog_snapshot_candidate_diff": {"p_previous_snapshot_id", "p_snapshot_id"},
@@ -69,6 +75,7 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "catalog_variant_reservations_settling": {"p_limit"},
     "claim_current_verdict_states": {"p_run_id"},
     "claim_run_lease": {"p_run_id", "p_worker_id"},
+    "compact_register_snapshot": {"p_apply", "p_snapshot_key"},
     "create_agent_message_guarded": {
         "p_attempt", "p_lease_token", "p_message", "p_run_id", "p_worker_id"
     },
@@ -157,6 +164,9 @@ REQUIRED_RPC_ARGS: dict[str, set[str]] = {
     "record_register_directory": {"p_fetched_at", "p_resource_id", "p_units"},
     "record_register_snapshot_archive": {
         "p_attempt", "p_byte_size", "p_gcs_uri", "p_lease_token", "p_line_count", "p_run_id", "p_sha256", "p_snapshot_id", "p_worker_id"
+    },
+    "record_register_snapshot_archive_from_database": {
+        "p_byte_size", "p_gcs_uri", "p_line_count", "p_sha256", "p_snapshot_id"
     },
     "record_register_unit_status": {
         "p_api_total", "p_attempt", "p_captured_rows", "p_count_verified", "p_failure_code", "p_lease_token", "p_run_id", "p_snapshot_id", "p_status", "p_unit_id", "p_worker_id"

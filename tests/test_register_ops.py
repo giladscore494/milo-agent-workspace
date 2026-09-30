@@ -351,13 +351,142 @@ def test_the_retention_workflow_is_dry_run_first_and_confirmed_to_apply():
     doc = workflow("register-retention.yml")
     inputs = triggers(doc)["workflow_dispatch"]["inputs"]
     assert inputs["mode"]["default"] == "dry-run" and inputs["mode"]["options"] == ["dry-run", "apply"]
+    assert inputs["operation"]["default"] == "prune" and inputs["operation"]["options"] == ["prune", "vacuum-full"]
     (job,) = doc["jobs"].values()
     assert job["environment"] == "production"
     first = steps(doc)[0]["run"]
     assert '"${CONFIRM_INPUT}" != "PRUNE"' in first and "^[0-9a-f]{64}$" in first
-    last = steps(doc)[-1]
-    assert last["env"]["MILO_READONLY_DB_URL"] == "${{ secrets.MILO_READONLY_DB_URL }}"
-    assert "register-retention.sh --list" in last["run"] and "--apply --confirm" in last["run"]
+    prune, vacuum_step = steps(doc)[-2:]
+    assert prune["if"] == "${{ inputs.operation == 'prune' }}"
+    assert prune["env"]["MILO_READONLY_DB_URL"] == "${{ secrets.MILO_READONLY_DB_URL }}"
+    assert "register-retention.sh --list" in prune["run"] and "--apply --confirm" in prune["run"]
+    # The owner's credential reaches the space reclamation step only.
+    assert vacuum_step["if"] == "${{ inputs.operation == 'vacuum-full' }}"
+    assert vacuum_step["env"]["SUPABASE_DB_PASSWORD"] == "${{ secrets.SUPABASE_DB_PASSWORD }}"
+    assert not [step for step in steps(doc) if step is not vacuum_step
+                and "SUPABASE_DB_PASSWORD" in json.dumps(step.get("env") or {})]
+    assert "register-vacuum.sh --sizes" in vacuum_step["run"]
+    assert 'register-vacuum.sh --apply --confirm "${CONFIRM_INPUT}"' in vacuum_step["run"]
+    assert '"${CONFIRM_INPUT}" != "VACUUM"' in first
+
+
+# =============================================================================
+# 2a. space reclamation (PR-L2): VACUUM (FULL, ANALYZE) of the compacted tables
+# =============================================================================
+
+VACUUM_PSQL = """#!/usr/bin/env bash
+owner="${PGUSER:+ [owner PGUSER=$PGUSER PGHOST=$PGHOST PGPORT=$PGPORT PGSSLMODE=$PGSSLMODE]}"
+printf 'psql%s%s %s\\n' "$owner" "${PGOPTIONS:+ [PGOPTIONS=$PGOPTIONS]}" "$*" | sed 's/postgresql:[^ ]*/<url>/' >> "$OPS_TEST_CALLS"
+# The owner's password arrives through PGPASSWORD only, and only the owner's.
+if [[ -n "${PGUSER:-}" ]]; then [[ "${PGPASSWORD:-}" == "$OPS_TEST_OWNER_PASSWORD" ]] || exit 7
+else [[ -z "${PGPASSWORD:-}" ]] || exit 7; fi
+case "$*" in
+  *"vacuum (full"*) exit "${OPS_TEST_VACUUM_STATUS:-0}" ;;
+  *"'OWNER '"*)
+    [[ -z "${OPS_TEST_OWNER_UNREACHABLE:-}" ]] || exit 2
+    printf 'OWNER catalog_raw_records=%s\\nOWNER catalog_candidate_variants=PASS\\n' "${OPS_TEST_OWNER:-PASS}"
+    exit 0 ;;
+  *"'GATE runs="*)
+    live=0; [[ -n "${OPS_TEST_LIVE_AT:-}" && "$*" == *"public.${OPS_TEST_LIVE_AT}'"* ]] && live=1
+    printf 'GATE runs=%s register_captures=0 database=%s table=%s\\n' "$live" \\
+      "${OPS_TEST_DB_BYTES:-144542867}" "${OPS_TEST_TABLE_BYTES:-62169088}"
+    exit 0 ;;
+esac
+printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=2 heap=1 toast=8192\\n' \\
+  "${OPS_TEST_RAW_BYTES:-62169088}"
+printf 'DATABASE bytes=%s\\nLIVE runs=%s register_captures=%s\\n' "${OPS_TEST_DB_BYTES:-144542867}" \\
+  "${OPS_TEST_LIVE_RUNS:-0}" "${OPS_TEST_LIVE_CAPTURES:-0}"
+"""
+
+OWNER_PASSWORD = "S3NTINEL-OWNER-PASSWORD"
+#: The read-only URL of a Supabase pooler (transaction mode): the owner connects to the same host in
+#: session mode (5432) as postgres.<project ref>.
+POOLER_URL = "postgresql://ro.abcdefghijklmnopqrst:S3NTINEL-DB-PASSWORD@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+OWNER_ENV = {"MILO_READONLY_DB_URL": POOLER_URL, "SUPABASE_DB_PASSWORD": OWNER_PASSWORD,
+             "SUPABASE_PROJECT_ID": "abcdefghijklmnopqrst", "OPS_TEST_OWNER_PASSWORD": OWNER_PASSWORD}
+
+
+def vacuum_tree(tmp_path: Path) -> OpsTree:
+    tree = OpsTree(tmp_path)
+    tree.tool("psql", VACUUM_PSQL)
+    return tree
+
+
+def vacuum(tree: OpsTree, *args: str, **env: str):
+    return tree.run("register-vacuum.sh", *args, extra_env={**OWNER_ENV, **env})
+
+
+def test_the_vacuum_dry_run_reads_sizes_and_the_owner_only(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    result = vacuum(tree, "--sizes")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "SIZE catalog_raw_records total=62169088" in result.stdout
+    assert "SUMMARY|register-vacuum sizes|PASS|pg_database_size 144542867 bytes; live runs 0" in result.stdout
+    for table in ("catalog_raw_records", "catalog_candidate_variants"):
+        assert f"SUMMARY|register-vacuum owner {table}|PASS|" in result.stdout
+    assert not [c for c in tree.tool_calls() if "vacuum (full" in c]
+    # The owner connects to the pooler's host in SESSION mode, as postgres.<ref>, over TLS.
+    (owner,) = [c for c in tree.tool_calls() if "[owner" in c]
+    assert "PGUSER=postgres.abcdefghijklmnopqrst PGHOST=aws-0-us-east-1.pooler.supabase.com PGPORT=5432" in owner
+    assert "PGSSLMODE=require" in owner
+    denied = vacuum(tree, "--sizes", OPS_TEST_OWNER="FAIL")
+    assert denied.returncode == 0 and "SUMMARY|register-vacuum owner catalog_raw_records|FAIL|" in denied.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text(), "\n".join(tree.tool_calls()))
+    assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(tree.tool_calls())
+
+
+def test_the_read_only_role_holds_no_maintain_and_the_owner_rewrites():
+    """PR-L2 should-fix 3: MAINTAIN would also let the read-only credential LOCK,
+    CLUSTER and REINDEX; the rewrite is the owner's."""
+    text = (OPS / "register-vacuum.sh").read_text()
+    assert "MAINTAIN" not in re.sub(r"#[^\n]*", "", text).replace("holds no MAINTAIN", "")
+    assert 'PGPASSWORD="$SUPABASE_DB_PASSWORD"' in text and "owner_psql -q -c" in text
+
+
+def test_the_vacuum_needs_its_word_the_owner_and_quiet(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    for args in (("--apply",), ("--apply", "--confirm", "vacuum"), ("--sizes", "--confirm", "VACUUM")):
+        assert vacuum(tree, *args).returncode == 2
+    assert tree.tool_calls() == []
+    for refused in ({"OPS_TEST_OWNER": "FAIL"}, {"OPS_TEST_OWNER_UNREACHABLE": "1"}, {"SUPABASE_DB_PASSWORD": ""},
+                    {"MILO_READONLY_DB_URL": "postgresql://ro:S3NTINEL-DB-PASSWORD@db.sentinel.example.com/postgres"}):
+        result = vacuum(tree, "--apply", "--confirm", "VACUUM", **refused)
+        assert result.returncode == 1 and "CATALOG_VACUUM_NOT_PERMITTED" in result.stderr, refused
+    assert not [c for c in tree.tool_calls() if "vacuum (full" in c]
+
+
+def test_liveness_and_headroom_are_checked_before_each_table(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    # Live before the SECOND table: the first was rewritten, the second is not.
+    result = vacuum(tree, "--apply", "--confirm", "VACUUM", OPS_TEST_LIVE_AT="catalog_candidate_variants")
+    assert result.returncode == 1 and "CATALOG_VACUUM_BLOCKED before public.catalog_candidate_variants" in result.stdout
+    assert [c.split("public.")[-1] for c in tree.tool_calls() if "vacuum (full" in c] == ["catalog_raw_records"]
+    # No room for the copy: 400,000,000 + 50,000,000 x 1.1 = 455,000,000 > 450,000,000.
+    rewritten = len([c for c in tree.tool_calls() if "vacuum (full" in c])
+    result = vacuum(tree, "--apply", "--confirm", "VACUUM", OPS_TEST_DB_BYTES="400000000",
+                    OPS_TEST_TABLE_BYTES="50000000")
+    assert result.returncode == 1
+    assert ("CATALOG_VACUUM_NO_HEADROOM before public.catalog_raw_records: pg_database_size 400000000 + 50000000"
+            " x 1.1 = 455000000 > 450000000 bytes") in result.stdout
+    assert len([c for c in tree.tool_calls() if "vacuum (full" in c]) == rewritten  # nothing was rewritten
+
+
+def test_the_vacuum_rewrites_each_table_as_the_owner_with_a_lock_timeout(tmp_path):
+    tree = vacuum_tree(tmp_path)
+    result = vacuum(tree, "--apply", "--confirm", "VACUUM")
+    assert result.returncode == 0, result.stdout + result.stderr
+    rewrites = [c for c in tree.tool_calls() if "vacuum (full" in c]
+    assert [c.split("public.")[-1] for c in rewrites] == ["catalog_raw_records", "catalog_candidate_variants"]
+    assert all("[owner PGUSER=postgres.abcdefghijklmnopqrst" in c and "PGOPTIONS" not in c
+               and "set lock_timeout = '5s'" in c and "<url>" not in c for c in rewrites)
+    gates = [c for c in tree.tool_calls() if "'GATE runs=" in c]
+    assert len(gates) == 2 and all("[owner" not in c for c in gates)
+    assert "SUMMARY|register-vacuum headroom catalog_raw_records|PASS|" in result.stdout
+    assert "SUMMARY|register-vacuum apply|PASS|pg_database_size 144542867 -> 144542867 bytes" in result.stdout
+    failed = vacuum(tree, "--apply", "--confirm", "VACUUM", OPS_TEST_VACUUM_STATUS="1")
+    assert failed.returncode == 1 and "did not complete" in failed.stdout
+    no_secret(result.stdout, result.stderr, tree.summary.read_text(), "\n".join(tree.tool_calls()))
+    assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(tree.tool_calls())
 
 
 # =============================================================================
@@ -400,6 +529,26 @@ def test_the_variant_backfill_runs_the_capture_job_for_one_snapshot(tmp_path):
     assert refused.returncode == 1 and "SUMMARY|register-variants|FAIL|" in refused.stdout
 
 
+def test_the_compaction_runs_the_capture_job_dry_run_first(tmp_path):
+    """PR-L2: `--compact dry-run|apply` runs the compaction module instead."""
+    tree = variants_tree(tmp_path)
+    for mode, line in (("dry-run", "READY snapshot_key=cs1.a raw_rows=5"),
+                       ("apply", "COMPACTED snapshot_key=cs1.a raw_rows=5 payloads_removed=5")):
+        result = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", mode,
+                          extra_env={"MILO_VARIANTS_POLL_SECONDS": "0", "OPS_TEST_OUTCOME": line})
+        assert result.returncode == 0, result.stdout + result.stderr
+        execute = [c for c in tree.tool_calls() if "jobs execute" in c][-1]
+        assert f"--args=-m,backend.catalog.register.compaction,--snapshot-key,{SNAPSHOT_KEY},--{mode}" in execute
+        assert f"SUMMARY|register-variants|PASS|{line}" in result.stdout
+    refused = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", "apply",
+                       extra_env={"MILO_VARIANTS_POLL_SECONDS": "0",
+                                  "OPS_TEST_OUTCOME": "REFUSED CATALOG_COMPACTION_BUILD_INCOMPLETE: x"})
+    assert refused.returncode == 1 and "SUMMARY|register-variants|FAIL|" in refused.stdout
+    calls = len(tree.tool_calls())
+    assert tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", "now").returncode == 2
+    assert len(tree.tool_calls()) == calls
+
+
 def test_the_variant_backfill_refuses_a_malformed_key(tmp_path):
     tree = variants_tree(tmp_path)
     for key in ("", "bad key", "a,b", "-x"):
@@ -417,6 +566,9 @@ def test_the_variant_workflow_runs_from_main_in_production():
     first = steps(doc)[0]["run"]
     assert "refs/heads/main" in first and "^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$" in first
     assert 'register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}"' in steps(doc)[-1]["run"]
+    # PR-L2: the compaction, dry-run first, from the same dispatch.
+    assert inputs["compact"]["options"] == ["none", "dry-run", "apply"] and inputs["compact"]["default"] == "none"
+    assert '--compact "${COMPACT_INPUT}"' in steps(doc)[-1]["run"]
 
 
 # =============================================================================

@@ -2015,6 +2015,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
         snapshot = self._catalog_snapshot_by_id(snapshot_id)
         if snapshot.get("activated_at") is None or snapshot.get("validation_state") != "complete":
             raise AppError("CATALOG_SNAPSHOT_NOT_ACTIVE", "catalog snapshot is not active", 409)
+        if self.register_snapshot_archived(str(snapshot["id"])):
+            raise AppError("CATALOG_SNAPSHOT_ARCHIVED", "the snapshot's archive is the record", 409)
         metadata = snapshot.get("retrieval_metadata") or {}
         contract = metadata.get("normalization_contract")
         if not contract or contract == "raw_only":
@@ -2174,7 +2176,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                 if record is None:
                     continue
                 # PR-Z3: `payload->>'field'`, compared verbatim.
-                codes = _register_codes(record["payload"])
+                codes = _register_codes(self._record_facts(record)[0])
                 if any(wanted_code is not None and str(wanted_code) != code
                        for wanted_code, code in zip(stated_codes, codes)):
                     continue
@@ -2263,6 +2265,9 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                 record = by_locator.get(locator)
                 if record is None:
                     continue
+                # PR-L2: a skeleton's candidate has no identity to match.
+                if self.register_snapshot_archived(str(record["snapshot_id"])):
+                    raise AppError("CATALOG_SNAPSHOT_ARCHIVED", "the snapshot's archive is the record", 409)
                 scope = dict(claim.get("identity_scope") or {})
                 readings = [row for row in self.catalog_candidates.values()
                             if row["raw_record_id"] == record["id"]
@@ -3527,6 +3532,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                 return None
             batch = next(row for row in self.work_scope_batches
                          if row["id"] == binding["batch_id"])
+            if self.register_snapshot_archived(str(batch["snapshot_id"])):
+                raise AppError("CATALOG_SNAPSHOT_ARCHIVED", "the snapshot's archive is the record", 409)
             candidates = {row["id"]: row for row in self.catalog_candidates.values()}
             items = []
             for item in sorted((row for row in self.work_scope_queue_items
@@ -3563,8 +3570,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
         """(identity key, content hash, raw record) of one stored candidate."""
         records = self._raw_records_by_id() if records is None else records
         record = records[candidate["raw_record_id"]]
-        return (catalog_coverage.candidate_identity_key(candidate, record["payload"]),
-                catalog_coverage.variant_content_sha256(record["payload"]), record)
+        codes, content = self._record_facts(record)
+        return (catalog_coverage.candidate_identity_key(candidate, codes), content, record)
 
     _IDENTITY_COLUMNS = ("manufacturer", "commercial_model", "model_year_start",
                          "model_year_end", "official_model_code", "trim")
@@ -3624,6 +3631,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                          None)
             if batch is None:
                 return None
+            if self.register_snapshot_archived(str(batch["snapshot_id"])):
+                raise AppError("CATALOG_SNAPSHOT_ARCHIVED", "the snapshot's archive is the record", 409)
             revision = next((row for row in self.work_scope_revisions
                              if row["work_scope_id"] == batch["work_scope_id"]
                              and row["revision"] == batch["revision"]), None)

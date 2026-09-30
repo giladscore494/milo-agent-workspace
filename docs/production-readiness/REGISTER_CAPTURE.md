@@ -44,11 +44,142 @@ snapshot. A re-measurement sets `measured_at`, never `updated_at`: it never
 makes an older unit the tozar's newest. Heap sizes only (a floor): the
 estimate below includes indexes.
 
-The estimate (PR-L1b, 6,000 B/row) is the measured total per register row,
-tables + TOAST + indexes, rounded up to the next 500: raw record + candidate
-3,512 B (production, 25,495 rows), variant 975-1,039 B, ledger at two levels
-~996 B (`tests/test_catalog_variants_postgres.py`, L1-6): 5,547 B at the
-upper reading.
+The estimate (PR-L2, 3,000 B/row) is the measured total per register row
+ONCE COMPACTED, tables + TOAST + indexes after VACUUM FULL, rounded up to the
+next 500: raw record without its payload ~605 B, candidate keys ~431 B (its
+identity is read from the variant row; the identity indexes skip it), variant
+~993 B (with the reading index the compacted readers use), ledger at two
+levels ~903 B = ~2,931 B (5,000 rows,
+`tests/test_register_compaction_postgres.py`; 5,256 B before compaction).
+That test asserts:
+
+| | |
+|---|---|
+| bytes per row | <= 2,890 x 1.15 and <= the default |
+| full register | 25 MB non-register base (`NON_REGISTER_BASE_BYTES`, production 144.5 - 121.0 MB) + 101,686 rows x ~2,931 B + the two superseded Toyota snapshots' 22 referenced skeletons = **~323.1 MB** (<= 360 MB) |
+| after one refresh (two snapshots per tozar) | the active snapshot compacted, the one before it kept as its referenced rows (10% planned) = **~333.6 MB** (<= 400 MB) |
+
+The capture gate stays `pg_database_size` + incoming rows x the estimate: the
+plan limit counts the database's size on disk, dead space included. A
+capture's rows hold their payload only until their build completes; the
+space a compaction frees is reused by later captures, but `pg_database_size`
+drops only after the two tables are rewritten (**Register retention**,
+`operation = vacuum-full`; operator step 7). The estimate counts COMPACTED
+rows, so while any finished register capture's snapshot is not compacted
+(`catalog_register_uncompacted_captures`: a refused or failed compaction
+leaves full-size rows) the gate prices incoming and in-flight rows as they
+land, uncompacted (`UNCOMPACTED_BYTES_PER_ROW` = 5,500 B; 5,256 B measured).
+Nothing is refused for it: a re-capture of that tozar supersedes and archives
+the stuck snapshot.
+
+**Readers after compaction** (`catalog_candidate_variants_resolved`): a
+UNION ALL of the candidates still stating their identity (read as stored,
+through the partial identity indexes), the compacted ones joined to their
+variant row (through `catalog_variants_reading_idx`), and the skeletons whose
+variant is gone (identity null). `catalog_work_scope_coverage_decisions` is an
+inlinable SQL function (no `SET`; every name qualified), planned with its
+caller's values; the two register-code helpers carry no `SET` either (no
+per-call search_path switch; their sub-select keeps them from being
+inlined). Measured on 6,000 rows (ms,
+before -> after compaction): coverage decisions 26 -> 113, the candidate page
+by model 17 -> 20, an identity lookup 0.9 -> 2.5; a model filter never scans
+the snapshot (asserted with EXPLAIN).
+
+### Compaction (PR-L2, 20261002000100)
+
+`public.compact_register_snapshot` has two modes.
+
+**Every apply reads the archive back first.** The dry-run runs first; only a
+READY snapshot has its archive object downloaded, its length, sha256 and
+line count checked against `catalog_register_snapshot_archives`, and the
+apply names the sha256 it computed (`p_verified_sha256`): the database
+refuses any other (`CATALOG_COMPACTION_ARCHIVE_UNVERIFIED`), and so does the
+job on a read failure or a mismatch -- nothing is removed on the word of an
+upload answer. The upload itself sends `md5Hash`, so Cloud Storage rejects a
+corrupted write.
+
+**Active** (the tozar's rank-1 snapshot). When nothing live reads it (as
+below, except the caller's own run: a capture job compacts in its own run),
+and its variants are completely
+built under the current mapper version AND its archive is recorded, its raw
+payloads leave the database and every candidate keeps only its keys (id,
+snapshot, raw record, `candidate_key`, status): its identity columns are
+NULL and read from the variant row through `catalog_candidate_variants_resolved`
+(the table's own columns; every candidate reader reads it). The capture job
+does it right after the build (the unit's document reports
+`compaction.status`: `compacted`, `unchanged`, `refused` with a code,
+`skipped` or `failed`; never failing the unit), and the **Register variants**
+workflow does it for an already built snapshot (`compact = dry-run`, then
+`apply`). Every row stays, with its id, keys, `payload_sha256` and
+`source_locator` (the archive line); every foreign key, evidence link, queue
+item and reservation stays valid.
+
+**Superseded** (any older activated snapshot of the tozar). Once the active
+one is built and nothing live can read the old one -- no live run on it (its
+writer, an adopter, a preparation, a batch run, a run whose checkpoint names
+it, a reservation a live run holds, and any capture-job run that is not a
+register capture: a Prepare may be reading it for reuse), no batch its open
+plan can still start, no reservation at all
+(`CATALOG_COMPACTION_SNAPSHOT_IN_USE` otherwise) -- it keeps only the rows
+something references (a candidate named by a queue item, evidence link, field
+provenance, promotion or reservation, and its raw record) as skeletons, and
+drops every other row and all its variants. `catalog_readable_snapshot` then
+refuses it (`CATALOG_SNAPSHOT_ARCHIVED`), and so do the readers that do not go
+through it -- `catalog_work_scope_coverage_decisions`,
+`catalog_variant_coverage_for_batch`, `work_scope_batch_for_run` and
+`catalog_run_pending_promotions` (`catalog_snapshot_not_archived`): a
+skeleton candidate has no identity left. Its archive is the record (the
+replay export reads it there, row or no row). The
+capture job does it for the tozar's older snapshots right after it compacts
+the new one (the unit's document lists them under `compaction.superseded`);
+the operator path does it by key. This includes the two superseded Toyota
+Prepare snapshots: their batches are completed (no run can start again), so
+only their 10 + 12 queued rows stay.
+
+The append-only triggers are suspended only inside that one security-definer
+function (search_path pinned, service_role only). Refusals, each writing
+nothing:
+`CATALOG_COMPACTION_SNAPSHOT_UNKNOWN`, `CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE`
+(not an activated whole-tozar Government snapshot),
+`CATALOG_COMPACTION_COUNT_UNVERIFIED` (the newest register unit that captured
+it is not count-verified, or stored rows differ from declared rows),
+`CATALOG_COMPACTION_BUILD_INCOMPLETE` (no complete current-mapper build
+covering every raw row), `CATALOG_COMPACTION_TYPED_MISMATCH` (a row's typed
+variant does not read exactly as its payload -- e.g. a zero-padded code;
+checked per row by `catalog_variant_reads_as_payload` -- or a candidate's
+identity is not its variant's, `catalog_candidate_reads_as_variant`),
+`CATALOG_COMPACTION_SNAPSHOT_IN_USE` (either mode), then
+`CATALOG_COMPACTION_ARCHIVE_MISSING` (so a dry-run naming it passed every other
+check) and, for an apply, `CATALOG_COMPACTION_ARCHIVE_UNVERIFIED`. The locks
+wait at most 5 s (`lock_timeout`); the checks then run under them (16 s per
+6,000 rows locally), so every reader of the six tables waits that long.
+
+After compaction every reader takes the register codes, the content hash and
+the identity reading from the snapshot's variant rows
+(`catalog_raw_record_code`, `catalog_raw_record_content_sha256`,
+`catalog_compacted_record_reading`); REGISTER_FIELD_ABSENT reads "the
+register states nothing" as the typed column null AND no parse issue for the
+field (an unparseable value stays a hard gap). The original record is read
+from the archive only: `python -m backend.catalog.register.compaction
+--snapshot-key <key> --show-record <upstream id>` (and the replay export)
+fetch the object and check its SHA-256 against the recorded one; for an active
+snapshot the database also checks the line against the row's
+`payload_sha256`. A compacted snapshot is not rebuilt under a new mapper
+version: the database refuses any variant row for it
+(`CATALOG_VARIANT_SNAPSHOT_COMPACTED`), CI refuses a migration that redefines
+`catalog_variant_mapper_version()` after PR-L2, and the deployed gate is NOT
+ready while a live compaction names another mapper (`CATALOG_COMPACTION_MAPPER`
+in `production-verify.sh`). No path rebuilds a compacted snapshot yet: a
+rebuild-from-archive must land before any variant mapper bump.
+
+A snapshot with no archive (a Prepare snapshot captured before PR-D1) gets it
+written from its stored rows first, only once every other precondition holds:
+the database checks the rows are exactly an archive's lines
+(`catalog_register_snapshot_archivable`), every line is checked against its
+row's `payload_sha256` (`catalog_raw_record_lines_mismatched`), then PR-D1's
+create-only writer uploads it (the same object a register capture of the
+same rows writes) and it is recorded
+(`record_register_snapshot_archive_from_database`).
 
 ### Archive
 
@@ -108,7 +239,7 @@ build under the current mapper version is complete. Their digest item is
 | `MILO_ENABLE_REGISTER_CAPTURE` | off | the website stage flag |
 | `MILO_DB_CAPACITY_BYTES` | `500000000` (500 MB) | |
 | `MILO_DB_CAPACITY_THRESHOLD` | `0.80` | |
-| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `6000` | raw + candidate + variant + two ledger levels, per row (PR-L1b) |
+| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `3000` | compacted raw record + candidate keys + variant + two ledger levels, per row (PR-L2) |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |
@@ -194,6 +325,43 @@ build under the current mapper version is complete. Their digest item is
    (the gate then fails). Only an exit 1 WITH a `REGISTER_COVERAGE=FAIL` line
    means that; any other failure of the report reads
    `INFO not available (the coverage report did not run: exit <n>)`.
+7. **Compaction (PR-L2)**: apply `20261002000100_catalog_register_compaction.sql`
+   with the release (it also grants the release read-only role MAINTAIN on
+   the two compacted tables). A new capture compacts by itself, then its
+   tozar's older snapshots. For the existing snapshots, each by key: Actions
+   -> **Register variants** with its `snapshot_key` and `compact = dry-run`,
+   then `compact = apply`:
+   - Audit `cs1.6fb07b73d273aa8b8a2a10a1a61f38f2` (archived by its capture;
+     expect `READY ... mode=active`) and the active Toyota
+     `cs1.ae06a5c5f8585e420e10eced830e2719` (a Prepare snapshot; expect
+     `READY ... mode=active archive=from-database`), then `COMPACTED ... mode=active`;
+   - then the superseded Toyota `cs1.e335295707fa8d6935b113bb6a0165f4` and
+     `cs1.41cdbb31f18f96429eb62651bc71131d` (expect `READY ... mode=superseded
+     archive=from-database`, then `COMPACTED ... mode=superseded raw_rows=6374
+     kept_rows=12` and `kept_rows=10`).
+   The capture job's bucket (`REGISTER_ARCHIVE_BUCKET`) must be set: an
+   archive written from the stored rows needs it. Then, with nothing live,
+   hand the space back: Actions -> **Register retention** with
+   `operation = vacuum-full`, `mode = dry-run` (the two tables' sizes,
+   `pg_database_size`, what is live, and `register-vacuum owner <table>`
+   PASS/FAIL: the owner connection owns each table), then `mode = apply`,
+   `confirm = VACUUM`. The rewrite runs as the tables' OWNER with the
+   migrations' own credential (the `production` environment's
+   `SUPABASE_DB_PASSWORD` and `SUPABASE_PROJECT_ID`, given to that one step,
+   passed as `PGPASSWORD`, never printed); the read-only role holds no
+   MAINTAIN. The owner connects to `MILO_READONLY_DB_URL`'s host: a Supabase
+   pooler in session mode (port 5432, `postgres.<project ref>`), or the direct
+   host (`postgres`). Refused `CATALOG_VACUUM_NOT_PERMITTED` unless the owner
+   read-back is PASS for both tables; then BEFORE EACH TABLE,
+   `CATALOG_VACUUM_BLOCKED` while any run or register capture is not
+   terminal, and `CATALOG_VACUUM_NO_HEADROOM` when `pg_database_size` + the
+   table's size x 1.1 > 450 MB (the rewrite copies the table first; the
+   numbers are printed). VACUUM (FULL, ANALYZE) holds ACCESS EXCLUSIVE on
+   each table for the seconds it rewrites it, waiting at most 5 s for the
+   lock (set on the connection itself). Check `pg_database_size` in its
+   summary (or on the Register page).
+   A superseded compaction also waits for every capture-job run that is not
+   a register capture (a Prepare) to end.
 
 ## Error codes
 

@@ -56,7 +56,7 @@ def _captured(source: str) -> dict[str, str]:
 
 
 def build_manifest(repository: Any, run_id: str, *, name: str,
-                   today: str | None = None) -> dict[str, Any]:
+                   today: str | None = None, archive_client: Any = None) -> dict[str, Any]:
     """The replay/1 manifest for one captured run (no `expected` outcome yet)."""
     checkpoint = repository.latest_checkpoint(run_id)
     if checkpoint is not None and str(checkpoint.get("run_id")) != str(run_id):
@@ -108,9 +108,27 @@ def build_manifest(repository: Any, run_id: str, *, name: str,
                          if isinstance(item["result"].get("source_record"), Mapping)},
                         key=lambda value: (len(value), value))
     rows = []
+    # PR-L2: a superseded snapshot kept as skeletons may no longer hold the
+    # row at all; its archive is the record (compaction.source_record).
+    archived = repository.register_snapshot_archived(str(record["snapshot_id"]))
+    lines = None  # the snapshot's archive, read and verified once
     for record_id in referenced:
-        row = repository.catalog_raw_record_by_upstream_id(record["snapshot_id"], record_id)
+        row = None if archived else repository.catalog_raw_record_by_upstream_id(record["snapshot_id"], record_id)
         payload = (row or {}).get("payload")
+        if archived or (row and payload is None):
+            # PR-L2: a compacted snapshot keeps its rows in the archive only:
+            # the line is fetched and checked (the object's size and sha256;
+            # an active snapshot's line against the row's payload_sha256).
+            from backend.catalog.register import compaction
+
+            reader = archive_client or compaction.default_archive_client()
+            try:
+                if lines is None:
+                    lines = compaction.archive_lines(repository, reader, str(record["snapshot_id"]))
+                payload = compaction.source_record(repository, reader, str(record["snapshot_id"]), record_id,
+                                                   lines=lines)
+            except compaction.CompactionError:
+                raise ExportRefused("SNAPSHOT_ROW_UNREADABLE") from None
         if not isinstance(payload, Mapping):
             raise ExportRefused("SNAPSHOT_ROW_UNREADABLE")
         rows.append(dict(payload))

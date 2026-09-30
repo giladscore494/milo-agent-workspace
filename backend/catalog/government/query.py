@@ -314,6 +314,35 @@ def unstated_fields(payload: Mapping[str, Any]) -> tuple[str, ...]:
                  or (isinstance(payload.get(name), str) and not payload[name].strip()))
 
 
+def reading_projection(reading: Mapping[str, Any]) -> dict[str, Any]:
+    """PR-L2: `identity_projection` of a COMPACTED row, from its typed variant
+    reading (`catalog_compacted_record_reading`). The compaction admitted the
+    row only if its typed columns read exactly as its payload did
+    (`catalog_variant_reads_as_payload`), so this is the same projection."""
+    fields = reading.get("fields") if isinstance(reading, Mapping) else None
+    fields = fields if isinstance(fields, Mapping) else {}
+    projected: dict[str, Any] = {}
+    for name, expected in IDENTITY_RECORD_FIELD_TYPES.items():
+        value = fields.get(name)
+        if isinstance(value, expected) and not isinstance(value, bool):
+            projected[name] = value
+    for _name, field_name in REGISTER_CODE_FIELDS:
+        if isinstance(fields.get(field_name), str):
+            projected[field_name] = fields[field_name]
+    return projected
+
+
+def reading_unstated(reading: Mapping[str, Any]) -> tuple[str, ...]:
+    """PR-L2: `unstated_fields` of a COMPACTED row: the typed column is null
+    AND the build recorded no parse issue for the field (an unparseable value
+    is stated, and stays a hard gap)."""
+    fields = reading.get("fields") if isinstance(reading, Mapping) else None
+    fields = fields if isinstance(fields, Mapping) else {}
+    issues = set(reading.get("parse_issue_fields") or ()) if isinstance(reading, Mapping) else set()
+    return tuple(name for name in IDENTITY_RECORD_FIELD_TYPES
+                 if fields.get(name) is None and name not in issues)
+
+
 class GovernmentCatalogQuery:
     """The bounded database-side read over one active Government snapshot."""
 
@@ -492,11 +521,16 @@ class GovernmentCatalogQuery:
                                            provenance=page.provenance, match_mode=mode)
         record = self._raw_record(matches[0].upstream_record_id)
         payload = record.get("payload") if isinstance(record, Mapping) else None
+        if payload is None:
+            # PR-L2: a compacted snapshot answers from the row's typed variant.
+            reading = self.compacted_reading(matches[0].upstream_record_id)
+            projection, unstated = reading_projection(reading), reading_unstated(reading)
+        else:
+            projection = identity_projection(payload if isinstance(payload, Mapping) else {})
+            unstated = unstated_fields(payload) if isinstance(payload, Mapping) else ()
         return VariantResolutionResult(
             matches=matches, match_count=1, provenance=page.provenance,
-            identity_projection=identity_projection(payload if isinstance(payload, Mapping) else {}),
-            unstated_fields=unstated_fields(payload) if isinstance(payload, Mapping) else (),
-            match_mode=mode)
+            identity_projection=projection, unstated_fields=unstated, match_mode=mode)
 
     def _separator_insensitive(self, manufacturer: str, commercial_model: str,
                                model_year: int, *, trim: str | None,
@@ -538,6 +572,20 @@ class GovernmentCatalogQuery:
         read of this layer when the row is missing or unreadable.
         """
         return self._raw_record(upstream_record_id)
+
+    def compacted_reading(self, upstream_record_id: str) -> Mapping[str, Any]:
+        """PR-L2: ONE compacted row's typed reading (its register codes, the
+        identity fields, the fields with a parse issue and its content hash),
+        refused like a missing row when the snapshot holds none for it."""
+        self._check_cancelled()
+        try:
+            reading = self._repository.catalog_compacted_record_reading(
+                self._active()["id"], str(upstream_record_id), allow_incomplete=self._allow_incomplete)
+        except AppError:
+            raise GovernmentProjectionError("GOV_QUERY_UNAVAILABLE") from None
+        if not isinstance(reading, Mapping) or not isinstance(reading.get("fields"), Mapping):
+            raise GovernmentProjectionError("GOV_PROJECTION_RECORD_MISSING")
+        return reading
 
     def _raw_record(self, upstream_record_id: str) -> Mapping[str, Any]:
         self._check_cancelled()
@@ -638,4 +686,4 @@ __all__ = ["IDENTITY_RECORD_FIELDS", "IDENTITY_RECORD_FIELD_TYPES",
            "GovernmentCatalogQuery", "ManufacturerCoverage", "ModelCoverage", "QueryPage",
            "TOTAL_COUNT_FIELD", "VariantResolutionResult", "bounded_limit",
            "bounded_offset", "is_count_row",
-           "identity_projection", "separator_key"]
+           "identity_projection", "reading_projection", "reading_unstated", "separator_key"]

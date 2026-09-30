@@ -9,6 +9,17 @@
 #                          the snapshot's stored rows in bounded batches and
 #                          writes them through public.record_catalog_variants.
 #
+#   --compact dry-run|apply
+#                          PR-L2 instead: the payload compaction of ONE already
+#                          built snapshot (`python -m
+#                          backend.catalog.register.compaction --snapshot-key
+#                          <key> --dry-run|--apply`). dry-run first: it writes
+#                          nothing and answers READY (or REFUSED with a static
+#                          code); apply removes the raw payloads (the archive
+#                          of a Prepare snapshot without one is written from
+#                          its stored rows first) and answers COMPACTED, or
+#                          UNCHANGED when it already was.
+#
 # Idempotent: a snapshot already built under the current mapper version is
 # answered `unchanged` without reading a row; a partial build is completed.
 # $0: no Government request, no model, no run. A newly captured register unit
@@ -23,16 +34,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 
 SNAPSHOT_KEY=""
+COMPACT=""
 usage() {
   cat << 'EOF'
-Usage: register-variants.sh --snapshot-key <key> [--dry-run] [--operator-config <path>]
+Usage: register-variants.sh --snapshot-key <key> [--compact dry-run|apply] [--dry-run] [--operator-config <path>]
 
-Builds the catalog variants of one active Government snapshot (idempotent).
+Builds the catalog variants of one active Government snapshot (idempotent),
+or (--compact) compacts an already built one: dry-run first, then apply.
 EOF
 }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --snapshot-key) SNAPSHOT_KEY="${2-}"; shift 2 ;;
+    --compact) COMPACT="${2-}"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --operator-config) MILO_OPERATOR_CONFIG_PATH="${2:?}"; shift 2 ;;
     --help) usage; exit 0 ;;
@@ -41,14 +55,27 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$SNAPSHOT_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$ ]] \
   || { printf 'REFUSED CATALOG_VARIANT_REQUEST_INVALID: --snapshot-key must be one snapshot key\n' >&2; exit 2; }
+case "$COMPACT" in
+  "" | dry-run | apply) ;;
+  *) printf 'REFUSED CATALOG_COMPACTION_REQUEST_INVALID: --compact must be dry-run or apply\n' >&2; exit 2 ;;
+esac
 
 ops_load_config
-summary_header "Catalog variants: build ${SNAPSHOT_KEY} (deterministic, \$0)"
-ARGS="--args=-m,backend.catalog.register.variants,--snapshot-key,${SNAPSHOT_KEY}"
+if [[ -n "$COMPACT" ]]; then
+  summary_header "Catalog variants: compact ${SNAPSHOT_KEY} (${COMPACT}, \$0)"
+  ARGS="--args=-m,backend.catalog.register.compaction,--snapshot-key,${SNAPSHOT_KEY},--${COMPACT}"
+  OUTCOME_PATTERN='^(READY|COMPACTED|UNCHANGED|REFUSED|FAILED) '
+  PASS_PATTERN='^(READY|COMPACTED|UNCHANGED) '
+else
+  summary_header "Catalog variants: build ${SNAPSHOT_KEY} (deterministic, \$0)"
+  ARGS="--args=-m,backend.catalog.register.variants,--snapshot-key,${SNAPSHOT_KEY}"
+  OUTCOME_PATTERN='^(BUILT|REFUSED|FAILED) '
+  PASS_PATTERN='^BUILT '
+fi
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
   ops_run gcloud run jobs execute "<CLOUD_RUN_CAPTURE_JOB>" --region "$REGION" --project "$PROJECT_ID" "$ARGS" --async
-  summary "register-variants" DRY-RUN "would build the variants of ${SNAPSHOT_KEY}"
+  summary "register-variants" DRY-RUN "would ${COMPACT:+compact (${COMPACT}) }${COMPACT:-build the variants of} ${SNAPSHOT_KEY}"
   summary_note "DRY RUN: nothing was called and nothing was changed."
   exit 0
 fi
@@ -79,19 +106,19 @@ while :; do
   waited=$(( waited + poll_seconds ))
 done
 
-# The build's own line (BUILT / REFUSED / FAILED ...), read back from the
-# execution's log: the snapshot key, counts and static codes only.
+# The build's (or the compaction's) own line, read back from the execution's
+# log: the snapshot key, counts and static codes only.
 outcome=""
 for _attempt in 1 2 3 4 5 6; do
   outcome="$(gcloud logging read \
     "resource.type=cloud_run_job AND labels.\"run.googleapis.com/execution_name\"=${execution}" \
     --project "$PROJECT_ID" --format='value(textPayload)' --limit 400 2> /dev/null \
-    | grep -E '^(BUILT|REFUSED|FAILED) ' | head -n 1 || true)"
+    | grep -E "$OUTCOME_PATTERN" | head -n 1 || true)"
   [[ -n "$outcome" ]] && break
   sleep "$poll_seconds"
 done
 printf '%s\n' "${outcome:-<no outcome line in the execution log>}"
-if [[ "$state" == "succeeded" && "$outcome" == BUILT\ * ]]; then
+if [[ "$state" == "succeeded" && "$outcome" =~ $PASS_PATTERN ]]; then
   summary "register-variants" PASS "${outcome#BUILT }"
   exit 0
 fi
