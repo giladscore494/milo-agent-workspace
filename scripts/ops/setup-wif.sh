@@ -26,6 +26,10 @@
 #   3. a deploy service account with the MINIMUM roles the deploy scripts use
 #      (listed below, each with the command that needs it), and
 #      `iam.serviceAccountUser` on the three runtime identities only;
+#      3a. the custom role miloProjectIamPolicyReader (exactly
+#      resourcemanager.projects.getIamPolicy and iam.roles.get, for the deploy
+#      preflight's project IAM check), created or updated in place, bound to
+#      the deployer and read back on --apply -- never a predefined role;
 #   4. `roles/iam.workloadIdentityUser` on that account for EXACTLY two
 #      principals -- the `production` and `production-kill-switch` GitHub
 #      environments (principalSet attribute.environment/<env>), both held to
@@ -144,6 +148,12 @@ PROJECT_ROLES=(
   "roles/logging.viewer"                   # builds submit log streaming; capture execution documents
   "roles/storage.bucketViewer"             # gcloud builds submit: proves the default source bucket belongs to the project (storage.buckets.list)
 )
+# ...and one CUSTOM project role (3a): production-preflight.sh's
+# iam:no-project-level-secret-access reads the project IAM policy and describes
+# the custom roles in it. Exactly these two permissions, sorted.
+IAM_READER_ROLE_ID="miloProjectIamPolicyReader"
+IAM_READER_ROLE="projects/${PROJECT_ID}/roles/${IAM_READER_ROLE_ID}"
+IAM_READER_PERMISSIONS=("iam.roles.get" "resourcemanager.projects.getIamPolicy")
 # Runtime identities the deployer deploys AS (iam.serviceAccounts.actAs), each
 # bound on that account only -- never project-wide. The capture job runs as
 # CAPTURE_SERVICE_ACCOUNT, or, when none is configured, as the worker identity
@@ -250,6 +260,74 @@ for role in "${PROJECT_ROLES[@]}"; do
       --member "serviceAccount:${DEPLOY_SA}" --role "$role" --condition None
   fi
 done
+
+# 3a. The deploy preflight's project IAM reads (P48): iam:no-project-level-
+#     secret-access reads the project policy (resourcemanager.projects.
+#     getIamPolicy) and describes the custom roles it finds there
+#     (iam.roles.get). Exactly those two permissions, in a CUSTOM role --
+#     never a predefined role that carries them (securityReviewer, viewer,
+#     browser ... each grants far more). Created or updated to exactly this
+#     list, bound to the deployer, and both read back on --apply.
+iam_reader_state() {
+  # iam_reader_state ROLE_JSON -> "deleted" | "<sorted,comma,separated permissions>"
+  python3 -c '
+import json, sys
+role = json.loads(sys.argv[1] or "{}")
+print("deleted" if role.get("deleted") else ",".join(sorted(role.get("includedPermissions") or [])))' "$1"
+}
+IAM_READER_WANTED="$(IFS=,; printf '%s' "${IAM_READER_PERMISSIONS[*]}")"
+role_err="$(mktemp)"
+role_status=0
+role_json="$(gcloud iam roles describe "$IAM_READER_ROLE_ID" --project "$PROJECT_ID" --format=json 2> "$role_err")" \
+  || role_status=$?
+if [[ "$role_status" -ne 0 ]] && ! grep -q "NOT_FOUND" "$role_err"; then
+  rm -f "$role_err"
+  printf 'FAIL   custom role %s could not be read (gcloud exit %s). It and its binding were not changed.\n' \
+    "$IAM_READER_ROLE" "$role_status" >&2
+  exit 1
+fi
+rm -f "$role_err"
+if [[ "$role_status" -ne 0 ]]; then
+  step CREATE "custom role ${IAM_READER_ROLE} (exactly: ${IAM_READER_PERMISSIONS[*]})" \
+    gcloud iam roles create "$IAM_READER_ROLE_ID" --project "$PROJECT_ID" \
+    --title "MILO project IAM policy reader" \
+    --description "Deploy preflight: read the project IAM policy and describe its custom roles. Nothing else." \
+    --permissions "$IAM_READER_WANTED" --stage GA
+else
+  role_state="$(iam_reader_state "$role_json")"
+  if [[ "$role_state" == "deleted" ]]; then
+    step UPDATE "undelete custom role ${IAM_READER_ROLE}" \
+      gcloud iam roles undelete "$IAM_READER_ROLE_ID" --project "$PROJECT_ID"
+  fi
+  if [[ "$role_state" == "$IAM_READER_WANTED" ]]; then
+    ok "custom role ${IAM_READER_ROLE} holds exactly ${IAM_READER_PERMISSIONS[*]}"
+  else
+    # --permissions REPLACES the list: anything else it held is removed.
+    step UPDATE "custom role ${IAM_READER_ROLE} permissions -> exactly ${IAM_READER_PERMISSIONS[*]}" \
+      gcloud iam roles update "$IAM_READER_ROLE_ID" --project "$PROJECT_ID" --permissions "$IAM_READER_WANTED"
+  fi
+fi
+if has_member "$project_policy" "$IAM_READER_ROLE" "serviceAccount:${DEPLOY_SA}"; then
+  ok "project role ${IAM_READER_ROLE}"
+else
+  step BIND "project role ${IAM_READER_ROLE} -> ${DEPLOY_SA} (project IAM policy read only)" \
+    gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+    --member "serviceAccount:${DEPLOY_SA}" --role "$IAM_READER_ROLE" --condition None
+fi
+if [[ "$MODE" == "apply" ]]; then
+  readback_role="$(gcloud iam roles describe "$IAM_READER_ROLE_ID" --project "$PROJECT_ID" --format=json 2> /dev/null \
+    || printf '{}')"
+  readback_policy="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
+  if [[ "$(iam_reader_state "$readback_role")" == "$IAM_READER_WANTED" ]] \
+     && has_member "$readback_policy" "$IAM_READER_ROLE" "serviceAccount:${DEPLOY_SA}"; then
+    printf 'PASS   custom role %s read back: exactly %s, bound to %s\n' \
+      "$IAM_READER_ROLE" "${IAM_READER_PERMISSIONS[*]}" "$DEPLOY_ACCOUNT_ID"
+  else
+    printf 'FAIL   custom role %s read back: it does not hold exactly %s, or it is not bound to %s\n' \
+      "$IAM_READER_ROLE" "${IAM_READER_PERMISSIONS[*]}" "$DEPLOY_SA" >&2
+    exit 1
+  fi
+fi
 for account in "${ACT_AS[@]}"; do
   policy="$(gcloud iam service-accounts get-iam-policy "$account" --project "$PROJECT_ID" --format=json 2> /dev/null || printf '{}')"
   if has_member "$policy" roles/iam.serviceAccountUser "serviceAccount:${DEPLOY_SA}"; then
