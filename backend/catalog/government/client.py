@@ -567,7 +567,8 @@ class DataGovClient:
         if int(response.status) != 200:
             raise GovernmentSourceError(
                 "GOV_HTTP_STATUS_UNEXPECTED",
-                retryable=int(response.status) in src.RETRYABLE_STATUS_CODES)
+                retryable=int(response.status) in src.RETRYABLE_STATUS_CODES,
+                http_status=int(response.status))
         media_type = str(response.content_type).split(";", 1)[0].strip().lower()
         if media_type not in src.JSON_CONTENT_TYPES:
             raise GovernmentSourceError("GOV_RESPONSE_NOT_JSON")

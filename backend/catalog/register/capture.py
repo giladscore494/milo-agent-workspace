@@ -82,13 +82,16 @@ class UnitOutcome:
     api_total: int | None = None
     captured_rows: int | None = None
     failure_code: str = ""
+    #: The numeric HTTP status of a ``GOV_HTTP_STATUS_UNEXPECTED`` failure.
+    http_status: int | None = None
     #: PR-L1: the snapshot's variant build after capture (never fails the unit).
     variants: dict[str, Any] | None = None
 
     def as_document(self) -> dict[str, Any]:
         return {"tozar": self.tozar, "status": self.status, "snapshot_key": self.snapshot_key,
                 "api_total": self.api_total, "captured_rows": self.captured_rows,
-                "failure_code": self.failure_code, "variants": self.variants}
+                "failure_code": self.failure_code, "variants": self.variants,
+                **({"http_status": self.http_status} if self.http_status is not None else {})}
 
 
 @dataclass
@@ -240,6 +243,8 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         if _is_fatal(failure) or isinstance(failure, CancellationRequested):
             raise
         outcome.failure_code = _unit_code(failure)
+        if isinstance(failure, GovernmentSourceError):
+            outcome.http_status = failure.http_status
         snapshot = seen.get("snapshot") or {}
         outcome.snapshot_key = str(snapshot.get("snapshot_key") or "")
         if outcome.failure_code == "CATALOG_CAPTURE_COUNT_MISMATCH":

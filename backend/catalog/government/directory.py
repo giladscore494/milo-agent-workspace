@@ -5,7 +5,13 @@ Read with bounded requests that never fetch row payload:
 1. one bounded SCAN of the tozar column: ``datastore_search`` with
    ``fields=tozar``, ``sort=_id``, full pages of `SCAN_PAGE_LIMIT` rows, offset
    paging until the offset reaches the scan's ``total``. Every row's tozar is
-   counted locally, by its exact string;
+   counted locally, by its exact string. Every scan page also sends
+   ``total_estimation_threshold`` (`SCAN_TOTAL_ESTIMATION_THRESHOLD`): an
+   UNFILTERED search on data.gov.il otherwise answers
+   ``total_was_estimated: true`` (production, 2026-09-30), and CKAN returns an
+   exact count whenever its estimate is below the threshold. The threshold
+   only asks for the exact total -- an answer still marked estimated is
+   refused as before;
 2. then, per capturable tozar, one count: ``limit=0`` with
    ``filters={"tozar": <exact>}``, whose ``total`` must equal the scan's count
    for that tozar and whose ``records`` must be empty.
@@ -64,6 +70,9 @@ DIRECTORY_CONTRACT = "gov.register.directory.1"
 TOZAR_FIELD = "tozar"
 #: Rows per tozar-column scan page (the client's own page ceiling).
 SCAN_PAGE_LIMIT = src.MAX_PAGE_LIMIT
+#: Sent with every scan page: CKAN counts exactly whenever its estimated total
+#: is below this, and the register (~101,691 rows) is two orders under it.
+SCAN_TOTAL_ESTIMATION_THRESHOLD = 10_000_000
 MAX_REQUESTS_ENV = "MILO_REGISTER_DIRECTORY_MAX_REQUESTS"
 MAX_SECONDS_ENV = "MILO_REGISTER_DIRECTORY_MAX_SECONDS"
 #: A full directory is one distinct cross-check, one scan page per 1000 rows
@@ -222,7 +231,9 @@ def _scan_counts(client: DataGovClient, resource_id: str,
     while True:
         result = _search(client, {"resource_id": resource_id, "fields": TOZAR_FIELD,
                                   "sort": "_id", "limit": str(SCAN_PAGE_LIMIT),
-                                  "offset": str(offset)}, budget)
+                                  "offset": str(offset),
+                                  "total_estimation_threshold":
+                                      str(SCAN_TOTAL_ESTIMATION_THRESHOLD)}, budget)
         total = _exact_total(result)
         if first_total is None:
             first_total = total
@@ -299,5 +310,6 @@ def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLT
     return _count(client, src.require_allowed_resource(resource_id), tozar, budget)
 
 
-__all__ = ["DIRECTORY_CONTRACT", "DirectoryUnit", "RegisterDirectory", "configured_caps",
+__all__ = ["DIRECTORY_CONTRACT", "DirectoryUnit", "RegisterDirectory",
+           "SCAN_TOTAL_ESTIMATION_THRESHOLD", "configured_caps",
            "count_tozar", "discover_directory", "register_version"]
