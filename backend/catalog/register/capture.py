@@ -20,7 +20,10 @@ across snapshots):
 4. activation (the database's own completeness gate), then the unit's
    outcome with the snapshot's MEASURED bytes (computed in the database);
 5. PR-L1: the captured snapshot's catalog variants, built in bounded batches
-   (`variants.build_after_capture`; reported, never failing the unit).
+   (`variants.build_after_capture`; reported, never failing the unit);
+6. PR-L2: once built (and archived, step 3), its raw payloads are removed
+   from the database (`compaction.compact_after_build`; reported, never
+   failing the unit).
 
 A snapshot that was already active (captured earlier, e.g. by Prepare) is
 reused as is: its archive is written if missing and its count verified. A
@@ -47,6 +50,7 @@ from backend.catalog.government.ingest import (GOVERNMENT_INGESTION_REASONS,
                                                GovernmentCatalogIngestor, GovernmentIngestionError)
 from backend.catalog.government.source import GOVERNMENT_SOURCE_REASONS, GovernmentSourceError
 from backend.catalog.register import archive as archive_module
+from backend.catalog.register.compaction import compact_after_build
 from backend.catalog.register.variants import build_after_capture
 from backend.errors import AppError, LEASE_FAILURE_CODES
 from backend.runtime import CancellationRequested
@@ -84,11 +88,14 @@ class UnitOutcome:
     failure_code: str = ""
     #: PR-L1: the snapshot's variant build after capture (never fails the unit).
     variants: dict[str, Any] | None = None
+    #: PR-L2: its payload compaction after a complete build (never fails the unit).
+    compaction: dict[str, Any] | None = None
 
     def as_document(self) -> dict[str, Any]:
         return {"tozar": self.tozar, "status": self.status, "snapshot_key": self.snapshot_key,
                 "api_total": self.api_total, "captured_rows": self.captured_rows,
-                "failure_code": self.failure_code, "variants": self.variants}
+                "failure_code": self.failure_code, "variants": self.variants,
+                "compaction": self.compaction}
 
 
 @dataclass
@@ -235,6 +242,9 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
         # failed build is reported and leaves the unit captured (the operator
         # backfill builds it again); an already built snapshot is a no-op.
         outcome.variants = build_after_capture(repository, report.snapshot_id)
+        # PR-L2: built and archived, the payloads leave the database (a
+        # refusal or a failure is reported and changes nothing).
+        outcome.compaction = compact_after_build(repository, report.snapshot_key, outcome.variants)
         return outcome
     except Exception as failure:  # noqa: BLE001 - reduced to a static code
         if _is_fatal(failure) or isinstance(failure, CancellationRequested):

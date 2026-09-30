@@ -90,6 +90,10 @@ The kill switch closes it.
    snapshot key. Expect `BUILT ... status=built rows=N/N`.
 3. Turn the browser on: **Website stage** → `catalog-browser`, or pick it as
    the deploy's restore stage.
+4. PR-L2 (`20261002000100`): compact the built snapshot -- **Register
+   variants** with `compact = dry-run`, then `apply` (REGISTER_CAPTURE.md,
+   Compaction). A compacted snapshot answers every read from its variants;
+   it is not rebuilt under a new mapper version.
 
 A read-only role created after the migration gets no EXECUTE on the read
 functions. Grant it the same way PR-D1's roles are granted:

@@ -56,7 +56,7 @@ def _captured(source: str) -> dict[str, str]:
 
 
 def build_manifest(repository: Any, run_id: str, *, name: str,
-                   today: str | None = None) -> dict[str, Any]:
+                   today: str | None = None, archive_client: Any = None) -> dict[str, Any]:
     """The replay/1 manifest for one captured run (no `expected` outcome yet)."""
     checkpoint = repository.latest_checkpoint(run_id)
     if checkpoint is not None and str(checkpoint.get("run_id")) != str(run_id):
@@ -111,6 +111,16 @@ def build_manifest(repository: Any, run_id: str, *, name: str,
     for record_id in referenced:
         row = repository.catalog_raw_record_by_upstream_id(record["snapshot_id"], record_id)
         payload = (row or {}).get("payload")
+        if row and payload is None:
+            # PR-L2: a compacted snapshot keeps its rows in the archive only:
+            # the line is fetched and checked against the row's payload_sha256.
+            from backend.catalog.register import compaction
+
+            try:
+                payload = compaction.source_record(repository, archive_client or compaction.default_archive_client(),
+                                                   str(record["snapshot_id"]), record_id)
+            except compaction.CompactionError:
+                raise ExportRefused("SNAPSHOT_ROW_UNREADABLE") from None
         if not isinstance(payload, Mapping):
             raise ExportRefused("SNAPSHOT_ROW_UNREADABLE")
         rows.append(dict(payload))

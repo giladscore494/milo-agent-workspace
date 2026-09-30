@@ -258,6 +258,11 @@ class Repository(Protocol):
     def catalog_database_bytes(self) -> int: ...
     def prunable_register_snapshots(self) -> list[dict[str, Any]]: ...
     def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]: ...
+    # PR-L2: payload compaction.
+    def compact_register_snapshot(self, snapshot_key: str, apply: bool) -> dict[str, Any]: ...
+    def catalog_compacted_record_reading(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None: ...
+    def record_register_snapshot_archive_from_database(self, snapshot_id: str, gcs_uri: str, byte_size: int, sha256: str, line_count: int) -> dict[str, Any]: ...
+    def catalog_raw_record_payload_matches(self, raw_record_id: str, line: str) -> bool: ...
     # PR-L1: catalog variants and the discovery tree.
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None: ...
     def record_catalog_variants(self, snapshot_id: str, mapper_version: str, rows: list[dict[str, Any]]) -> dict[str, Any]: ...
@@ -2517,6 +2522,37 @@ class SupabaseRepository:
         return self._guarded_rpc("prune_register_snapshots", {
             "p_snapshot_keys": [str(k) for k in snapshot_keys], "p_digest": str(digest)},
             "register prune", refusals=self._REGISTER_REFUSALS)
+
+    # -- PR-L2: payload compaction (migration 20261002000100) ------------
+    def compact_register_snapshot(self, snapshot_key: str, apply: bool) -> dict[str, Any]:
+        """ONE snapshot's compaction (service role; `apply=False` is the
+        dry-run). A precondition refusal is an ANSWER (status `refused` and a
+        static code), never an exception."""
+        data = self._guarded_rpc("compact_register_snapshot", {
+            "p_snapshot_key": str(snapshot_key), "p_apply": bool(apply)}, "register compaction")
+        if not isinstance(data, dict) or "status" not in data:
+            raise AppError("REPOSITORY_ERROR", "register compaction returned an unreadable document", 502)
+        return data
+
+    def catalog_compacted_record_reading(self, snapshot_id: Any, upstream_record_id: str, *, allow_incomplete: bool = False) -> dict[str, Any] | None:
+        rows = self._read_rpc("catalog_compacted_record_reading", {
+            "p_snapshot_id": str(snapshot_id), "p_upstream_record_id": str(upstream_record_id),
+            "p_allow_incomplete": bool(allow_incomplete)})
+        return rows[0] if rows else None
+
+    def record_register_snapshot_archive_from_database(self, snapshot_id: str, gcs_uri: str, byte_size: int, sha256: str, line_count: int) -> dict[str, Any]:
+        return self._guarded_rpc("record_register_snapshot_archive_from_database", {
+            "p_snapshot_id": str(snapshot_id), "p_gcs_uri": str(gcs_uri), "p_byte_size": int(byte_size),
+            "p_sha256": str(sha256), "p_line_count": int(line_count)},
+            "register snapshot archive", refusals=self._REGISTER_REFUSALS)
+
+    def catalog_raw_record_payload_matches(self, raw_record_id: str, line: str) -> bool:
+        try:
+            data = self.client.rpc("catalog_raw_record_payload_matches", {
+                "p_raw_record_id": str(raw_record_id), "p_line": str(line)}).execute().data
+        except Exception as exc:
+            raise AppError("REPOSITORY_ERROR", "the archive line check failed", 502) from exc
+        return data is True
 
     # -- PR-L1: catalog variants (migration 20260930000100) --------------
     def catalog_variant_build_state(self, snapshot_id: str, mapper_version: str) -> dict[str, Any] | None:

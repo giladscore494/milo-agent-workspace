@@ -2174,7 +2174,7 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
                 if record is None:
                     continue
                 # PR-Z3: `payload->>'field'`, compared verbatim.
-                codes = _register_codes(record["payload"])
+                codes = _register_codes(self._record_facts(record)[0])
                 if any(wanted_code is not None and str(wanted_code) != code
                        for wanted_code, code in zip(stated_codes, codes)):
                     continue
@@ -3563,8 +3563,8 @@ class MemoryRepository(RegisterMemoryMixin, VariantsMemoryMixin):
         """(identity key, content hash, raw record) of one stored candidate."""
         records = self._raw_records_by_id() if records is None else records
         record = records[candidate["raw_record_id"]]
-        return (catalog_coverage.candidate_identity_key(candidate, record["payload"]),
-                catalog_coverage.variant_content_sha256(record["payload"]), record)
+        codes, content = self._record_facts(record)
+        return (catalog_coverage.candidate_identity_key(candidate, codes), content, record)
 
     _IDENTITY_COLUMNS = ("manufacturer", "commercial_model", "model_year_start",
                          "model_year_end", "official_model_code", "trim")

@@ -97,6 +97,10 @@ GOVERNMENT_PROJECTION_REASONS: Mapping[str, str] = {
     # meant to receive.
     "GOV_QUERY_UNAVAILABLE":
         "the bounded government catalog query could not be answered",
+    # PR-L2: a compacted snapshot keeps no payloads; the whole-snapshot
+    # projection reads them (the bounded query layer reads its typed variants).
+    "GOV_PROJECTION_SNAPSHOT_COMPACTED":
+        "that government snapshot is compacted: its rows are read through the catalog query",
 }
 
 #: The ONE refusal an explicit acknowledgement may bypass.
@@ -554,6 +558,8 @@ class GovernmentCatalogProjection:
         records = {str(row["id"]): row
                    for row in self._read_all(self._repository.list_catalog_raw_records,
                                              snapshot["id"])}
+        if any(row.get("payload") is None for row in records.values()):
+            raise GovernmentProjectionError("GOV_PROJECTION_SNAPSHOT_COMPACTED")
         candidates = self._read_all(self._repository.list_catalog_candidates, snapshot["id"])
         self._require_candidates_match(state, candidates, records)
         provenance = _provenance_of(snapshot)

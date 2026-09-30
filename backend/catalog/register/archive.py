@@ -168,6 +168,19 @@ class GcsArchiveWriter:
             break
         raise ArchiveWriteError(f"the archive upload failed with HTTP {status}")
 
+    def get(self, name: str) -> bytes:
+        """PR-L2: the object's bytes (objectViewer). The caller verifies them
+        against the recorded sha256; nothing here trusts what it read."""
+        url = GCS_OBJECT_URL.format(bucket=quote(self.bucket, safe=""), name=quote(name, safe=""))
+        try:
+            response = self._session().get(url, params={"alt": "media"}, timeout=TIMEOUT_SECONDS)
+            status = int(response.status_code)
+        except Exception:
+            raise ArchiveWriteError("the archive could not be read") from None
+        if status != 200:
+            raise ArchiveWriteError(f"the archive read failed with HTTP {status}")
+        return bytes(response.content)
+
     def _existing(self, session: Any, name: str, archive: ArchiveObject) -> str:
         url = GCS_OBJECT_URL.format(bucket=quote(self.bucket, safe=""), name=quote(name, safe=""))
         try:

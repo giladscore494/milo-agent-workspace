@@ -14,6 +14,7 @@ import gzip
 import hashlib
 import json
 import socket
+from unittest import mock
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
@@ -30,6 +31,7 @@ from backend.catalog.government.directory import (DirectoryUnit, discover_direct
 from backend.catalog.government.ingest import GovernmentCatalogIngestor
 from backend.catalog.government.source import GovernmentSourceError
 from backend.catalog.register import archive as arc
+from backend.catalog.register import capture as capture_module
 from backend.catalog.register import config as register_config
 from backend.catalog.register import coverage as coverage_module
 from backend.catalog.register import prune as prune_module
@@ -169,8 +171,11 @@ def claimed_lease(repo: MemoryRepository, run_id: str):
     return WorkerLease(claimed["id"], "capture-worker", int(claimed["attempt"]), claimed["lease_token"])
 
 
-def captured_world(records=None, *, writer: FakeWriter | None = None, client: DataGovClient | None = None):
-    """The API claims ONE tozar; the capture job captures it."""
+def captured_world(records=None, *, writer: FakeWriter | None = None, client: DataGovClient | None = None,
+                   compact: bool = True):
+    """The API claims ONE tozar; the capture job captures it (and, PR-L2,
+    compacts it once built -- `compact=False` keeps the payloads, for the
+    tests of the build itself)."""
     repo, w = world()
     version = directory(repo)
     answer, started = request(repo, w, version, [TOYOTA])
@@ -178,8 +183,10 @@ def captured_world(records=None, *, writer: FakeWriter | None = None, client: Da
     group = repo.register_capture_group(answer["group_id"])["group"]
     lease = claimed_lease(repo, group["run_id"])
     writer = writer if writer is not None else FakeWriter()
-    report = capture_group(repo, lease, client=client or scoped_client(records or planned_records()),
-                           group_id=answer["group_id"], archive_writer=writer)
+    with mock.patch.object(capture_module, "compact_after_build",
+                           capture_module.compact_after_build if compact else lambda *_a: None):
+        report = capture_group(repo, lease, client=client or scoped_client(records or planned_records()),
+                               group_id=answer["group_id"], archive_writer=writer)
     return repo, w, version, report, writer
 
 
@@ -349,12 +356,16 @@ def test_one_tozar_is_captured_verified_archived_measured_and_activated():
     assert archive["gcs_uri"] == f"gs://{BUCKET}/{name}"
     assert archive["sha256"] == hashlib.sha256(data).hexdigest() and archive["byte_size"] == len(data)
     assert archive["line_count"] == 28 and archive["line_basis"] == "source_locator.capture_index+1"
-    # Every stored raw record is line capture_index+1 of the object, verbatim.
+    # Every stored raw record is line capture_index+1 of the object, verbatim:
+    # PR-L2 compacted the built, archived snapshot, so the line is proven by
+    # the row's own payload digest.
+    assert outcome.compaction == {"status": "compacted"}
     lines = arc.read_lines(data)
     stored = [row for (sid, _k), row in repo.catalog_raw_records.items() if str(sid) == str(snapshot["id"])]
     assert len(stored) == 28
     for row in stored:
-        assert lines[int(row["source_locator"]["capture_index"])] == row["payload"]
+        line = arc.canonical_line(lines[int(row["source_locator"]["capture_index"])])
+        assert row["payload"] is None and repo.catalog_raw_record_payload_matches(row["id"], line)
 
 
 def test_the_register_snapshot_is_the_snapshot_prepare_makes():
@@ -382,7 +393,8 @@ def test_the_register_snapshot_is_the_snapshot_prepare_makes():
             == {k: v for k, v in register_snapshot["retrieval_metadata"].items() if k not in timing})
 
     def content(r: MemoryRepository, snapshot: Mapping[str, Any]):
-        rows = sorted(json.dumps(row["payload"], sort_keys=True, ensure_ascii=False)
+        # The payload digest: the register snapshot is compacted (PR-L2).
+        rows = sorted(row["payload_sha256"]
                       for (sid, _k), row in r.catalog_raw_records.items() if str(sid) == str(snapshot["id"]))
         candidates = sorted(json.dumps({k: v for k, v in row.items() if k not in (
             "id", "snapshot_id", "created_at", "updated_at", "raw_record_id", "created_by_run_id")},
@@ -568,8 +580,8 @@ def test_the_capacity_guard_refuses_with_the_exact_numbers_and_starts_nothing():
     trigger = FakeTrigger()
     with pytest.raises(register_service.CapacityRefusal) as refused:
         request(repo, w, version, [LEXUS], trigger)
-    # 399,000,000 + 1000 x 6000 = 405,000,000 > 0.80 x 500,000,000.
-    assert refused.value.capacity == {"current_bytes": 399_000_000, "projected_bytes": 405_000_000,
+    # 399,000,000 + 1000 x 4000 = 403,000,000 > 0.80 x 500,000,000.
+    assert refused.value.capacity == {"current_bytes": 399_000_000, "projected_bytes": 403_000_000,
                                       "limit_bytes": 400_000_000}
     assert refused.value.code == "CATALOG_CAPACITY_THRESHOLD_EXCEEDED"
     assert trigger.calls == [] and repo.register_capture_units() == []
@@ -654,7 +666,7 @@ def test_the_api_captures_answers_202_then_200_and_a_capacity_body():
     assert error["code"] == "CATALOG_CAPACITY_THRESHOLD_EXCEEDED"
     # The first request's 28 rows are still in flight: they count too.
     assert error["capacity"] == {"current_bytes": 399_999_000,
-                                 "projected_bytes": 399_999_000 + (5000 + 28) * 6000,
+                                 "projected_bytes": 399_999_000 + (5000 + 28) * 4000,
                                  "limit_bytes": 400_000_000}
 
 
@@ -1053,13 +1065,13 @@ def test_a_register_that_reverts_records_its_old_version_again():
 
 def test_the_capacity_guard_counts_rows_still_in_flight():
     repo, w = world()
-    repo.register_database_bytes = 390_900_000
+    repo.register_database_bytes = 393_900_000
     version = directory(repo, {TOYOTA: 28, LEXUS: 1500})
-    assert request(repo, w, version, [LEXUS])[1]  # 390,900,000 + 1500 x 6000 = 399,900,000: fits
+    assert request(repo, w, version, [LEXUS])[1]  # 393,900,000 + 1500 x 4000 = 399,900,000: fits
     with pytest.raises(register_service.CapacityRefusal) as refused:
-        # Alone it would fit (391,068,000); with LEXUS still in flight it does not.
+        # Alone it would fit (394,012,000); with LEXUS still in flight it does not.
         request(repo, w, version, [TOYOTA])
-    assert refused.value.capacity["projected_bytes"] == 390_900_000 + (28 + 1500) * 6000
+    assert refused.value.capacity["projected_bytes"] == 393_900_000 + (28 + 1500) * 4000
 
 
 def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_change():
@@ -1077,10 +1089,10 @@ def test_the_capacity_guard_ignores_a_killed_job_across_a_directory_version_chan
     claimed_lease(repo, run_id)  # the job started: running, under a lease
     new = directory(repo, {TOYOTA: 28, LEXUS: 1501})
     assert new != old
-    # Live: the old unit still counts (390,900,000 + (1501 + 1500) x 6000 > 400,000,000).
+    # Live: the old unit still counts (390,900,000 + (1501 + 1500) x 4000 > 400,000,000).
     with pytest.raises(register_service.CapacityRefusal) as refused:
         request(repo, w, new, [LEXUS])
-    assert refused.value.capacity["projected_bytes"] == 390_900_000 + (1501 + 1500) * 6000
+    assert refused.value.capacity["projected_bytes"] == 390_900_000 + (1501 + 1500) * 4000
     # Killed: the job's lease expired an hour ago and nothing renewed it.
     repo.runs[run_id]["lease_expires_at"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     assert repo.runs[run_id]["status"] in ("starting", "running")

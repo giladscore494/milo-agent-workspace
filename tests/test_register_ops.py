@@ -400,6 +400,26 @@ def test_the_variant_backfill_runs_the_capture_job_for_one_snapshot(tmp_path):
     assert refused.returncode == 1 and "SUMMARY|register-variants|FAIL|" in refused.stdout
 
 
+def test_the_compaction_runs_the_capture_job_dry_run_first(tmp_path):
+    """PR-L2: `--compact dry-run|apply` runs the compaction module instead."""
+    tree = variants_tree(tmp_path)
+    for mode, line in (("dry-run", "READY snapshot_key=cs1.a raw_rows=5"),
+                       ("apply", "COMPACTED snapshot_key=cs1.a raw_rows=5 payloads_removed=5")):
+        result = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", mode,
+                          extra_env={"MILO_VARIANTS_POLL_SECONDS": "0", "OPS_TEST_OUTCOME": line})
+        assert result.returncode == 0, result.stdout + result.stderr
+        execute = [c for c in tree.tool_calls() if "jobs execute" in c][-1]
+        assert f"--args=-m,backend.catalog.register.compaction,--snapshot-key,{SNAPSHOT_KEY},--{mode}" in execute
+        assert f"SUMMARY|register-variants|PASS|{line}" in result.stdout
+    refused = tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", "apply",
+                       extra_env={"MILO_VARIANTS_POLL_SECONDS": "0",
+                                  "OPS_TEST_OUTCOME": "REFUSED CATALOG_COMPACTION_BUILD_INCOMPLETE: x"})
+    assert refused.returncode == 1 and "SUMMARY|register-variants|FAIL|" in refused.stdout
+    calls = len(tree.tool_calls())
+    assert tree.run("register-variants.sh", "--snapshot-key", SNAPSHOT_KEY, "--compact", "now").returncode == 2
+    assert len(tree.tool_calls()) == calls
+
+
 def test_the_variant_backfill_refuses_a_malformed_key(tmp_path):
     tree = variants_tree(tmp_path)
     for key in ("", "bad key", "a,b", "-x"):
@@ -417,6 +437,9 @@ def test_the_variant_workflow_runs_from_main_in_production():
     first = steps(doc)[0]["run"]
     assert "refs/heads/main" in first and "^[A-Za-z0-9][A-Za-z0-9._:@+-]{0,199}$" in first
     assert 'register-variants.sh --snapshot-key "${SNAPSHOT_KEY_INPUT}"' in steps(doc)[-1]["run"]
+    # PR-L2: the compaction, dry-run first, from the same dispatch.
+    assert inputs["compact"]["options"] == ["none", "dry-run", "apply"] and inputs["compact"]["default"] == "none"
+    assert '--compact "${COMPACT_INPUT}"' in steps(doc)[-1]["run"]
 
 
 # =============================================================================

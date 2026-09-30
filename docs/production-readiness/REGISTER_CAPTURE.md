@@ -44,11 +44,61 @@ snapshot. A re-measurement sets `measured_at`, never `updated_at`: it never
 makes an older unit the tozar's newest. Heap sizes only (a floor): the
 estimate below includes indexes.
 
-The estimate (PR-L1b, 6,000 B/row) is the measured total per register row,
-tables + TOAST + indexes, rounded up to the next 500: raw record + candidate
-3,512 B (production, 25,495 rows), variant 975-1,039 B, ledger at two levels
-~996 B (`tests/test_catalog_variants_postgres.py`, L1-6): 5,547 B at the
-upper reading.
+The estimate (PR-L2, 4,000 B/row) is the measured total per register row
+ONCE COMPACTED, tables + TOAST + indexes, rounded up to the next 500: raw
+record without its payload 601 B, candidate 1,067 B, variant 981 B, ledger at
+two levels 906 B = 3,555 B (5,000 rows, `tests/test_register_compaction_postgres.py`;
+5,246 B before compaction, of which the raw record 2,292 B). PR-L1b's 6,000
+counted the payload. A capture's rows hold their payload only until their
+build completes: the space a compaction frees is reused by the next capture
+once (auto)vacuum has run; `pg_database_size` itself shrinks only after a
+`vacuum full` (operator step 7).
+
+### Compaction (PR-L2, 20261002000100)
+
+When a snapshot's variants are completely built under the current mapper
+version AND its archive is recorded, its raw payloads leave the database
+(`public.compact_register_snapshot`): the capture job does it right after the
+build (the unit's document reports `compaction.status`: `compacted`,
+`unchanged`, `refused` with a code, `skipped` or `failed`; never failing the
+unit), and the **Register variants** workflow does it for an already built
+snapshot (`compact = dry-run`, then `apply`). Every raw record row stays, with
+its id, keys, `payload_sha256` and `source_locator` (the archive line); no
+candidate is touched; every foreign key, evidence link, queue item and
+reservation stays valid. The raw records' append-only trigger is suspended
+only inside that one security-definer function (search_path pinned,
+service_role only). Refusals, each writing nothing:
+`CATALOG_COMPACTION_SNAPSHOT_UNKNOWN`, `CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE`
+(not an activated whole-tozar Government snapshot),
+`CATALOG_COMPACTION_COUNT_UNVERIFIED` (the newest register unit that captured
+it is not count-verified, or stored rows differ from declared rows),
+`CATALOG_COMPACTION_BUILD_INCOMPLETE` (no complete current-mapper build
+covering every raw row), `CATALOG_COMPACTION_TYPED_MISMATCH` (a row's typed
+variant does not read exactly as its payload -- e.g. a zero-padded code;
+checked per row by `catalog_variant_reads_as_payload`) and, last,
+`CATALOG_COMPACTION_ARCHIVE_MISSING` (so a dry-run naming it passed every other
+check).
+
+After compaction every reader takes the register codes, the content hash and
+the identity reading from the snapshot's variant rows
+(`catalog_raw_record_code`, `catalog_raw_record_content_sha256`,
+`catalog_compacted_record_reading`); REGISTER_FIELD_ABSENT reads "the
+register states nothing" as the typed column null AND no parse issue for the
+field (an unparseable value stays a hard gap). The original record is read
+from the archive only: `python -m backend.catalog.register.compaction
+--snapshot-key <key> --show-record <upstream id>` (and the replay export)
+fetch the object, check its SHA-256 against the recorded one and have the
+database check the line against the row's `payload_sha256`. A compacted
+snapshot is not rebuilt under a new mapper version
+(`CATALOG_VARIANT_SNAPSHOT_COMPACTED`); rebuilding one from its archive is a
+follow-up.
+
+A Prepare snapshot captured before PR-D1 has no archive: `compact = apply`
+first writes it from the stored rows in capture order with PR-D1's
+create-only writer (the same object a register capture of the same rows
+writes) and records it (`record_register_snapshot_archive_from_database`),
+then compacts. A SUPERSEDED snapshot is never built (rank 1 only), so it is
+never compacted: it is pruned when nothing references it, or stays whole.
 
 ### Archive
 
@@ -108,7 +158,7 @@ build under the current mapper version is complete. Their digest item is
 | `MILO_ENABLE_REGISTER_CAPTURE` | off | the website stage flag |
 | `MILO_DB_CAPACITY_BYTES` | `500000000` (500 MB) | |
 | `MILO_DB_CAPACITY_THRESHOLD` | `0.80` | |
-| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `6000` | raw + candidate + variant + two ledger levels, per row (PR-L1b) |
+| `MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE` | `4000` | compacted raw record + candidate + variant + two ledger levels, per row (PR-L2) |
 | `MILO_REGISTER_GROUP_MAX_ROWS` | `10000` | one request's cap |
 | `MILO_REGISTER_ARCHIVE_BUCKET` | none | capture job; from the operator key `REGISTER_ARCHIVE_BUCKET` |
 | `MILO_REGISTER_DIRECTORY_MAX_REQUESTS` / `_MAX_SECONDS` | `6000` / `3000` | capture job |
@@ -194,6 +244,17 @@ build under the current mapper version is complete. Their digest item is
    (the gate then fails). Only an exit 1 WITH a `REGISTER_COVERAGE=FAIL` line
    means that; any other failure of the report reads
    `INFO not available (the coverage report did not run: exit <n>)`.
+7. **Compaction (PR-L2)**: apply `20261002000100_catalog_register_compaction.sql`
+   with the release. A new capture compacts by itself. For each existing
+   built snapshot (the active Toyota snapshot once its variants are built):
+   Actions -> **Register variants** with its `snapshot_key` and
+   `compact = dry-run` (expect `READY ...`, or `READY ... archive=from-database`
+   for a Prepare snapshot), then `compact = apply` (expect `COMPACTED ...`;
+   `UNCHANGED` when it already was). The capture job's bucket
+   (`REGISTER_ARCHIVE_BUCKET`) must be set: an archive written from the stored
+   rows needs it. To return the freed space to the plan, run once, in a quiet
+   window (it locks the table while it rewrites it), in the SQL editor:
+   `vacuum (full, analyze) public.catalog_raw_records;`
 
 ## Error codes
 

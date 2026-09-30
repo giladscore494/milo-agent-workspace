@@ -5,11 +5,13 @@ these mirrors let the build, the capture job and the API run offline."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
 from backend.catalog import coverage as catalog_coverage
+from backend.catalog.government import query as query_module
 from backend.catalog.register import retention
 from backend.catalog.register import variants as mapper
 from backend.errors import AppError
@@ -158,6 +160,120 @@ class VariantsMemoryMixin:
                     row.update(incoming, updated_at=_now())
                     written += 1
         return written
+
+    # -- PR-L2: payload compaction (20261002000100) ----------------------------------------
+    def _compactions(self) -> dict[str, dict[str, Any]]:
+        return self._variants_state().setdefault("compactions", {})
+
+    def _compacted_variant(self, record: dict[str, Any]) -> dict[str, Any] | None:
+        done = self._compactions().get(str(record["snapshot_id"]))
+        if done is None:
+            return None
+        return self._variants_state()["rows"].get(
+            (str(record["snapshot_id"]), record["upstream_record_id"], done["mapper_version"]))
+
+    def _record_facts(self, record: dict[str, Any]) -> tuple[dict[str, Any], str]:
+        """(codes source, content hash) of one raw record: its payload while it
+        exists, the compacted snapshot's variant afterwards (the SQL helpers)."""
+        if record.get("payload") is not None:
+            return record["payload"], catalog_coverage.variant_content_sha256(record["payload"])
+        variant = self._compacted_variant(record) or {}
+        codes = {field: (str(variant[field]) if isinstance(variant.get(field), int) else variant.get(field))
+                 for _name, field in catalog_coverage.REGISTER_IDENTITY_FIELDS}
+        return codes, variant.get("content_sha256")
+
+    @staticmethod
+    def _reading(variant: dict[str, Any]) -> dict[str, Any]:
+        fields = {name: variant.get(name) for name in query_module.IDENTITY_RECORD_FIELDS}
+        for _name, field in catalog_coverage.REGISTER_IDENTITY_FIELDS:
+            value = variant.get(field)
+            fields[field] = str(value) if isinstance(value, int) else value
+        return {"upstream_record_id": variant["upstream_record_id"], "mapper_version": variant["mapper_version"],
+                "content_sha256": variant["content_sha256"], "fields": fields,
+                "parse_issue_fields": sorted({i["field"] for i in variant.get("parse_issues") or []})}
+
+    def compact_register_snapshot(self, snapshot_key: str, apply: bool) -> dict[str, Any]:
+        """Mirror of `compact_register_snapshot`; its losslessness check is the
+        Python readers' own: the typed reading answers exactly as the payload."""
+        with self.lock:
+            snapshot = next((s for s in self.catalog_snapshots.values()
+                             if s.get("snapshot_key") == snapshot_key and s.get("source_family") == "government"), None)
+            refused = {"status": "refused", "snapshot_key": snapshot_key}
+            if snapshot is None:
+                return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_UNKNOWN"}
+            sid = str(snapshot["id"])
+            done = self._compactions().get(sid)
+            if done is not None:
+                return {"status": "unchanged", "snapshot_key": snapshot_key, **done}
+            filters = ((snapshot.get("retrieval_metadata") or {}).get("capture_scope") or {}).get("filters")
+            if not snapshot.get("activated_at") or not isinstance(filters, dict) or set(filters) != {"tozar"}:
+                return {**refused, "code": "CATALOG_COMPACTION_SNAPSHOT_INELIGIBLE"}
+            records = [r for r in self.catalog_raw_records.values() if str(r["snapshot_id"]) == sid]
+            units = sorted((u for u in self._register_state()["units"].values() if str(u.get("snapshot_id")) == sid),
+                           key=lambda u: (str(u.get("updated_at")), str(u.get("id"))))
+            if (units and units[-1].get("count_verified") is not True) or \
+                    int(snapshot.get("stored_record_count") or 0) != int(snapshot.get("declared_record_count") or -1) \
+                    or int(snapshot.get("stored_record_count") or 0) != len(records):
+                return {**refused, "code": "CATALOG_COMPACTION_COUNT_UNVERIFIED"}
+            build = self._variants_state()["builds"].get((sid, mapper.MAPPER_VERSION))
+            rows = self._variants_state()["rows"]
+            variants = {r["upstream_record_id"]: rows.get((sid, r["upstream_record_id"], mapper.MAPPER_VERSION))
+                        for r in records}
+            if not build or not build.get("completed_at") or any(v is None for v in variants.values()):
+                return {**refused, "code": "CATALOG_COMPACTION_BUILD_INCOMPLETE"}
+            mismatched = sum(1 for r in records if not self._reads_as_payload(r["payload"], variants[r["upstream_record_id"]]))
+            if mismatched:
+                return {**refused, "code": "CATALOG_COMPACTION_TYPED_MISMATCH", "mismatched_rows": mismatched}
+            archive = self._register_state()["archives"].get(sid)
+            if archive is None or int(archive["line_count"]) != len(records):
+                return {**refused, "code": "CATALOG_COMPACTION_ARCHIVE_MISSING"}
+            before = self._snapshot_bytes(sid)
+            if not apply:
+                return {"status": "ready", "snapshot_key": snapshot_key, "raw_rows": len(records),
+                        "mapper_version": mapper.MAPPER_VERSION, "bytes_before": before}
+            for record in records:
+                record["payload"] = None
+            done = {"raw_rows": len(records), "mapper_version": mapper.MAPPER_VERSION,
+                    "bytes_before": before, "bytes_after": self._snapshot_bytes(sid)}
+            self._compactions()[sid] = done
+            for unit in units:
+                if unit.get("status") == "captured":
+                    unit.update(measured_bytes=done["bytes_after"], measurement_method="memory:json_length+variants")
+            return {"status": "compacted", "snapshot_key": snapshot_key, "payloads_removed": len(records), **done}
+
+    def _reads_as_payload(self, payload: dict[str, Any] | None, variant: dict[str, Any]) -> bool:
+        if payload is None:
+            return False
+        reading = self._reading(variant)
+        codes, content = self._record_facts({"payload": payload})
+        return (content == variant["content_sha256"]
+                and all(reading["fields"][f] == catalog_coverage.register_code(payload, f)
+                        for _name, f in catalog_coverage.REGISTER_IDENTITY_FIELDS)
+                and query_module.reading_projection(reading) == query_module.identity_projection(payload)
+                and query_module.reading_unstated(reading) == query_module.unstated_fields(payload))
+
+    def catalog_compacted_record_reading(self, snapshot_id: Any, upstream_record_id: str, *,
+                                         allow_incomplete: bool = False) -> dict[str, Any] | None:
+        self._readable_snapshot(snapshot_id, allow_incomplete)
+        record = next((r for r in self.catalog_raw_records.values() if str(r["snapshot_id"]) == str(snapshot_id)
+                       and r["upstream_record_id"] == str(upstream_record_id)), None)
+        variant = self._compacted_variant(record) if record else None
+        return self._reading(variant) if variant else None
+
+    def record_register_snapshot_archive_from_database(self, snapshot_id: str, gcs_uri: str, byte_size: int,
+                                                       sha256: str, line_count: int) -> dict[str, Any]:
+        snapshot = self._snapshot_by_id(snapshot_id)
+        if snapshot is None or not snapshot.get("activated_at"):
+            raise AppError("CATALOG_REGISTER_REQUEST_INVALID", "unknown snapshot", 409)
+        return self.record_register_snapshot_archive(
+            snapshot["created_by_run_id"], snapshot_id, gcs_uri, byte_size, sha256, line_count,
+            worker_id="", attempt=0, lease_token="", _leased=False)
+
+    def catalog_raw_record_payload_matches(self, raw_record_id: str, line: str) -> bool:
+        from backend.catalog.digest import catalog_payload_digest
+
+        record = next((r for r in self.catalog_raw_records.values() if str(r["id"]) == str(raw_record_id)), None)
+        return record is not None and record["payload_sha256"] == catalog_payload_digest(json.loads(line))
 
     # -- the discovery tree ----------------------------------------------------------------
     def _current_variant_snapshots(self) -> set[str]:

@@ -187,6 +187,10 @@ UNFENCED_BY_DESIGN = {
     # in the database. The operator backfill runs with no run at all, so there
     # is no lease to present; a replaced worker could only write the same rows.
     "record_catalog_variants",
+    # PR-L2: an archive written from a Prepare snapshot's STORED rows is
+    # recorded by the operator path with no run (idempotent: the same object
+    # answers the existing row, another one conflicts).
+    "record_register_snapshot_archive_from_database",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",
