@@ -33,9 +33,16 @@ from typing import Any, Mapping, Protocol
 from .source import (CONNECT_TIMEOUT_SECONDS, DATA_GOV_HOST, MAX_RESPONSE_BYTES,
                      READ_TIMEOUT_SECONDS)
 
-#: What this package sends about itself. No version of any credential, and no
-#: identifying user information.
-USER_AGENT = "milo-catalog-government/1 (+read-only public dataset capture)"
+#: The token data.gov.il asks automated clients to put in their User-Agent: its
+#: API examples page, section "צריכת נתונים על ידי crawling", says "יש להוסיף
+#: ב user agent את הערך datagov-external-client" (P52): the operator's
+#: documented identification for automated clients.
+DATAGOV_CRAWLER_TOKEN = "datagov-external-client"
+
+#: What this package sends about itself: the crawler token, then our own
+#: identification. No version of any credential, and no identifying user
+#: information. Not `snapshot.CAPTURE_TOOL`, which is snapshot provenance.
+USER_AGENT = f"{DATAGOV_CRAWLER_TOKEN} milo-catalog-government/1 (+read-only public dataset capture)"
 
 
 class TransportFailure(Exception):
@@ -137,5 +144,5 @@ class HttpsDataGovTransport:
         return b"".join(chunks), False
 
 
-__all__ = ["USER_AGENT", "DataGovTransport", "HttpResponse", "HttpsDataGovTransport",
+__all__ = ["DATAGOV_CRAWLER_TOKEN", "USER_AGENT", "DataGovTransport", "HttpResponse", "HttpsDataGovTransport",
            "TransportFailure"]

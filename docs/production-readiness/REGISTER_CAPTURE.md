@@ -20,6 +20,8 @@ proxied, and its two writes are execution routes, so they use the existing
 | Capture | capture job (`--register-group-id`) | Per tozar: the scoped capture Prepare uses (same client, bounds, snapshot key and content hash), rows written in bounded batches, then **before activation**: the stored count must equal a FRESH, independent count of that exact tozar taken after every row is written (the directory's bounded `limit=0` request with `filters={"tozar": <exact>}` -- never the capture's own reported total; it is the unit's `api_total`), and the archive object must be written and recorded. A snapshot that is already ACTIVE with the same key (e.g. Prepare captured the same content, with no archive) gets the same two checks after the ingest: its archive is written and verified (idempotent: a recorded archive is trusted) before the unit is marked captured. Otherwise the snapshot stays inactive (never used by Prepare). |
 | Page | API (`GET /projects/{id}/register`) | Every tozar with expected rows and state (not captured / capturing / captured with snapshot key, rows and verified / failed with its code), totals vs the directory, measured bytes per row, and the capacity bar. 404 while the flag is off. |
 
+P52: every data.gov.il request (directory, capture, counts) sends a User-Agent containing `datagov-external-client`, the crawler token data.gov.il's API examples page requires of automated clients ("צריכת נתונים על ידי crawling"); `snapshot.CAPTURE_TOOL` (snapshot provenance) is unchanged.
+
 ### Capacity
 
 `projected = pg_database_size + (expected_rows + rows still in flight) x MILO_CAPTURE_BYTES_PER_ROW_ESTIMATE`
