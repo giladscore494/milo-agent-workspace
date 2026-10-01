@@ -401,7 +401,8 @@ case "$*" in
       "${OPS_TEST_DB_BYTES:-144542867}" "${OPS_TEST_TABLE_BYTES:-62169088}"
     exit 0 ;;
 esac
-printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=2 heap=1 toast=8192\\n' \\
+# The candidates' table is the larger here: the rewrite order (smaller first) stays raw_records first.
+printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=70000000 heap=1 toast=8192\\n' \\
   "${OPS_TEST_RAW_BYTES:-62169088}"
 printf 'DATABASE bytes=%s\\nLIVE runs=%s register_captures=%s\\n' "${OPS_TEST_DB_BYTES:-144542867}" \\
   "${OPS_TEST_LIVE_RUNS:-0}" "${OPS_TEST_LIVE_CAPTURES:-0}"
@@ -503,6 +504,125 @@ def test_the_vacuum_rewrites_each_table_as_the_owner_with_a_lock_timeout(tmp_pat
     assert failed.returncode == 1 and "did not complete" in failed.stdout
     no_secret(result.stdout, result.stderr, tree.summary.read_text(), "\n".join(tree.tool_calls()))
     assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(tree.tool_calls())
+
+
+#: Production, 2.10 (Register retention #12): the sizes the fixed order refused with.
+PROD_DATABASE, PROD_RAW, PROD_CANDIDATES = 364_915_859, 85_417_984, 59_473_920
+#: The candidates' table after its rewrite (heap 17.6 MB of 59.5 MB total).
+PROD_CANDIDATES_AFTER, PROD_RAW_AFTER = 40_000_000, 60_000_000
+
+#: A stateful stub: a rewrite shrinks its table and pg_database_size by what it frees.
+SIZED_PSQL = """#!/usr/bin/env bash
+printf 'psql%s %s\\n' "${PGUSER:+ [$PGUSER]}" "$*" >> "$OPS_TEST_CALLS"
+# shellcheck disable=SC1090
+source "$OPS_TEST_STATE"
+save() {
+  declare -p database catalog_raw_records catalog_candidate_variants catalog_raw_records_after \\
+    catalog_candidate_variants_after size_reads > "$OPS_TEST_STATE"
+}
+case "$*" in
+  *"vacuum (full"*)
+    args="$*" && table="${args##*public.}" && after="${table}_after"
+    database=$(( database - ${!table} + ${!after} ))
+    printf -v "$table" '%s' "${!after}"
+    save
+    exit 0 ;;
+  *"'OWNER '"*)
+    printf 'OWNER catalog_raw_records=PASS\\nOWNER catalog_candidate_variants=PASS\\n'
+    exit 0 ;;
+  *"'GATE runs="*)
+    [[ "$*" =~ public\\.([a-z_]+)\\'::regclass ]] && table="${BASH_REMATCH[1]}"
+    runs=0 captures=0
+    if [[ "${OPS_TEST_LIVE_AT:-}" == "$table" ]]; then printf -v "${OPS_TEST_LIVE_KIND:-runs}" 1; fi
+    printf 'GATE runs=%s register_captures=%s database=%s table=%s\\n' "$runs" "$captures" "$database" "${!table}"
+    exit 0 ;;
+esac
+raw="$catalog_raw_records" candidates="$catalog_candidate_variants"
+size_reads=$(( size_reads + 1 )) && save
+# The second read is the order's (right before the loop): it fails, or carries one table only.
+if [[ "$size_reads" -eq 2 && "${OPS_TEST_ORDER_READ:-}" == fail ]]; then exit 1; fi
+if [[ "$size_reads" -eq 2 && "${OPS_TEST_ORDER_READ:-}" == partial ]]; then
+  printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nDATABASE bytes=%s\\n' "$raw" "$database"
+  exit 0
+fi
+# The fixed order of before (raw_records first): the size read ranks raw_records the smaller.
+[[ -z "${OPS_TEST_FIXED_ORDER:-}" ]] || candidates=$(( raw + 1 ))
+printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=%s heap=1 toast=0\\n' \\
+  "$raw" "$candidates"
+printf 'DATABASE bytes=%s\\nLIVE runs=0 register_captures=0\\n' "$database"
+"""
+
+
+def sized_vacuum(tmp_path: Path, *, database: int = PROD_DATABASE, raw: int = PROD_RAW,
+                 candidates: int = PROD_CANDIDATES, candidates_after: int = PROD_CANDIDATES_AFTER, **env: str):
+    tmp_path.mkdir()
+    tree = OpsTree(tmp_path)
+    tree.tool("psql", SIZED_PSQL)
+    state = tmp_path / "db-state.sh"
+    state.write_text(f"database={database}\ncatalog_raw_records={raw}\n"
+                     f"catalog_candidate_variants={candidates}\ncatalog_raw_records_after={PROD_RAW_AFTER}\n"
+                     f"catalog_candidate_variants_after={candidates_after}\nsize_reads=0\n")
+    result = vacuum(tree, "--apply", "--confirm", "VACUUM", OPS_TEST_STATE=str(state), **env)
+    rewritten = [c.split("public.")[-1] for c in tree.tool_calls() if "vacuum (full" in c]
+    return result, rewritten, tree.tool_calls()
+
+
+def test_the_smaller_table_is_rewritten_first_and_frees_the_larger_ones_headroom(tmp_path):
+    """PR-VAC: production refused the fixed order before its first table; smaller first, both fit."""
+    old, rewritten, _ = sized_vacuum(tmp_path / "fixed", OPS_TEST_FIXED_ORDER="1")
+    assert old.returncode == 1 and rewritten == []
+    assert ("CATALOG_VACUUM_NO_HEADROOM before public.catalog_raw_records: pg_database_size 364915859 + 85417984"
+            " x 1.1 = 458875641 > 450000000 bytes") in old.stdout
+    result, rewritten, calls = sized_vacuum(tmp_path / "sized")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rewritten == ["catalog_candidate_variants", "catalog_raw_records"]
+    assert ("SUMMARY|register-vacuum order|PASS|smaller first: catalog_candidate_variants 59473920 bytes,"
+            " then catalog_raw_records 85417984 bytes") in result.stdout
+    assert ("SUMMARY|register-vacuum headroom catalog_candidate_variants|PASS|pg_database_size 364915859"
+            " + 59473920 x 1.1 = 430337171 <= 450000000 bytes") in result.stdout
+    # 364,915,859 - 59,473,920 + 40,000,000 = 345,441,939 before raw_records.
+    assert ("SUMMARY|register-vacuum headroom catalog_raw_records|PASS|pg_database_size 345441939"
+            " + 85417984 x 1.1 = 439401721 <= 450000000 bytes") in result.stdout
+    assert "SUMMARY|register-vacuum apply|PASS|pg_database_size 364915859 -> 320023955 bytes" in result.stdout
+    # The order is read with the read-only role (the sizes' own SQL, once more right before the loop),
+    # and the gate still runs before EACH table, read-only.
+    sizes = [c for c in calls if "'SIZE '" in c]
+    gates = [c for c in calls if "'GATE runs=" in c]
+    assert len(sizes) == 3 and len(gates) == 2
+    assert all("[postgres." not in c for c in sizes + gates)
+    assert calls.index(sizes[1]) < calls.index(gates[0])
+    no_secret(result.stdout, result.stderr, "\n".join(calls))
+    assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(calls)
+
+
+def test_the_order_is_numeric_and_an_unreadable_order_rewrites_nothing(tmp_path):
+    # 9,000,000 < 85,000,000 although "9" sorts after "8" as text.
+    result, rewritten, _ = sized_vacuum(tmp_path / "digits", database=300_000_000, raw=85_000_000,
+                                        candidates=9_000_000, candidates_after=8_000_000)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rewritten == ["catalog_candidate_variants", "catalog_raw_records"]
+    for read, shown in (("fail", "could not be read; nothing was rewritten"),
+                        ("partial", "did not carry both tables; nothing was rewritten")):
+        result, rewritten, _ = sized_vacuum(tmp_path / read, OPS_TEST_ORDER_READ=read)
+        assert result.returncode == 1 and rewritten == [], read
+        assert f"SUMMARY|register-vacuum order|FAIL|the sizes before the rewrite {shown}" in result.stdout
+
+
+def test_the_smaller_first_order_keeps_every_refusal(tmp_path):
+    # Even the smaller table does not fit: 400,000,000 + 59,473,920 x 1.1 > 450,000,000; nothing is rewritten.
+    result, rewritten, _ = sized_vacuum(tmp_path / "full", database=400_000_000)
+    assert result.returncode == 1 and rewritten == []
+    assert ("CATALOG_VACUUM_NO_HEADROOM before public.catalog_candidate_variants: pg_database_size 400000000"
+            " + 59473920 x 1.1 = 465421312 > 450000000 bytes") in result.stdout
+    assert "REFUSED CATALOG_VACUUM_NO_HEADROOM" in result.stderr
+    # Live before the SECOND (larger) table: a run, or a register capture; only the smaller was rewritten.
+    for kind, shown in (("runs", "1 live run(s), 0 live register capture(s)"),
+                        ("captures", "0 live run(s), 1 live register capture(s)")):
+        result, rewritten, _ = sized_vacuum(tmp_path / kind, OPS_TEST_LIVE_AT="catalog_raw_records",
+                                         OPS_TEST_LIVE_KIND=kind)
+        assert result.returncode == 1 and rewritten == ["catalog_candidate_variants"], kind
+        assert f"CATALOG_VACUUM_BLOCKED before public.catalog_raw_records: {shown}" in result.stdout
+        assert "REFUSED CATALOG_VACUUM_BLOCKED" in result.stderr
 
 
 # =============================================================================
