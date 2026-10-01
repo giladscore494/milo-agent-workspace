@@ -13,6 +13,8 @@
 #                      whether the owner connection owns it (PASS/FAIL)
 #   --apply --confirm VACUUM
 #                      refuses unless the owner connection owns both tables;
+#                      orders the two by their current total size, the smaller
+#                      first (its rewrite frees room for the larger's copy);
 #                      then, BEFORE EACH TABLE, refuses while any run or
 #                      register capture is not terminal and while
 #                      pg_database_size + the table's size x 1.1 > 450 MB (the
@@ -45,8 +47,8 @@ Usage: register-vacuum.sh [--sizes | --apply --confirm VACUUM] [--dry-run] [--op
 
 --sizes (default) is read-only: sizes, what is live, and the owner read-back.
 --apply rewrites catalog_raw_records and catalog_candidate_variants (VACUUM
-(FULL, ANALYZE)) as their owner, each refused while any run or register
-capture is live or without the headroom for its copy.
+(FULL, ANALYZE)) as their owner, the smaller first, each refused while any
+run or register capture is live or without the headroom for its copy.
 EOF
 }
 while [[ $# -gt 0 ]]; do
@@ -216,6 +218,18 @@ if (( ! owner_ok )); then
   printf 'REFUSED CATALOG_VACUUM_NOT_PERMITTED: the owner connection does not own both tables; nothing was rewritten\n' >&2
   exit 1
 fi
+# The smaller table first: its rewrite shrinks pg_database_size, which may be
+# what makes room for the larger table's copy. Read with the same SQL, now.
+sizes="$(read_only "$SIZES_SQL")" || ops_fail "the sizes before the rewrite could not be read" "register-vacuum order"
+order="$(sed -n 's/^SIZE \([a-z_]*\) total=\([0-9]*\) .*/\2 \1/p' <<< "$sizes" | sort -k1,1n -k2,2)"
+TABLES=() order_detail=""
+while read -r bytes table; do
+  TABLES+=("$table") order_detail+="${order_detail:+, then }${table} ${bytes} bytes"
+done <<< "$order"
+[[ "${TABLES[*]}" == "catalog_raw_records catalog_candidate_variants" \
+  || "${TABLES[*]}" == "catalog_candidate_variants catalog_raw_records" ]] \
+  || ops_fail "the sizes before the rewrite did not carry both tables; nothing was rewritten" "register-vacuum order"
+summary "register-vacuum order" PASS "smaller first: ${order_detail}"
 for table in "${TABLES[@]}"; do
   # Re-checked before EACH table: nothing live, and room for the copy.
   gate="$(read_only "$(gate_sql "$table")")" \

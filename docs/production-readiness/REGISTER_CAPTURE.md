@@ -365,7 +365,10 @@ build under the current mapper version is complete. Their digest item is
    made from `MILO_READONLY_DB_URL` read from the environment and split into
    libpq's variables, its password as `PGPASSWORD`: neither URL nor password
    is ever on psql's argv. Refused `CATALOG_VACUUM_NOT_PERMITTED` unless the owner
-   read-back is PASS for both tables; then BEFORE EACH TABLE,
+   read-back is PASS for both tables; the two are rewritten in ascending
+   order of their current total size (`register-vacuum order` prints it: the
+   smaller table's rewrite shrinks `pg_database_size` first, which can be what
+   makes room for the larger one's copy); then BEFORE EACH TABLE,
    `CATALOG_VACUUM_BLOCKED` while any run or register capture is not
    terminal, and `CATALOG_VACUUM_NO_HEADROOM` when `pg_database_size` + the
    table's size x 1.1 > 450 MB (the rewrite copies the table first; the
