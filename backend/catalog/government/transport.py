@@ -35,8 +35,8 @@ from .source import (CONNECT_TIMEOUT_SECONDS, DATA_GOV_HOST, MAX_RESPONSE_BYTES,
 
 #: The token data.gov.il asks automated clients to put in their User-Agent: its
 #: API examples page, section "צריכת נתונים על ידי crawling", says "יש להוסיף
-#: ב user agent את הערך datagov-external-client" (P52). Sending the operator's
-#: documented crawler token is the sanctioned path past its firewall.
+#: ב user agent את הערך datagov-external-client" (P52): the operator's
+#: documented identification for automated clients.
 DATAGOV_CRAWLER_TOKEN = "datagov-external-client"
 
 #: What this package sends about itself: the crawler token, then our own

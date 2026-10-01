@@ -49,7 +49,7 @@ def test_outgoing_user_agent_carries_crawler_token_and_our_identification() -> N
     assert user_agent == transport.USER_AGENT
 
 
-def test_user_agent_adds_no_other_header() -> None:
+def test_request_headers_are_exactly_accept_user_agent_host() -> None:
     session = _RecordingSession()
     transport.HttpsDataGovTransport(session=session).get(
         source.action_url("package_show"), params={"id": "x"})
