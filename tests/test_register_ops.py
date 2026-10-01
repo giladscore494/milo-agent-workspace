@@ -516,13 +516,16 @@ SIZED_PSQL = """#!/usr/bin/env bash
 printf 'psql%s %s\\n' "${PGUSER:+ [$PGUSER]}" "$*" >> "$OPS_TEST_CALLS"
 # shellcheck disable=SC1090
 source "$OPS_TEST_STATE"
+save() {
+  declare -p database catalog_raw_records catalog_candidate_variants catalog_raw_records_after \\
+    catalog_candidate_variants_after size_reads > "$OPS_TEST_STATE"
+}
 case "$*" in
   *"vacuum (full"*)
     args="$*" && table="${args##*public.}" && after="${table}_after"
     database=$(( database - ${!table} + ${!after} ))
     printf -v "$table" '%s' "${!after}"
-    declare -p database catalog_raw_records catalog_candidate_variants \\
-      catalog_raw_records_after catalog_candidate_variants_after > "$OPS_TEST_STATE"
+    save
     exit 0 ;;
   *"'OWNER '"*)
     printf 'OWNER catalog_raw_records=PASS\\nOWNER catalog_candidate_variants=PASS\\n'
@@ -535,6 +538,13 @@ case "$*" in
     exit 0 ;;
 esac
 raw="$catalog_raw_records" candidates="$catalog_candidate_variants"
+size_reads=$(( size_reads + 1 )) && save
+# The second read is the order's (right before the loop): it fails, or carries one table only.
+if [[ "$size_reads" -eq 2 && "${OPS_TEST_ORDER_READ:-}" == fail ]]; then exit 1; fi
+if [[ "$size_reads" -eq 2 && "${OPS_TEST_ORDER_READ:-}" == partial ]]; then
+  printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nDATABASE bytes=%s\\n' "$raw" "$database"
+  exit 0
+fi
 # The fixed order of before (raw_records first): the size read ranks raw_records the smaller.
 [[ -z "${OPS_TEST_FIXED_ORDER:-}" ]] || candidates=$(( raw + 1 ))
 printf 'SIZE catalog_raw_records total=%s heap=1 toast=8192\\nSIZE catalog_candidate_variants total=%s heap=1 toast=0\\n' \\
@@ -543,14 +553,15 @@ printf 'DATABASE bytes=%s\\nLIVE runs=0 register_captures=0\\n' "$database"
 """
 
 
-def sized_vacuum(tmp_path: Path, *, database: int = PROD_DATABASE, **env: str):
+def sized_vacuum(tmp_path: Path, *, database: int = PROD_DATABASE, raw: int = PROD_RAW,
+                 candidates: int = PROD_CANDIDATES, candidates_after: int = PROD_CANDIDATES_AFTER, **env: str):
     tmp_path.mkdir()
     tree = OpsTree(tmp_path)
     tree.tool("psql", SIZED_PSQL)
     state = tmp_path / "db-state.sh"
-    state.write_text(f"database={database}\ncatalog_raw_records={PROD_RAW}\n"
-                     f"catalog_candidate_variants={PROD_CANDIDATES}\ncatalog_raw_records_after={PROD_RAW_AFTER}\n"
-                     f"catalog_candidate_variants_after={PROD_CANDIDATES_AFTER}\n")
+    state.write_text(f"database={database}\ncatalog_raw_records={raw}\n"
+                     f"catalog_candidate_variants={candidates}\ncatalog_raw_records_after={PROD_RAW_AFTER}\n"
+                     f"catalog_candidate_variants_after={candidates_after}\nsize_reads=0\n")
     result = vacuum(tree, "--apply", "--confirm", "VACUUM", OPS_TEST_STATE=str(state), **env)
     rewritten = [c.split("public.")[-1] for c in tree.tool_calls() if "vacuum (full" in c]
     return result, rewritten, tree.tool_calls()
@@ -582,6 +593,19 @@ def test_the_smaller_table_is_rewritten_first_and_frees_the_larger_ones_headroom
     assert calls.index(sizes[1]) < calls.index(gates[0])
     no_secret(result.stdout, result.stderr, "\n".join(calls))
     assert OWNER_PASSWORD not in result.stdout + result.stderr + "\n".join(calls)
+
+
+def test_the_order_is_numeric_and_an_unreadable_order_rewrites_nothing(tmp_path):
+    # 9,000,000 < 85,000,000 although "9" sorts after "8" as text.
+    result, rewritten, _ = sized_vacuum(tmp_path / "digits", database=300_000_000, raw=85_000_000,
+                                        candidates=9_000_000, candidates_after=8_000_000)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert rewritten == ["catalog_candidate_variants", "catalog_raw_records"]
+    for read, shown in (("fail", "could not be read; nothing was rewritten"),
+                        ("partial", "did not carry both tables; nothing was rewritten")):
+        result, rewritten, _ = sized_vacuum(tmp_path / read, OPS_TEST_ORDER_READ=read)
+        assert result.returncode == 1 and rewritten == [], read
+        assert f"SUMMARY|register-vacuum order|FAIL|the sizes before the rewrite {shown}" in result.stdout
 
 
 def test_the_smaller_first_order_keeps_every_refusal(tmp_path):

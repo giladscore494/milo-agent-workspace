@@ -180,7 +180,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
       ops_run psql "(owner)" -X -v ON_ERROR_STOP=1 -c "set lock_timeout = '5s'" -c "vacuum (full, analyze) public.${table}"
     done
   fi
-  summary "register-vacuum ${MODE}" DRY-RUN "would read the sizes (read-only)$([[ "$MODE" == "apply" ]] && printf ' and rewrite %s as their owner' "${TABLES[*]}")"
+  summary "register-vacuum ${MODE}" DRY-RUN "would read the sizes (read-only)$([[ "$MODE" == "apply" ]] && printf ' and rewrite %s as their owner, the smaller first (sizes read at apply time)' "${TABLES[*]}")"
   summary_note "DRY RUN: nothing was called and nothing was changed."
   exit 0
 fi
@@ -220,8 +220,8 @@ if (( ! owner_ok )); then
 fi
 # The smaller table first: its rewrite shrinks pg_database_size, which may be
 # what makes room for the larger table's copy. Read with the same SQL, now.
-sizes="$(read_only "$SIZES_SQL")" || ops_fail "the sizes before the rewrite could not be read" "register-vacuum order"
-order="$(sed -n 's/^SIZE \([a-z_]*\) total=\([0-9]*\) .*/\2 \1/p' <<< "$sizes" | sort -k1,1n -k2,2)"
+sizes="$(read_only "$SIZES_SQL")" || ops_fail "the sizes before the rewrite could not be read; nothing was rewritten" "register-vacuum order"
+order="$(sed -n 's/^SIZE \([a-z_]*\) total=\([0-9][0-9]*\) .*/\2 \1/p' <<< "$sizes" | sort -k1,1n -k2,2)"
 TABLES=() order_detail=""
 while read -r bytes table; do
   TABLES+=("$table") order_detail+="${order_detail:+, then }${table} ${bytes} bytes"
