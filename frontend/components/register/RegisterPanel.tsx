@@ -5,6 +5,7 @@ import {
   REGISTER_CAPTURE_FALLBACK,
   REGISTER_DIRECTORY_FALLBACK,
   REGISTER_READ_FALLBACK,
+  REGISTER_SYNC_FALLBACK,
   safeErrorText,
 } from '@/lib/errorText';
 import {
@@ -34,6 +35,8 @@ export type RegisterClient = {
   register: (projectId: string) => Promise<unknown>;
   requestCapture: (projectId: string, registerVersion: string, tozars: string[], conversationId: string) => Promise<unknown>;
   requestDirectory: (projectId: string, conversationId: string) => Promise<unknown>;
+  /** PR-SYNC-1: one incremental sync (optional, so older test clients still type-check). */
+  requestSync?: (projectId: string, conversationId: string) => Promise<unknown>;
 };
 
 /** The workspace's own API client, read at call time. */
@@ -42,6 +45,7 @@ const defaultClient: RegisterClient = {
   requestCapture: (projectId, version, tozars, conversationId) =>
     api.requestRegisterCapture(projectId, version, tozars, conversationId),
   requestDirectory: (projectId, conversationId) => api.requestRegisterDirectory(projectId, conversationId),
+  requestSync: (projectId, conversationId) => api.requestRegisterSync(projectId, conversationId),
 };
 
 export type RegisterPanelProps = {
@@ -149,17 +153,18 @@ export function RegisterPanel({ projectId, conversationId, client = defaultClien
     }
   };
 
-  const refresh = async () => {
-    if (!conversationId || busy) return;
+  const start = async (sync: boolean) => {
+    const send = sync ? client.requestSync : client.requestDirectory;
+    if (!conversationId || busy || !send) return;
     setBusy(true);
     setActionError('');
     setRefusedCapacity(undefined);
     setNotice('');
     try {
-      await client.requestDirectory(projectId, conversationId);
-      setNotice('Directory refresh requested. Read the page again in a few minutes.');
+      await send(projectId, conversationId);
+      setNotice(`${sync ? 'Sync' : 'Directory refresh'} requested. Read the page again in a few minutes.`);
     } catch (error) {
-      setActionError(safeErrorText(error, REGISTER_DIRECTORY_FALLBACK));
+      setActionError(safeErrorText(error, sync ? REGISTER_SYNC_FALLBACK : REGISTER_DIRECTORY_FALLBACK));
     } finally {
       setBusy(false);
       await load(projectId);
@@ -201,7 +206,8 @@ export function RegisterPanel({ projectId, conversationId, client = defaultClien
                 busy={busy}
                 onToggle={toggle}
                 onCapture={(tozars) => void capture(tozars)}
-                onRefresh={() => void refresh()}
+                onRefresh={() => void start(false)}
+                onSync={client.requestSync ? () => void start(true) : undefined}
                 onReload={() => void load(projectId)}
               />
             )}
@@ -225,11 +231,12 @@ type BodyProps = {
   onToggle: (tozar: string) => void;
   onCapture: (tozars: string[]) => void;
   onRefresh: () => void;
+  onSync?: () => void;
   onReload: () => void;
 };
 
 function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, busy, onToggle, onCapture,
-  onRefresh, onReload }: BodyProps) {
+  onRefresh, onSync, onReload }: BodyProps) {
   const version = view.directory?.registerVersion;
   const selectedRows = selectedUnits.reduce((sum, item) => sum + item.expectedRows, 0);
   const fits = groupFits(selectedUnits, view.groupMaxRows);
@@ -259,6 +266,14 @@ function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, 
       ) : (
         <p className="muted">The register directory has not been read yet.</p>
       )}
+      {view.lastSync && (
+        <dl className="register-sync" aria-label="Last sync">
+          {view.lastSync.finishedAt && <div><dt>last sync</dt><dd>{safeText(view.lastSync.finishedAt)}</dd></div>}
+          {view.lastSync.fields.map((field) => (
+            <div key={field.name}><dt>{field.name}</dt><dd>{field.value}</dd></div>
+          ))}
+        </dl>
+      )}
       {!hasConversation && view.canCapture && (
         <p className="note">Open a conversation of this project to capture: each capture is recorded under it.</p>
       )}
@@ -269,6 +284,11 @@ function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, 
             disabled={!canAct || selectedUnits.length === 0 || !fits}
             onClick={() => onCapture(selectedUnits.map((item) => item.tozar))}>
             {busy ? 'Requesting…' : `Capture selected (${selectedUnits.length})`}
+          </button>
+        )}
+        {view.canSync && onSync && (
+          <button type="button" className="button button--primary" disabled={busy || !hasConversation} onClick={onSync}>
+            Sync register
           </button>
         )}
         {view.canRefreshDirectory && (

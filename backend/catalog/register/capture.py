@@ -68,6 +68,8 @@ REGISTER_CAPTURE_REASONS: Mapping[str, str] = {
         "that register capture group is not captured by this run",
     "CATALOG_REGISTER_CAPTURE_FAILED":
         "the unit could not be captured",
+    "CATALOG_REGISTER_NO_DIRECTORY":
+        "the register directory has not been read yet",
 }
 
 
@@ -274,7 +276,11 @@ def capture_unit(repository: Any, lease: Any, *, client: DataGovClient, unit: Ma
 def capture_group(repository: Any, lease: Any, *, client: DataGovClient, group_id: str,
                   archive_writer: Any, resource_id: str = src.WLTP_RESOURCE_ID,
                   cancellation_checker: Callable[[], bool] | None = None,
-                  event_sink: Callable[[str, Mapping[str, Any]], None] | None = None) -> GroupReport:
+                  event_sink: Callable[[str, Mapping[str, Any]], None] | None = None,
+                  stop_before_unit: Callable[[Mapping[str, Any]], bool] | None = None) -> GroupReport:
+    """`stop_before_unit` (PR-SYNC-1, a sync's budget and throttle stop): when
+    it answers True for the next unit, that unit and the rest are left as they
+    are -- `requested` under this run, retryable once the run has ended."""
     answer = repository.register_capture_group(group_id)
     group = answer.get("group") or {}
     if str(group.get("run_id")) != str(lease.run_id) or group.get("kind", "capture") != "capture":
@@ -283,6 +289,8 @@ def capture_group(repository: Any, lease: Any, *, client: DataGovClient, group_i
     for unit in answer.get("units") or []:
         if unit.get("status") not in ("requested", "capturing"):
             continue
+        if stop_before_unit is not None and stop_before_unit(unit):
+            break
         report.units.append(capture_unit(
             repository, lease, client=client, unit=unit, archive_writer=archive_writer,
             resource_id=resource_id, cancellation_checker=cancellation_checker,

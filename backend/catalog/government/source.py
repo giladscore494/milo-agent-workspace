@@ -223,6 +223,11 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
         "or the scan and the counts disagree",
     "GOV_DIRECTORY_REGISTER_CHANGED":
         "the register's row total changed while the directory was being read",
+    # PR-SYNC-1: a register sync stops at the firewall's first answer
+    "GOV_SYNC_THROTTLED":
+        "data.gov.il's firewall answered the register sync (HTTP 403 page or 429); run it again later",
+    "GOV_SYNC_DIRECTORY_TOO_LARGE":
+        "more tozars changed than one register sync may count; press Refresh directory once",
 }
 
 

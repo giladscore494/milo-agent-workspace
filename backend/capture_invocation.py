@@ -156,6 +156,13 @@ def register_directory(*, project_ref: str, run_id: str) -> Invocation:
         env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
 
 
+def register_sync(*, project_ref: str, run_id: str) -> Invocation:
+    """PR-SYNC-1: the ONE execution of one incremental register sync."""
+    return Invocation(
+        entrypoint_args=(*capture_arguments(project_ref=project_ref, run_id=run_id), "--register-sync"),
+        env_overrides=((REGISTER_SWITCH, REGISTER_SWITCH_ON),))
+
+
 def normalisation_job_arguments(*, project_ref: str) -> tuple[str, ...]:
     """PR-D3: the normalisation job's WHOLE, fixed entrypoint arguments (its
     definition, `government-production-capture.sh --ensure-normalisation-job`):

@@ -16,7 +16,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RegisterPanel, RegisterClient } from '../components/register/RegisterPanel';
 import { ApiError } from '../lib/api';
-import { capacityRefusal, capturable, groupFits, parseRegister } from '../lib/register';
+import { capacityRefusal, capturable, groupFits, parseRegister, parseSyncSummary } from '../lib/register';
 import { isGatewayRequestAllowed, isRunCreationRequest } from '../lib/server/gatewayPolicy';
 
 const PROJECT = '00000000-0000-4000-8000-000000000001';
@@ -63,6 +63,7 @@ function client(body: unknown = registerBody(), overrides: Partial<RegisterClien
     register: vi.fn(async () => body),
     requestCapture: vi.fn(async () => ({ decision: 'claimed' })),
     requestDirectory: vi.fn(async () => ({ started: true })),
+    requestSync: vi.fn(async () => ({ started: true })),
     ...overrides,
   };
 }
@@ -240,6 +241,32 @@ describe('RegisterPanel', () => {
     expect(api.requestDirectory).toHaveBeenCalledWith(PROJECT, CONVERSATION);
   });
 
+  it('syncs under the open conversation and shows the last sync', async () => {
+    const summary = 'SYNC_SUMMARY|changed=true|directory_version=9e2ae1e5da80|work=93|captured=21|reused=0|'
+      + 'failed=0|deferred=72|requests=78/80|stop=budget|backlog=72/2900|coverage=98793/101693';
+    const api = client(registerBody({ can_sync: true, last_sync: { summary, finished_at: '2026-10-05T10:00:00Z' } }));
+    await openPanel(api);
+    const shown = await screen.findByLabelText('Last sync');
+    expect(shown.textContent).toContain('backlog72/2900');
+    expect(shown.textContent).toContain('stopbudget');
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Sync register' }));
+    });
+    expect(api.requestSync).toHaveBeenCalledWith(PROJECT, CONVERSATION);
+    expect(parseSyncSummary(summary)?.map((field) => field.name)).toEqual(['changed', 'directory_version', 'work',
+      'captured', 'reused', 'failed', 'deferred', 'requests', 'stop', 'backlog', 'coverage']);
+    for (const bad of [summary.replace('stop=budget', 'stop=<b>'), summary.replace('|work=93', ''), `${summary}|x=1`]) {
+      expect(parseSyncSummary(bad)).toBeUndefined();
+    }
+  });
+
+  it('offers no sync where the server cannot sync', async () => {
+    await openPanel(client());
+    await screen.findByRole('table');
+    expect(screen.queryByRole('button', { name: 'Sync register' })).toBeNull();
+    expect(screen.queryByLabelText('Last sync')).toBeNull();
+  });
+
   it('shows nothing when the first read is unreadable or fails, never a partial page', async () => {
     for (const api of [client({ available: true, units: 'nope' }),
       client(undefined, { register: vi.fn(async () => { throw new ApiError(502, 'REPOSITORY_ERROR', 'x'); }) })]) {
@@ -283,7 +310,8 @@ describe('capacityRefusal', () => {
 
 describe('gateway policy for the Register page', () => {
   const read = `/projects/${PROJECT}/register`;
-  const writes = [`/projects/${PROJECT}/register/captures`, `/projects/${PROJECT}/register/directory`];
+  const writes = [`/projects/${PROJECT}/register/captures`, `/projects/${PROJECT}/register/directory`,
+    `/projects/${PROJECT}/register/sync`];
   afterEach(() => {
     delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
     delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;

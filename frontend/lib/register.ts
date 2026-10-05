@@ -40,9 +40,14 @@ export type RegisterCapacity = {
   overThreshold: boolean;
 };
 
+/** PR-SYNC-1: the last sync's summary fields, in the server's order. */
+export type SyncField = { name: string; value: string };
+
 export type RegisterView = {
   canCapture: boolean;
   canRefreshDirectory: boolean;
+  canSync: boolean;
+  lastSync?: { fields: SyncField[]; finishedAt?: string };
   directory?: {
     registerVersion: string;
     resourceId: string;
@@ -123,6 +128,25 @@ function unit(value: unknown): RegisterUnit | undefined {
   return out;
 }
 
+const SYNC_FIELDS = ['changed', 'directory_version', 'work', 'captured', 'reused', 'failed', 'deferred',
+  'requests', 'stop', 'backlog', 'coverage'];
+
+/** `SYNC_SUMMARY|name=value|...`: exactly the known names, in order, each a bounded token. */
+export function parseSyncSummary(line: unknown): SyncField[] | undefined {
+  if (typeof line !== 'string' || line.length > 400) return undefined;
+  const [head, ...parts] = line.split('|');
+  const fields = parts.map((part) => {
+    const [name, value, extra] = part.split('=');
+    return { name, value, extra };
+  });
+  if (head !== 'SYNC_SUMMARY' || fields.length !== SYNC_FIELDS.length
+      || fields.some((field, index) => field.name !== SYNC_FIELDS[index] || field.extra !== undefined
+        || !/^[a-z0-9/]{1,40}$/.test(field.value ?? ''))) {
+    return undefined;
+  }
+  return fields.map(({ name, value }) => ({ name, value }));
+}
+
 /** The Register page, or `undefined` when the body is not the expected shape. */
 export function parseRegister(body: unknown): RegisterView | undefined {
   const source = asObject(body);
@@ -164,9 +188,14 @@ export function parseRegister(body: unknown): RegisterView | undefined {
       || typeof capacityRaw.over_threshold !== 'boolean' || groupMaxRows === undefined || groupMaxRows < 1) {
     return undefined;
   }
+  const lastSyncRaw = asObject(source.last_sync);
+  const syncFields = parseSyncSummary(lastSyncRaw.summary);
   return {
     canCapture: source.can_capture,
     canRefreshDirectory: source.can_refresh_directory,
+    canSync: source.can_sync === true,
+    lastSync: syncFields && { fields: syncFields,
+      finishedAt: typeof lastSyncRaw.finished_at === 'string' ? lastSyncRaw.finished_at.slice(0, 64) : undefined },
     directory,
     units: units as RegisterUnit[],
     totals: totals as RegisterView['totals'],
