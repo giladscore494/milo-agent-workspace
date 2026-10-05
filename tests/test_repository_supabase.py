@@ -57,6 +57,10 @@ class FakeQuery:
         self.filters.append(("eq", *args))
         return self
 
+    def gt(self, *args):
+        self.filters.append(("gt", *args))
+        return self
+
     def in_(self, *args):
         self.filters.append(("in", *args))
         return self
@@ -91,7 +95,18 @@ class FakeQuery:
             self.client.updated.append((self.table, self.payload))
             return FakeResult([self.payload])
         self.client.selected.append(self)
-        return FakeResult(list(self.client.select_data.get(self.table, [])))
+        rows = list(self.client.select_data.get(self.table, []))
+        # The schedule read is deliberately tested with enough rows to cross
+        # PostgREST's page boundary. Keep the general fake permissive; emulate
+        # ordering, keyset filtering and limit only for this table.
+        if self.table == "register_sync_schedules":
+            for item in self.filters:
+                if item[0] == "gt" and item[1] == "project_id":
+                    rows = [row for row in rows if str(row.get("project_id") or "") > str(item[2])]
+            rows.sort(key=lambda row: str(row.get("project_id") or ""))
+            if self.bounds and self.bounds[0] == "limit":
+                rows = rows[:int(self.bounds[1])]
+        return FakeResult(rows)
 
 
 class FakeClient:
@@ -116,6 +131,25 @@ def repo():
     repository = SupabaseRepository.__new__(SupabaseRepository)
     repository.client = FakeClient()
     return repository
+
+
+def test_register_sync_schedules_reads_past_the_first_postgrest_page(repo):
+    """PR-SYNC-2: the global schedule state must include projects after row 1000."""
+    project_ids = [str(UUID(int=index + 1)) for index in range(1005)]
+    repo.client.select_data["register_sync_schedules"] = [
+        {"project_id": project_id, "enabled": index == 1004}
+        for index, project_id in enumerate(project_ids)
+    ]
+
+    rows = repo.register_sync_schedules()
+
+    assert [row["project_id"] for row in rows] == project_ids
+    reads = [query for query in repo.client.selected if query.table == "register_sync_schedules"]
+    assert len(reads) == 2
+    assert reads[0].bounds == ("limit", 1000) and reads[0].filters == []
+    assert reads[1].bounds == ("limit", 1000)
+    assert reads[1].filters == [("gt", "project_id", project_ids[999])]
+    assert rows[-1]["enabled"] is True
 
 
 @pytest.mark.parametrize("method,rpc,payload_name", [
