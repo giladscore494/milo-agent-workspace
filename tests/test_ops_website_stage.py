@@ -399,7 +399,7 @@ def test_a_successful_deploy_restores_exactly_the_named_stage_after_the_deployed
     assert all(calls.index(call) > gate for call in restore_calls(tree))
     assert_no_stage2(result.stdout + "\n".join(tree.tool_calls()))
     summary = re.findall(r"^SUMMARY\|(\d+[a-d]?) [^|]+\|([A-Z-]+)\|", result.stdout, re.M)
-    assert [step for step, _ in summary][:10] == [str(n) for n in range(1, 11)]
+    assert [step for step, _ in summary][:11] == [str(n) for n in range(1, 10)] + ["9b", "10"]
     assert all(outcome in ("PASS", "SKIPPED") for _, outcome in summary)
     if restore == "none":
         assert "SUMMARY|11 website-stage|SKIPPED|restore_website_stage=none" in result.stdout
