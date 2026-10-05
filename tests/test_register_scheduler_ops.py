@@ -66,10 +66,12 @@ if args[:3] == ["iam", "service-accounts", "describe"]:
 if args[:3] == ["iam", "service-accounts", "create"]:
     state["accounts"].append(args[3] + "@" + flag("--project") + ".iam.gserviceaccount.com"); save(); sys.exit(0)
 if args[:4] == ["iam", "service-accounts", "keys", "list"]:
+    if os.environ.get("OPS_TEST_KEYS_DENIED"): deny()
     print("\n".join(f"key{i}" for i in range(state["keys"]))); sys.exit(0)
 if args[:3] == ["run", "services", "describe"]:
     print(os.environ.get("OPS_TEST_API_URL", "")); sys.exit(0)
 if args[:3] == ["run", "services", "list"]:
+    if os.environ.get("OPS_TEST_LIST_DENIED"): deny()
     print("\n".join(sorted(state["run_policies"]))); sys.exit(0)
 if args[:3] == ["run", "services", "get-iam-policy"]:
     if os.environ.get("OPS_TEST_IAM_DENIED"): deny()
@@ -206,6 +208,10 @@ def test_check_reads_only_and_reports_each_state(tmp_path):
     assert verdict(denied.stdout) == "UNREADABLE" and "Verify from Cloud Shell" in denied.stdout
     iam = tree.run("setup-register-scheduler.sh", "--check", extra_env={**env, "OPS_TEST_IAM_DENIED": "1"})
     assert verdict(iam.stdout) == "UNREADABLE"
+    # A listing it cannot read never reads as "no extra grant" or "no key".
+    for unreadable in ("OPS_TEST_KEYS_DENIED", "OPS_TEST_LIST_DENIED"):
+        check = tree.run("setup-register-scheduler.sh", "--check", extra_env={**env, unreadable: "1"})
+        assert verdict(check.stdout) == "UNREADABLE", (unreadable, check.stdout)
     assert not [call for call in tree.tool_calls()[calls:] if MUTATING.search(call)]
     # Anything more than invoker on the API is a FAIL: on the project, on another service, a key.
     for widen in ({"project": [["roles/viewer", MEMBER]]},
@@ -245,9 +251,9 @@ def test_the_deploy_writes_the_scheduler_identity_from_the_operator_config(tmp_p
     assert tree.tool_calls() == []
     assert ("DRY-RUN: gcloud run services update test-api --region test-region --project test-project "
             f"--update-env-vars MILO_REGISTER_SCHEDULER_IDENTITY={SA}") in result.stdout
-    assert "SUMMARY|10b scheduler-identity|DRY-RUN|" in result.stdout
+    assert "SUMMARY|9b scheduler-identity|DRY-RUN|" in result.stdout
     order = [line.split("|")[1] for line in result.stdout.splitlines() if line.startswith("SUMMARY|")]
-    assert order.index("10 deployed-gate") < order.index("10b scheduler-identity") < order.index("11 website-stage")
+    assert order.index("9 worker-contract") < order.index("9b scheduler-identity") < order.index("10 deployed-gate")
 
 
 def test_the_kill_switch_closes_register_capture_on_the_api_so_ticks_skip(tmp_path):

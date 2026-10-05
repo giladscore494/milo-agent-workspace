@@ -339,7 +339,8 @@ threshold (360 MB of 400 MB at the defaults).
 One row per project in `register_sync_schedules` (migration
 `20261005000100`, service role only). The register is global: the earliest
 switch that is on drives the sync; any other is a standby. Every row gets
-every tick.
+every tick and the same pause and counters, so a second project's switch can
+neither hide a pause nor leave it, and Resume on any of them resumes all.
 
 ### The tick and its rules
 
@@ -365,8 +366,9 @@ writes `last_tick` and prints exactly one line:
 
 Counters, each finished sync counted once: a `throttled` stop adds one
 throttle; any other finish resets the throttles; a `completed` /
-`partial_success` sync resets the failures, any other ending adds one. A start
-the API refuses is a skip with its code (`SYNC_BUSY` for
+`partial_success` sync resets the failures, any other ending adds one, and so
+does a start whose job never triggered (`CATALOG_REGISTER_TRIGGER_FAILED`). A
+start the API refuses is a skip with its code (`SYNC_BUSY` for
 `CATALOG_REGISTER_BUSY`, else the refusal's own code). Each transition into a
 pause sends ONE Sentry event (the reason code only) when `SENTRY_DSN` is bound;
 the skips that follow send nothing.
@@ -396,7 +398,7 @@ holds `roles/run.invoker` on `milo-agent-api` and nothing else) and forwards
 the header; the API verifies it with the gateway's verifier (signature,
 issuer, audience, expiry, `email_verified`) and requires the email to equal
 `MILO_REGISTER_SCHEDULER_IDENTITY`, which `scripts/ops/deploy.sh` writes on the
-API from the operator configuration (step 10b). Missing or partial
+API from the operator configuration (step 9b). Missing or partial
 configuration, or that identity also listed as a gateway or worker identity,
 is 503 and nothing runs; any other token -- the gateway's included -- is 401.
 The route is in no gateway allowlist (`frontend/lib/server/gatewayPolicy.ts`).
@@ -408,7 +410,7 @@ ticks by closing `MILO_ENABLE_REGISTER_CAPTURE` (rule 1).
 1. **Migrations**: the *Deploy Supabase Migrations* workflow applies
    `20261005000100_register_sync_schedules.sql`.
 2. **Deploy production** (the release): sets
-   `MILO_REGISTER_SCHEDULER_IDENTITY` on the API (step 10b).
+   `MILO_REGISTER_SCHEDULER_IDENTITY` on the API (step 9b).
 3. **Setup**, once, from Cloud Shell, as the project owner:
 
    ```bash

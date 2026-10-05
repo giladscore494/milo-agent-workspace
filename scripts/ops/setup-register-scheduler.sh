@@ -78,11 +78,13 @@ roles_on() {  # roles_on ERRFILE SERVICE -- exit 2 when the policy cannot be rea
   python3 -c "$ROLES_PY" "$MEMBER" <<< "$policy"
 }
 extra_grants() {  # every grant but invoker on the API, as scope:role
-  local policy name
+  local policy name names
   policy="$(gcloud projects get-iam-policy "$PROJECT_ID" --format=json 2> /dev/null)" || return 1
+  names="$(gcloud run services list --region "$REGION" --project "$PROJECT_ID" \
+    --format='value(metadata.name)' 2> /dev/null)" || return 1
+  grep -qxF "$API_SERVICE" <<< "$names" || return 1  # a listing without the API proves nothing
   python3 -c "$ROLES_PY" "$MEMBER" <<< "$policy" | sed 's/^/project:/'
-  for name in $(gcloud run services list --region "$REGION" --project "$PROJECT_ID" \
-                  --format='value(metadata.name)' 2> /dev/null); do
+  for name in $names; do
     roles_on /dev/null "$name" > "$TMP.roles" || return 1
     [[ "$name" != "$API_SERVICE" ]] || sed -i "\|^${INVOKER}\$|d" "$TMP.roles"
     sed "s|^|service/${name}:|" "$TMP.roles"
@@ -109,7 +111,8 @@ if [[ "$MODE" == "check" ]]; then
     || { summary invoker GAP "${SA_ID} does not hold ${INVOKER} on ${API_SERVICE}"; drift="${drift} invoker"; }
   extra="$(extra_grants)" || verdict UNREADABLE "the project or service IAM policies are not readable by this identity. ${verify}"
   keys="$(gcloud iam service-accounts keys list --iam-account "$SA" --project "$PROJECT_ID" --managed-by user \
-    --format='value(name)' 2> /dev/null | grep -c . || true)"
+    --format='value(name)' 2> /dev/null)" || verdict UNREADABLE "the keys of ${SA_ID} are not readable by this identity. ${verify}"
+  keys="$(grep -c . <<< "$keys" || true)"
   [[ -z "$extra" ]] || verdict FAIL "${SA_ID} holds more than ${INVOKER} on ${API_SERVICE}: $(paste -sd, - <<< "$extra")"
   [[ "${keys:-0}" -eq 0 ]] || verdict FAIL "${SA_ID} has ${keys} user-managed key(s); it must have none"
   [[ -z "${drift// /}" ]] || verdict GAP "the tick is not fully set up (above). Run: bash scripts/ops/setup-register-scheduler.sh --apply"
@@ -159,13 +162,14 @@ if ! drift="$(job_drift "$TMP" "${url}${ROUTE}")"; then
 elif [[ -n "$drift" ]]; then
   step job UPDATE "${JOB_NAME} (${drift})" gcloud scheduler jobs update http "$JOB_NAME" "${flags[@]}"
   [[ "$drift" != *paused* || "$MODE" != "apply" ]] \
-    || gcloud scheduler jobs resume "$JOB_NAME" --location "$REGION" --project "$PROJECT_ID" > /dev/null 2>&1
+    || gcloud scheduler jobs resume "$JOB_NAME" --location "$REGION" --project "$PROJECT_ID" > /dev/null 2>&1 \
+    || { summary job FAIL "${JOB_NAME} could not be resumed"; exit 1; }
 else
   ok job "$wanted"
 fi
 
 if [[ "$MODE" == "apply" ]]; then
-  result="$(bash "$0" --check --operator-config "$CONFIG_PATH")"
+  result="$(bash "$0" --check --operator-config "$CONFIG_PATH")" || true
   printf '%s\n' "$result"
   grep -q '^SUMMARY|scheduler|PASS|' <<< "$result" || { summary setup FAIL "the tick did not read back as set up (above)"; exit 1; }
   summary setup PASS "set up; next: turn Auto sync on in the Register page"

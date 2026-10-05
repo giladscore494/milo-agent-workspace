@@ -507,3 +507,40 @@ def test_the_production_replay_converges_then_checks_daily():
     hours5 = (at - datetime(2026, 10, 5, 17, 7, tzinfo=UTC)) / H
     assert round(hours5, 2) == 29.08
     print(f"\nREPLAY|instant_syncs=backlog 0/0 after {hours:g} h|five_minute_syncs=after {hours5:.2f} h")
+
+
+# =============================================================================
+# review findings: the pause is global; a start that never ran is a failure
+# =============================================================================
+
+def test_a_second_projects_switch_neither_hides_nor_leaves_a_pause(sentry):
+    w = World()
+    w.switch("on")
+    for n in range(2):
+        w.tick(T0 + 2 * n * H)
+        w.finish(w.started()[-1], at=T0 + 2 * n * H, status="failed")
+    assert w.tick(T0 + 4 * H)["reason"] == "SYNC_PAUSED_FAILING"
+    theirs = str(uuid4())
+    w.repo.seed_project(theirs, f"p-{theirs[:8]}", "P", [str(USER)], workflow_key="swarm_v2")
+    conversation = w.repo.create_conversation(UUID(theirs), "b", USER)["id"]
+    autosync.set_switch(w.repo, USER, UUID(theirs), action="on", conversation_id=UUID(conversation))
+    page_b = autosync.view(w.repo, UUID(theirs))
+    assert page_b["paused_reason"] == "SYNC_PAUSED_FAILING"
+    assert page_b["next"]["reason"] == "SYNC_PAUSED_FAILING"
+    w.switch("off")  # B drives now: still paused
+    assert w.tick(T0 + 5 * H)["reason"] == "SYNC_PAUSED_FAILING" and len(w.started()) == 2
+    autosync.set_switch(w.repo, USER, UUID(theirs), action="resume", conversation_id=UUID(conversation))
+    assert all(row["paused_reason"] is None for row in w.repo.register_sync_schedules())
+    assert w.tick(T0 + 6 * H)["decision"] == "start" and sentry == ["SYNC_PAUSED_FAILING"]
+
+
+def test_a_start_whose_job_never_triggers_counts_as_a_failure(sentry):
+    from backend.catalog.scope import prepare_trigger as trig
+
+    w = World()
+    w.trigger.state = trig.TRIGGER_FAILED
+    w.switch("on")
+    reasons = [w.tick(T0 + n * H)["reason"] for n in range(3)]
+    assert reasons == ["CATALOG_REGISTER_TRIGGER_FAILED", "CATALOG_REGISTER_TRIGGER_FAILED",
+                       "SYNC_PAUSED_FAILING"] and sentry == ["SYNC_PAUSED_FAILING"]
+

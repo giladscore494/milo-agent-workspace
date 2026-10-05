@@ -36,8 +36,8 @@ export function AutoSyncSection({ autoSync, busy, hasConversation, onSwitch }: {
       )}
       {autoSync.enabled && autoSync.schedulerStale && (
         <p className="alert" role="alert">
-          Scheduler not ticking: no tick for over 2 hours while Auto sync is on. Check the Cloud Scheduler job
-          (bash scripts/ops/setup-register-scheduler.sh --check).
+          Scheduler not ticking: no tick recorded for over 2 hours while Auto sync is on (the job is not
+          ticking, or every tick fails). Check bash scripts/ops/setup-register-scheduler.sh --check and the API log.
         </p>
       )}
       {autoSync.dbWarning && (

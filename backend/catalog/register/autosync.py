@@ -43,6 +43,10 @@ _SUCCEEDED = ("completed", "partial_success")
 _BACKLOG = re.compile(r"\|backlog=(\d+)/(\d+)(?:\||$)")
 _CODE = re.compile(r"^[A-Z][A-Z0-9_]{2,79}$")
 _TICK_FIELDS = ("at", "decision", "reason", "backlog", "db_mb", "warning")
+#: The register is global: every row carries the same pause and counters (a
+#: second project's switch can neither hide a pause nor leave it).
+_SHARED = ("paused_reason", "paused_at", "resumed_at", "consecutive_throttles", "consecutive_failures",
+           "counted_run_id")
 
 
 def _time(value: Any) -> datetime | None:
@@ -133,6 +137,13 @@ def _driving(rows: list[Mapping[str, Any]]) -> Mapping[str, Any] | None:
     return min(on, key=lambda row: str(row.get("enabled_at") or "")) if on else None
 
 
+def _shared(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """The global state: a paused row's if any, else the newest-ticked row's."""
+    source = next((row for row in rows if row.get("paused_reason")), None) or max(
+        rows, key=lambda row: str((row.get("last_tick") or {}).get("at") or ""), default={})
+    return {key: source.get(key) for key in _SHARED if source.get(key) is not None}
+
+
 def _db_mb(db_bytes: int | None) -> str:
     return "-" if db_bytes is None else f"{db_bytes / 1_000_000:.1f}"
 
@@ -173,15 +184,17 @@ def tick(repo: Any, *, trigger: Any, env: Mapping[str, str] | None = None,
                     action = SKIP
                     reason = ("SYNC_BUSY" if refused.code == "CATALOG_REGISTER_BUSY"
                               else refused.code if _CODE.fullmatch(str(refused.code)) else "SYNC_START_REFUSED")
-        state = {key: schedule.get(key) for key in ("consecutive_throttles", "consecutive_failures",
-                                                     "counted_run_id", "paused_reason", "paused_at")
-                 if schedule.get(key) != before.get(key)}
+                    if refused.code == "CATALOG_REGISTER_TRIGGER_FAILED":  # a start that never ran: a failure
+                        schedule["consecutive_failures"] = int(schedule.get("consecutive_failures") or 0) + 1
+        state = {key: schedule.get(key) for key in _SHARED}
+        current = repo.register_sync_schedule(UUID(str(driving["project_id"]))) or {}
+        if current.get("resumed_at") != before.get("resumed_at"):
+            state = {}  # the owner pressed Resume during this tick: theirs wins
     left = "unknown" if last is None or last.get("backlog") is None else f"{last['backlog']}/{last['backlog_rows']}"
     record = {"at": now.isoformat(), "decision": START if action == START else SKIP, "reason": reason,
               "backlog": left, "db_mb": _db_mb(db_bytes), "warning": warning}
     for row in rows:
-        project = UUID(str(row["project_id"]))
-        repo.update_register_sync_schedule(project, {**(state if row is driving else {}), "last_tick": record})
+        repo.update_register_sync_schedule(UUID(str(row["project_id"])), {**state, "last_tick": record})
     print("SYNC_TICK|" + "|".join(f"{key}={record[key]}" for key in _TICK_FIELDS[1:5])
           + (f"|warning={warning}" if warning else ""), flush=True)
     return record
@@ -198,8 +211,8 @@ def set_switch(repo: Any, user_id: UUID, project_id: UUID, *, action: str, conve
     service._authorized_conversation(repo, user_id, project_id, conversation_id)
     if action == "on":
         repo.upsert_register_sync_schedule(project_id, {
-            "enabled": True, "enabled_by": str(user_id), "conversation_id": str(conversation_id),
-            "enabled_at": now.isoformat()})
+            **_shared(repo.register_sync_schedules()), "enabled": True, "enabled_by": str(user_id),
+            "conversation_id": str(conversation_id), "enabled_at": now.isoformat()})
     elif action == "off":
         if repo.register_sync_schedule(project_id) is not None:
             repo.update_register_sync_schedule(project_id, {"enabled": False})
@@ -210,9 +223,11 @@ def set_switch(repo: Any, user_id: UUID, project_id: UUID, *, action: str, conve
                     >= register_config.load(environment).capacity_limit_bytes:
                 raise AppError("SYNC_RESUME_OVER_CAPACITY", "the database is still above its capacity "
                                "threshold: run Register retention with mode vacuum-full first", 409)
-            repo.update_register_sync_schedule(project_id, {
-                "paused_reason": None, "paused_at": None, "resumed_at": now.isoformat(),
-                "consecutive_failures": 0})
+            last = last_attempt(repo)
+            for other in repo.register_sync_schedules():  # the pause is global, and so is Resume
+                repo.update_register_sync_schedule(UUID(str(other["project_id"])), {
+                    "paused_reason": None, "paused_at": None, "resumed_at": now.isoformat(),
+                    "consecutive_failures": 0, **({"counted_run_id": last["run_id"]} if last else {})})
     else:
         raise AppError("SYNC_SWITCH_INVALID", "the action must be on, off or resume", 422)
     return view(repo, project_id, env=environment, now=now)
