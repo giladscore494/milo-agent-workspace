@@ -1277,6 +1277,10 @@ def test_only_the_reviewed_pr3_seams_import_the_government_package():
         # own client, lease and gates; the in-memory mirror reads the
         # directory's version function.
         "backend/catalog/register/capture.py",
+        # PR-SYNC-1: the register sync -- run ONLY inside that entrypoint's sync
+        # mode, with the entrypoint's own client; it wraps the transport the
+        # entrypoint opened (a request meter) and constructs none.
+        "backend/catalog/register/sync.py",
         "backend/testing/register_memory.py",
         # PR-HYG P27: the in-memory mirror of the work-scope queue build reads
         # the ONE placeholder rule (`is_placeholder_identity`), as the SQL does.
