@@ -2547,8 +2547,22 @@ class SupabaseRepository:
 
     # -- PR-SYNC-2: the auto sync schedule (migration 20261005000100) ------
     def register_sync_schedules(self) -> list[dict[str, Any]]:
-        return self._many(self.client.table("register_sync_schedules").select("*")
-                          .order("project_id").limit(100))
+        """Every schedule, keyset-paginated so the global state is never row-capped."""
+        rows: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            query = (self.client.table("register_sync_schedules").select("*")
+                     .order("project_id").limit(1000))
+            if after is not None:
+                query = query.gt("project_id", after)
+            page = self._many(query)
+            rows.extend(page)
+            if len(page) < 1000:
+                return rows
+            tail = str(page[-1].get("project_id") or "")
+            if not tail or tail == after:
+                raise AppError("REPOSITORY_ERROR", "register sync schedule pagination did not advance", 502)
+            after = tail
 
     def register_sync_schedule(self, project_id: UUID) -> dict[str, Any] | None:
         rows = self._many(self.client.table("register_sync_schedules").select("*")
