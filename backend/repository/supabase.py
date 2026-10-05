@@ -257,6 +257,11 @@ class Repository(Protocol):
     def register_snapshot_archive(self, snapshot_id: str) -> dict[str, Any] | None: ...
     def count_catalog_raw_records(self, snapshot_id: str) -> int: ...
     def catalog_database_bytes(self) -> int: ...
+    # PR-SYNC-2: the auto sync schedule (20261005000100_register_sync_schedules.sql).
+    def register_sync_schedules(self) -> list[dict[str, Any]]: ...
+    def register_sync_schedule(self, project_id: UUID) -> dict[str, Any] | None: ...
+    def upsert_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None: ...
+    def update_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None: ...
     def prunable_register_snapshots(self) -> list[dict[str, Any]]: ...
     def prune_register_snapshots(self, snapshot_keys: list[str], digest: str) -> dict[str, Any]: ...
     # PR-L2: payload compaction.
@@ -2539,6 +2544,41 @@ class SupabaseRepository:
         if not isinstance(data, int) or isinstance(data, bool) or data < 0:
             raise AppError("REPOSITORY_ERROR", "database size is unreadable", 502)
         return data
+
+    # -- PR-SYNC-2: the auto sync schedule (migration 20261005000100) ------
+    def register_sync_schedules(self) -> list[dict[str, Any]]:
+        """Every schedule, keyset-paginated so the global state is never row-capped."""
+        rows: list[dict[str, Any]] = []
+        after: str | None = None
+        while True:
+            query = (self.client.table("register_sync_schedules").select("*")
+                     .order("project_id").limit(1000))
+            if after is not None:
+                query = query.gt("project_id", after)
+            page = self._many(query)
+            rows.extend(page)
+            if len(page) < 1000:
+                return rows
+            tail = str(page[-1].get("project_id") or "")
+            if not tail or tail == after:
+                raise AppError("REPOSITORY_ERROR", "register sync schedule pagination did not advance", 502)
+            after = tail
+
+    def register_sync_schedule(self, project_id: UUID) -> dict[str, Any] | None:
+        rows = self._many(self.client.table("register_sync_schedules").select("*")
+                          .eq("project_id", str(project_id)).limit(1))
+        return rows[0] if rows else None
+
+    def upsert_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None:
+        """The owner's switch: only the named columns change (the tick's state stays)."""
+        self._many(self.client.table("register_sync_schedules").upsert(
+            {**fields, "project_id": str(project_id), "updated_at": datetime.now(UTC).isoformat()},
+            on_conflict="project_id"))
+
+    def update_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None:
+        """Only the named columns of an existing row; a missing row stays missing."""
+        self._many(self.client.table("register_sync_schedules").update(
+            {**fields, "updated_at": datetime.now(UTC).isoformat()}).eq("project_id", str(project_id)))
 
     def prunable_register_snapshots(self) -> list[dict[str, Any]]:
         """The whole prunable list, as ONE jsonb document (never row-capped):

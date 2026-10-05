@@ -374,6 +374,25 @@ case "$ARCHIVE_CHECK" in
        "${ARCHIVE_CHECK#* } Remediation: bash scripts/ops/setup-register-archive.sh --apply" ;;
 esac
 
+# PR-SYNC-2: the register sync's hourly tick (scripts/ops/setup-register-
+# scheduler.sh --check, read-only): the Cloud Scheduler job exists and targets
+# the API's tick route with the gateway audience, and its own account holds
+# roles/run.invoker on the API only. Until the operator sets it up, or when
+# this identity cannot read it, this is a WARN: the deploy does not depend on
+# it (Auto sync then never starts). An account holding more is BLOCKED.
+SCHEDULER_CHECK="$(bash "${REPO_ROOT}/scripts/ops/setup-register-scheduler.sh" --check \
+  --operator-config "$CONFIG_PATH" 2> /dev/null | grep '^SUMMARY|scheduler|' | tail -n 1 \
+  || printf 'SUMMARY|scheduler|UNREADABLE|the check did not run')"
+SCHEDULER_RESULT="$(cut -d'|' -f3 <<< "$SCHEDULER_CHECK")"
+SCHEDULER_DETAIL="$(cut -d'|' -f4- <<< "$SCHEDULER_CHECK")"
+case "$SCHEDULER_RESULT" in
+  PASS) record_check PASS "scheduler:register-sync-tick" "$SCHEDULER_DETAIL" ;;
+  FAIL) record_check BLOCKED "scheduler:register-sync-tick" \
+       "${SCHEDULER_DETAIL} Remediation: remove the extra grant(s) or key(s), then bash scripts/ops/setup-register-scheduler.sh --check" ;;
+  UNREADABLE) record_check WARN "scheduler:register-sync-tick" "not verifiable with this identity (${SCHEDULER_DETAIL})" ;;
+  *) record_check WARN "scheduler:register-sync-tick" "${SCHEDULER_DETAIL:-not set up} (Auto sync never starts until it is)" ;;
+esac
+
 # Gateway / frontend binding. The Vercel gateway reaches the API through
 # workload identity federation, so the API URL and the impersonated identity
 # both have to be known before the website can talk to the backend at all.

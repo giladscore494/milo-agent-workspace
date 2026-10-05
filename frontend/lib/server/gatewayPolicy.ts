@@ -174,10 +174,12 @@ const EXECUTION_RULES: GatewayRule[] = [
   // backend gates it again (MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS).
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/preparations$`, 'i') },
   // PR-D1: capture register tozars, and refresh the register directory
-  // (PR-SYNC-1: or run one incremental sync). The
-  // API executes the capture job; nothing starts a run, so neither is a
-  // run-start rule. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE).
-  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory|sync)$`, 'i') },
+  // (PR-SYNC-1: or run one incremental sync; PR-SYNC-2: the Auto sync switch).
+  // The API executes the capture job; nothing starts a run, so none is a
+  // run-start rule. The backend gates each again (MILO_ENABLE_REGISTER_CAPTURE).
+  // The Cloud Scheduler tick (/internal/register/sync-tick) is deliberately in
+  // NO rule here: only the scheduler's own identity may call it.
+  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory|sync|auto-sync)$`, 'i') },
   // PR-D3: the ONE guarded model call (its own job; not a run) and the
   // owner's approval or rejection. The backend gates each again
   // (MILO_ENABLE_REGISTER_CAPTURE, and MILO_ENABLE_MANUFACTURER_NORMALISATION

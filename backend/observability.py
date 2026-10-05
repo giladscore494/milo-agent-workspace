@@ -286,6 +286,21 @@ def report_run_failed(run_id: Any, code: Any, workflow_key: Any = None) -> bool:
         return False
 
 
+def report_sync_paused(code: Any) -> bool:
+    """PR-SYNC-2: one event when the register's auto sync pauses itself.
+    Carries the static reason code only."""
+    if not _enabled:
+        return False
+    try:
+        import sentry_sdk
+        with sentry_sdk.new_scope() as scope:
+            scope.set_tag("error_code", safe_code(code))
+            sentry_sdk.capture_message("register auto sync paused", level="warning")
+        return True
+    except Exception:
+        return False
+
+
 def report_exception(exc: BaseException) -> bool:
     """Report an exception that is about to end the process (type and stack only)."""
     if not _enabled:

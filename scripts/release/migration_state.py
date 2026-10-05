@@ -110,6 +110,8 @@ MARKERS: dict[str, tuple[str, str]] = {
     "20261002000200": ("function", "catalog_candidate_register_reading"),
     # PR-D3 manufacturer normalisation.
     "20261003000100": ("table", "catalog_manufacturer_normalization_versions"),
+    # PR-SYNC-2 the register auto sync schedule.
+    "20261005000100": ("table", "register_sync_schedules"),
 }
 
 STATES = ("empty-schema", "legacy-baseline", "partially-migrated", "fully-migrated", "drift", "unrecognized")

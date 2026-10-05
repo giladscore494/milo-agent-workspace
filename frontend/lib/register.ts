@@ -43,8 +43,27 @@ export type RegisterCapacity = {
 /** PR-SYNC-1: the last sync's summary fields, in the server's order. */
 export type SyncField = { name: string; value: string };
 
+/** PR-SYNC-2: the Auto sync block -- the switch, a pause and its next step, the ticks. */
+export type AutoSyncTick = {
+  at: string; decision: 'start' | 'skip'; reason: string; backlog: string; dbMb: string; warning?: string;
+};
+
+export type AutoSync = {
+  enabled: boolean;
+  pausedReason?: string;
+  pausedAt?: string;
+  nextStep?: string;
+  consecutiveThrottles: number;
+  consecutiveFailures: number;
+  lastTick?: AutoSyncTick;
+  next: { decision: 'start' | 'skip'; reason: string };
+  schedulerStale: boolean;
+  dbWarning: boolean;
+};
+
 export type RegisterView = {
   canCapture: boolean;
+  autoSync?: AutoSync;
   canRefreshDirectory: boolean;
   canSync: boolean;
   lastSync?: { fields: SyncField[]; finishedAt?: string };
@@ -147,6 +166,52 @@ export function parseSyncSummary(line: unknown): SyncField[] | undefined {
   return fields.map(({ name, value }) => ({ name, value }));
 }
 
+const DECISIONS: ReadonlySet<string> = new Set(['start', 'skip']);
+const TICK_VALUE = /^[A-Za-z0-9./-]{1,40}$/;
+
+function shortText(value: unknown, max: number): string | undefined {
+  return typeof value === 'string' && value.length >= 1 && value.length <= max ? value : undefined;
+}
+
+/** The Auto sync block, or `undefined` (the page then shows no Auto sync control). */
+export function parseAutoSync(body: unknown): AutoSync | undefined {
+  const source = asObject(body);
+  const next = asObject(source.next);
+  const throttles = count(source.consecutive_throttles);
+  const failures = count(source.consecutive_failures);
+  if (typeof source.enabled !== 'boolean' || typeof source.scheduler_stale !== 'boolean'
+      || typeof source.db_warning !== 'boolean' || throttles === undefined || failures === undefined
+      || typeof next.decision !== 'string' || !DECISIONS.has(next.decision)
+      || typeof next.reason !== 'string' || !CODE.test(next.reason)) {
+    return undefined;
+  }
+  const out: AutoSync = {
+    enabled: source.enabled, consecutiveThrottles: throttles, consecutiveFailures: failures,
+    next: { decision: next.decision as 'start' | 'skip', reason: next.reason },
+    schedulerStale: source.scheduler_stale, dbWarning: source.db_warning,
+  };
+  if (source.paused_reason !== null && source.paused_reason !== undefined) {
+    if (typeof source.paused_reason !== 'string' || !CODE.test(source.paused_reason)) return undefined;
+    out.pausedReason = source.paused_reason;
+    out.pausedAt = shortText(source.paused_at, 64);
+    out.nextStep = shortText(source.next_step, 400);
+  }
+  if (source.last_tick !== null && source.last_tick !== undefined) {
+    const tick = asObject(source.last_tick);
+    const at = shortText(tick.at, 64);
+    if (at === undefined || typeof tick.decision !== 'string' || !DECISIONS.has(tick.decision)
+        || typeof tick.reason !== 'string' || !CODE.test(tick.reason)
+        || typeof tick.backlog !== 'string' || !TICK_VALUE.test(tick.backlog)
+        || typeof tick.db_mb !== 'string' || !TICK_VALUE.test(tick.db_mb)) {
+      return undefined;
+    }
+    out.lastTick = { at, decision: tick.decision as 'start' | 'skip', reason: tick.reason,
+      backlog: tick.backlog, dbMb: tick.db_mb };
+    if (typeof tick.warning === 'string' && CODE.test(tick.warning)) out.lastTick.warning = tick.warning;
+  }
+  return out;
+}
+
 /** The Register page, or `undefined` when the body is not the expected shape. */
 export function parseRegister(body: unknown): RegisterView | undefined {
   const source = asObject(body);
@@ -194,6 +259,7 @@ export function parseRegister(body: unknown): RegisterView | undefined {
     canCapture: source.can_capture,
     canRefreshDirectory: source.can_refresh_directory,
     canSync: source.can_sync === true,
+    autoSync: parseAutoSync(source.auto_sync),
     lastSync: syncFields && { fields: syncFields,
       finishedAt: typeof lastSyncRaw.finished_at === 'string' ? lastSyncRaw.finished_at.slice(0, 64) : undefined },
     directory,
@@ -251,3 +317,18 @@ export function formatBytes(bytes: number): string {
 export function formatCount(value: number): string {
   return value.toLocaleString('en-US');
 }
+
+/** PR-SYNC-2: each tick reason in a few words (an unknown code shows as itself). */
+export const AUTO_SYNC_REASON_COPY: Readonly<Record<string, string>> = {
+  SYNC_FIRST: 'no sync has run yet',
+  SYNC_BACKLOG: 'backlog left, an hour since the last sync',
+  SYNC_DAILY_CHECK: 'complete; the daily change check',
+  SYNC_NOT_DUE: 'not due yet',
+  SYNC_BUSY: 'a capture, refresh or sync is running',
+  SYNC_COOLING_DOWN: 'cooling down after a firewall block',
+  SYNC_AUTO_OFF: 'Auto sync is off',
+  SYNC_REGISTER_DISABLED: 'register capture is off on the server',
+  SYNC_PAUSED_CAPACITY: 'the database reached its capacity threshold',
+  SYNC_PAUSED_FAILING: 'two syncs in a row failed',
+};
+

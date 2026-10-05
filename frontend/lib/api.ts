@@ -190,6 +190,13 @@ export const api = {
       body: JSON.stringify({ conversation_id: conversationId }),
     }),
 
+  /** PR-SYNC-2: the Register page's Auto sync switch (on / off / resume); answers the Auto sync block. */
+  setRegisterAutoSync: (projectId: string, action: 'on' | 'off' | 'resume', conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/auto-sync`, {
+      method: 'POST',
+      body: JSON.stringify({ action, conversation_id: conversationId }),
+    }),
+
   /**
    * The conversation's durable run history, newest first and bounded by the
    * server. It is what lets a completed result outlive session storage: after

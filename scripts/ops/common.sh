@@ -103,6 +103,16 @@ ops_load_config() {
   fi
 }
 
+# PR-SYNC-2: the register sync's Cloud Scheduler identity -- one fixed account
+# per project, created by setup-register-scheduler.sh, written onto the API by
+# deploy.sh (MILO_REGISTER_SCHEDULER_IDENTITY). Never typed by hand.
+ops_register_scheduler_account_id() {
+  printf 'milo-register-scheduler'
+}
+ops_register_scheduler_identity() {
+  printf '%s@%s.iam.gserviceaccount.com' "$(ops_register_scheduler_account_id)" "$PROJECT_ID"
+}
+
 # ops_live_runs — the number of non-terminal runs, on stdout. The same
 # statement production-verify.sh's RUNS_QUIESCENT runs, read-only. The URL is
 # read from the named variable and never printed; psql's stderr is dropped

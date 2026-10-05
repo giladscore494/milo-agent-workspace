@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import {
+  REGISTER_AUTO_SYNC_FALLBACK,
   REGISTER_CAPTURE_FALLBACK,
   REGISTER_DIRECTORY_FALLBACK,
   REGISTER_READ_FALLBACK,
@@ -21,6 +22,7 @@ import {
   parseRegister,
 } from '@/lib/register';
 import { safeText } from '@/lib/sanitize';
+import { AutoSyncAction, AutoSyncSection } from './AutoSyncSection';
 import { NormalisationClient, NormalisationSection } from './NormalisationSection';
 
 const normalisationClient: NormalisationClient = {
@@ -37,6 +39,8 @@ export type RegisterClient = {
   requestDirectory: (projectId: string, conversationId: string) => Promise<unknown>;
   /** PR-SYNC-1: one incremental sync (optional, so older test clients still type-check). */
   requestSync?: (projectId: string, conversationId: string) => Promise<unknown>;
+  /** PR-SYNC-2: the Auto sync switch (optional, like requestSync). */
+  setAutoSync?: (projectId: string, action: AutoSyncAction, conversationId: string) => Promise<unknown>;
 };
 
 /** The workspace's own API client, read at call time. */
@@ -46,6 +50,7 @@ const defaultClient: RegisterClient = {
     api.requestRegisterCapture(projectId, version, tozars, conversationId),
   requestDirectory: (projectId, conversationId) => api.requestRegisterDirectory(projectId, conversationId),
   requestSync: (projectId, conversationId) => api.requestRegisterSync(projectId, conversationId),
+  setAutoSync: (projectId, action, conversationId) => api.setRegisterAutoSync(projectId, action, conversationId),
 };
 
 export type RegisterPanelProps = {
@@ -171,6 +176,23 @@ export function RegisterPanel({ projectId, conversationId, client = defaultClien
     }
   };
 
+  const switchAutoSync = async (action: AutoSyncAction) => {
+    if (!conversationId || busy || !client.setAutoSync) return;
+    setBusy(true);
+    setActionError('');
+    setRefusedCapacity(undefined);
+    setNotice('');
+    try {
+      await client.setAutoSync(projectId, action, conversationId);
+      setNotice(action === 'on' ? 'Auto sync is on.' : action === 'off' ? 'Auto sync is off.' : 'Auto sync resumed.');
+    } catch (error) {
+      setActionError(safeErrorText(error, REGISTER_AUTO_SYNC_FALLBACK));
+    } finally {
+      setBusy(false);
+      await load(projectId);
+    }
+  };
+
   return (
     <section className="panel register-panel" aria-labelledby="register-title">
       <header className="catalog-review-head">
@@ -208,6 +230,7 @@ export function RegisterPanel({ projectId, conversationId, client = defaultClien
                 onCapture={(tozars) => void capture(tozars)}
                 onRefresh={() => void start(false)}
                 onSync={client.requestSync ? () => void start(true) : undefined}
+                onAutoSync={client.setAutoSync ? (action) => void switchAutoSync(action) : undefined}
                 onReload={() => void load(projectId)}
               />
             )}
@@ -232,11 +255,12 @@ type BodyProps = {
   onCapture: (tozars: string[]) => void;
   onRefresh: () => void;
   onSync?: () => void;
+  onAutoSync?: (action: AutoSyncAction) => void;
   onReload: () => void;
 };
 
 function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, busy, onToggle, onCapture,
-  onRefresh, onSync, onReload }: BodyProps) {
+  onRefresh, onSync, onAutoSync, onReload }: BodyProps) {
   const version = view.directory?.registerVersion;
   const selectedRows = selectedUnits.reduce((sum, item) => sum + item.expectedRows, 0);
   const fits = groupFits(selectedUnits, view.groupMaxRows);
@@ -273,6 +297,9 @@ function RegisterBody({ view, selected, selectedUnits, canAct, hasConversation, 
             <div key={field.name}><dt>{field.name}</dt><dd>{field.value}</dd></div>
           ))}
         </dl>
+      )}
+      {view.autoSync && (
+        <AutoSyncSection autoSync={view.autoSync} busy={busy} hasConversation={hasConversation} onSwitch={onAutoSync} />
       )}
       {!hasConversation && view.canCapture && (
         <p className="note">Open a conversation of this project to capture: each capture is recorded under it.</p>

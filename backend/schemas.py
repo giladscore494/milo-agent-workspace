@@ -1091,6 +1091,15 @@ class RegisterDirectoryRequest(BaseModel):
     conversation_id: UUID
 
 
+class RegisterAutoSyncRequest(BaseModel):
+    """PR-SYNC-2: the Register page's Auto sync switch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(pattern=r"^(on|off|resume)$")
+    conversation_id: UUID
+
+
 # --- PR-D3: manufacturer normalisation ----------------------------------------
 
 class NormalisationRequest(BaseModel):

@@ -23,6 +23,8 @@
 #   8. model env: the reviewed worker model names, set and read back
 #   9. worker contract: MILO_CAPTURE_REPLAY=false, and no provider key bound
 #      (permanent mode: the key is expected and reported, never removed)
+#   9b. the register sync tick's accepted caller (MILO_REGISTER_SCHEDULER_IDENTITY,
+#      milo-register-scheduler@<GCP_PROJECT_ID>) set on the API and read back
 #  10. production-verify.sh --gate deployed for that SHA
 #  11. only once 1-10 PASSED, and not in permanent mode: turn the website's
 #      plan tools back on (--restore-website-stage, scripts/ops/website-stage.sh)
@@ -262,6 +264,33 @@ else
     ops_fail "a provider key is bound to the worker at Stage A: ${bound[*]}" "9 worker-contract"
   fi
   summary "9 worker-contract" PASS "${MILO_REPLAY_CAPTURE_FLAG_NAME}=false; provider key bound: ${bound[*]:-none}"
+fi
+
+# 9b. PR-SYNC-2: the register sync tick's ONE accepted caller, set on the API
+#     from the operator configuration (GCP_PROJECT_ID; the account itself is
+#     created by setup-register-scheduler.sh) and read back, BEFORE the
+#     deployed gate verifies the revision it rolls. Never by hand.
+SCHEDULER_PAIR="MILO_REGISTER_SCHEDULER_IDENTITY=$(ops_register_scheduler_identity)"
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  ops_run gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "$SCHEDULER_PAIR"
+  summary "9b scheduler-identity" DRY-RUN "would set ${SCHEDULER_PAIR%%=*} on ${API_SERVICE} and read it back"
+else
+  gcloud run services update "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --update-env-vars "$SCHEDULER_PAIR" > /dev/null 2>&1 \
+    || ops_fail "${SCHEDULER_PAIR%%=*} could not be set on ${API_SERVICE}" "9b scheduler-identity"
+  readback="$(gcloud run services describe "$API_SERVICE" --region "$REGION" --project "$PROJECT_ID" \
+    --format=json 2> /dev/null | python3 -c '
+import json, sys
+doc = json.load(sys.stdin)
+for container in ((doc.get("spec") or {}).get("template") or {}).get("spec", {}).get("containers") or []:
+    for entry in container.get("env") or []:
+        if entry.get("name") == "MILO_REGISTER_SCHEDULER_IDENTITY":
+            print(entry.get("value") or "")
+' 2> /dev/null || true)"
+  [[ "$readback" == "${SCHEDULER_PAIR#*=}" ]] \
+    || ops_fail "${SCHEDULER_PAIR%%=*} did not read back on ${API_SERVICE}" "9b scheduler-identity"
+  summary "9b scheduler-identity" PASS "${SCHEDULER_PAIR%%=*} set on ${API_SERVICE} and read back"
 fi
 
 # 10. The deployed gate, for this exact SHA.

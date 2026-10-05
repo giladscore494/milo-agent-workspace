@@ -191,6 +191,10 @@ UNFENCED_BY_DESIGN = {
     # recorded by the operator path with no run (idempotent: the same object
     # answers the existing row, another one conflicts).
     "record_register_snapshot_archive_from_database",
+    # PR-SYNC-2: the Auto sync switch is the owner's, written by the API from
+    # the Register page (membership-authorized like a sync); no worker ever
+    # writes it and it is not run state.
+    "upsert_register_sync_schedule",
     # Lease-optional by contract, checked completely whenever one IS supplied:
     # these predate the lease contract and the worker always passes one.
     "append_run_event", "save_checkpoint", "update_run_usage",

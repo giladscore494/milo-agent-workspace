@@ -293,6 +293,44 @@ class RegisterMemoryMixin:
     def catalog_database_bytes(self) -> int:
         return int(self.register_database_bytes)
 
+    # -- PR-SYNC-2: the auto sync schedule (20261005000100) ----------------------------
+    _SCHEDULE_DEFAULTS = {"enabled": False, "enabled_by": None, "conversation_id": None, "enabled_at": None,
+                          "paused_reason": None, "paused_at": None, "resumed_at": None,
+                          "consecutive_throttles": 0, "consecutive_failures": 0, "counted_run_id": None,
+                          "last_tick": None}
+
+    def _schedules(self) -> dict[str, dict[str, Any]]:
+        return self._register_state().setdefault("schedules", {})
+
+    def register_sync_schedules(self) -> list[dict[str, Any]]:
+        return [json.loads(json.dumps(row)) for _key, row in sorted(self._schedules().items())]
+
+    def register_sync_schedule(self, project_id: UUID) -> dict[str, Any] | None:
+        row = self._schedules().get(str(project_id))
+        return json.loads(json.dumps(row)) if row else None
+
+    def _write_schedule(self, project_id: UUID, fields: dict[str, Any], *, create: bool) -> None:
+        with self.lock:
+            current = self._schedules().get(str(project_id))
+            if current is None and not create:
+                return
+            row = {**(current or {"project_id": str(project_id), **self._SCHEDULE_DEFAULTS}),
+                   **json.loads(json.dumps(fields)), "updated_at": _now()}
+            # The table's CHECK constraints.
+            if row["enabled"] and not (row["enabled_by"] and row["conversation_id"]):
+                raise AppError("REPOSITORY_ERROR", "register_sync_schedules_switch_complete", 502)
+            if row["paused_reason"] not in (None, "SYNC_PAUSED_CAPACITY", "SYNC_PAUSED_FAILING"):
+                raise AppError("REPOSITORY_ERROR", "register_sync_schedules_paused_reason", 502)
+            if min(int(row["consecutive_throttles"]), int(row["consecutive_failures"])) < 0:
+                raise AppError("REPOSITORY_ERROR", "register_sync_schedules_counters", 502)
+            self._schedules()[str(project_id)] = row
+
+    def upsert_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None:
+        self._write_schedule(project_id, fields, create=True)
+
+    def update_register_sync_schedule(self, project_id: UUID, fields: dict[str, Any]) -> None:
+        self._write_schedule(project_id, fields, create=False)
+
     # -- retention ----------------------------------------------------------------------
     def _prunable(self) -> list[dict[str, Any]]:
         referenced_ids: set[str] = set()
