@@ -169,6 +169,7 @@ import re
 import sys
 import threading
 import time
+from dataclasses import replace
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
@@ -202,6 +203,7 @@ from backend.run_identity import (
 from backend.production_config import TRUE_VALUES
 from backend.runtime import TERMINAL_STATES, CancellationRequested
 from backend.catalog.register import normalization
+from backend.catalog.register import sync as register_sync
 from backend.catalog.register.capture import (REGISTER_CAPTURE_REASONS, RegisterCaptureError,
                                               capture_group as register_capture_group,
                                               refresh_directory as register_refresh_directory)
@@ -297,6 +299,7 @@ NORMALISATION_ARGUMENTS: tuple[tuple[str, str], ...] = (
 REGISTER_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("register_group_id", "--register-group-id"),
     ("register_directory", "--register-directory"),
+    ("register_sync", "--register-sync"),
 )
 #: The three arguments of the scoped mode. All three or none.
 WORK_SCOPE_ARGUMENTS: tuple[tuple[str, str], ...] = (
@@ -406,7 +409,7 @@ CAPTURE_REASONS: Mapping[str, str] = {
         "scoped work-scope preparation is not enabled for this process",
     # PR-D1: the register modes (directory refresh, group capture).
     "CAPTURE_REGISTER_ARGUMENTS_INVALID":
-        "register capture needs exactly one of a group id (a UUID) or a directory refresh",
+        "register capture needs exactly one of a group id (a UUID), a directory refresh or a sync",
     "CAPTURE_REGISTER_CAPTURE_DISABLED":
         "register capture is not enabled for this execution",
     # PR-D3: the manufacturer normalisation mode (one guarded model call).
@@ -565,6 +568,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="--execute only: capture this register capture group (PR-D1)")
     parser.add_argument("--register-directory", action="store_true", default=None,
                         help="--execute only: refresh the register directory (PR-D1)")
+    parser.add_argument("--register-sync", action="store_true", default=None,
+                        help="--execute only: one incremental register sync (PR-SYNC-1)")
     parser.add_argument("--normalisation-claim", action="store_true", default=None,
                         help="--execute only: claim the requested normalisation and make its ONE "
                              "guarded model call (PR-D3; the normalisation job's fixed mode)")
@@ -755,11 +760,15 @@ def _refusal(args: argparse.Namespace, extra: Sequence[str],
 
 
 def _register_request(args: argparse.Namespace) -> tuple[str, str] | None:
-    """("group", id) or ("directory", "") -- or None when malformed. Pure."""
+    """("group", id), ("directory", "") or ("sync", "") -- or None when
+    malformed (more than one mode included). Pure."""
     group = getattr(args, "register_group_id", None)
     directory = getattr(args, "register_directory", None)
-    if group is not None and directory is not None:
+    sync = getattr(args, "register_sync", None)
+    if sum(value is not None for value in (group, directory, sync)) != 1:
         return None
+    if sync is not None:
+        return ("sync", "") if sync is True else None
     if directory is not None:
         return ("directory", "") if directory is True else None
     try:
@@ -1280,8 +1289,9 @@ def _finalize(repository: Any, lease: WorkerLease, *, document: Mapping[str, Any
         if cancelled:
             finalizer.finalize(TerminalClaim.cancelled("operator_capture"))
         elif reason_code:
-            finalizer.finalize(TerminalClaim.failure(
-                "operator_capture", reason_code, safe_message(reason_code)))
+            claim = TerminalClaim.failure("operator_capture", reason_code, safe_message(reason_code))
+            # PR-SYNC-1: a sync's summary is its run's output, failed or not.
+            finalizer.finalize(replace(claim, output=dict(document)) if "sync" in document else claim)
         else:
             finalizer.finalize(TerminalClaim.control_success(
                 "operator_capture", dict(document)))
@@ -1657,10 +1667,20 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         _finalize(repository, lease, document={"normalisation": outcome}, reason_code="", cancelled=False)
         return EXIT_OK, _envelope("succeeded", "", normalisation=outcome)
     try:
-        client = DataGovClient(_open_transport(), page_limit=CAPTURE_PAGE_LIMIT,
+        # PR-SYNC-1: a sync's every send is metered, and the firewall's first
+        # answer ends it -- no throttle schedule at all.
+        sync = register is not None and register[0] == "sync"
+        meter = register_sync.MeteredTransport(_open_transport()) if sync else None
+        client = DataGovClient(meter or _open_transport(), page_limit=CAPTURE_PAGE_LIMIT,
                                max_pages=CAPTURE_MAX_PAGES, max_records=CAPTURE_MAX_RECORDS,
-                               cancellation_checker=supervisor.should_stop)
-        if register is not None and register[0] == "directory":
+                               cancellation_checker=supervisor.should_stop,
+                               **({"throttle_backoff_seconds": ()} if sync else {}))
+        if sync:
+            register_document = {"sync": register_sync.run_sync(
+                repository, lease, client=client, meter=meter, archive_writer=_open_archive_writer(env),
+                env=env, cancellation_checker=supervisor.should_stop, event_sink=record_event)}
+            print(register_document["sync"]["summary"])
+        elif register is not None and register[0] == "directory":
             # PR-D1: the register directory (metadata reads only).
             register_document = {"directory": register_refresh_directory(
                 repository, client=client, env=env)}
@@ -1702,6 +1722,16 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
         return EXIT_FAILED, _envelope("failed", reason, **({"detail": detail} if detail else {}))
     supervisor.stop()
 
+    if register_document is not None and "sync" in register_document:
+        sync_document = register_document["sync"]
+        reason = ("GOV_SYNC_THROTTLED" if sync_document["stop"] == "throttled" else
+                  "CATALOG_REGISTER_CAPTURE_FAILED" if sync_document["failure_codes"] else "")
+        # A failed unit may leave its snapshot pending under this run: the run
+        # ends `failed` (below) so the next capture can adopt it. The summary
+        # is kept in the run's output either way.
+        _finalize(repository, lease, document=register_document, reason_code=reason, cancelled=False)
+        return (EXIT_FAILED if reason else EXIT_OK), _envelope("failed" if reason else "succeeded", reason,
+                                                               register=register_document)
     if register_document is not None:
         group = register_document.get("group") or {}
         if int(group.get("failed") or 0) > 0:

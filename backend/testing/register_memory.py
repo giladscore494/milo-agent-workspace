@@ -193,6 +193,10 @@ class RegisterMemoryMixin:
         groups = self._register_state()["groups"]
         return [dict(groups[g]) for g in group_ids if g in groups]
 
+    def register_directory_groups(self, limit: int) -> list[dict[str, Any]]:
+        groups = [g for g in self._register_state()["groups"].values() if g.get("kind") == "directory"]
+        return [dict(g) for g in sorted(groups, key=lambda g: (str(g["claimed_at"]), g["id"]), reverse=True)][:limit]
+
     def register_capture_units(self) -> list[dict[str, Any]]:
         return [dict(u) for u in self._register_state()["units"].values()]
 

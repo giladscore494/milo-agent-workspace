@@ -323,6 +323,36 @@ def _count(client: DataGovClient, resource_id: str, tozar: str, budget: _Budget)
     return total
 
 
+def source_total(client: DataGovClient, budget: _Budget, *,
+                 resource_id: str = src.WLTP_RESOURCE_ID) -> int:
+    """PR-SYNC-1: the register's exact row total in ONE ``limit=0`` request
+    (no row payload; the scan's own estimation threshold)."""
+    result = _search(client, {"resource_id": src.require_allowed_resource(resource_id), "limit": "0",
+                              "total_estimation_threshold": str(SCAN_TOTAL_ESTIMATION_THRESHOLD)}, budget)
+    if result.get("records") not in (None, []):
+        raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+    return _exact_total(result)
+
+
+def light_directory(client: DataGovClient, previous: Mapping[str, int], budget: _Budget, *,
+                    resource_id: str = src.WLTP_RESOURCE_ID,
+                    now: Callable[[], datetime] = lambda: datetime.now(UTC)) -> RegisterDirectory:
+    """PR-SYNC-1: the directory again, counting only what moved. The SAME scan
+    (`_scan_counts`: exact total, full pages, sum check), then an independent
+    `_count` ONLY for a tozar whose scan count differs from `previous` (the
+    latest recorded directory) or that is new; it must equal the scan, else
+    the whole directory is refused. An unchanged tozar keeps its previously
+    verified count, which this scan reproduced exactly."""
+    resource_id = src.require_allowed_resource(resource_id)
+    scanned, unfilterable = _scan_counts(client, resource_id, budget)
+    names = sorted(scanned, key=lambda value: value.encode("utf-8"))
+    for tozar in names:
+        if previous.get(tozar) != scanned[tozar] and _count(client, resource_id, tozar, budget) != scanned[tozar]:
+            raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
+    return RegisterDirectory(resource_id=resource_id, units=tuple(DirectoryUnit(t, scanned[t]) for t in names),
+                             fetched_at=now(), requests=budget.used, unfilterable_values=unfilterable)
+
+
 def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLTP_RESOURCE_ID,
                 clock: Callable[[], float] = time.monotonic) -> int:
     """ONE fresh count of an exact tozar: the directory's own bounded
@@ -336,5 +366,5 @@ def count_tozar(client: DataGovClient, tozar: str, *, resource_id: str = src.WLT
 
 
 __all__ = ["DIRECTORY_CONTRACT", "DirectoryUnit", "RegisterDirectory",
-           "SCAN_TOTAL_ESTIMATION_THRESHOLD", "configured_caps",
-           "count_tozar", "discover_directory", "register_version"]
+           "SCAN_TOTAL_ESTIMATION_THRESHOLD", "configured_caps", "count_tozar",
+           "discover_directory", "light_directory", "register_version", "source_total"]

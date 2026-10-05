@@ -173,10 +173,11 @@ const EXECUTION_RULES: GatewayRule[] = [
   // that revision; it starts no run, so it is NOT a run-start rule. The
   // backend gates it again (MILO_ENABLE_WORK_SCOPE_PREPARATION_REQUESTS).
   { method: 'POST', path: new RegExp(`^/work-scopes/${UUID}/preparations$`, 'i') },
-  // PR-D1: capture register tozars, and refresh the register directory. The
+  // PR-D1: capture register tozars, and refresh the register directory
+  // (PR-SYNC-1: or run one incremental sync). The
   // API executes the capture job; nothing starts a run, so neither is a
   // run-start rule. The backend gates both again (MILO_ENABLE_REGISTER_CAPTURE).
-  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory)$`, 'i') },
+  { method: 'POST', path: new RegExp(`^/projects/${UUID}/register/(captures|directory|sync)$`, 'i') },
   // PR-D3: the ONE guarded model call (its own job; not a run) and the
   // owner's approval or rejection. The backend gates each again
   // (MILO_ENABLE_REGISTER_CAPTURE, and MILO_ENABLE_MANUFACTURER_NORMALISATION

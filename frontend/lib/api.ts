@@ -183,6 +183,13 @@ export const api = {
       body: JSON.stringify({ conversation_id: conversationId }),
     }),
 
+  /** PR-SYNC-1: one incremental register sync (409 CATALOG_REGISTER_BUSY while anything runs). */
+  requestRegisterSync: (projectId: string, conversationId: string) =>
+    request<unknown>(`/projects/${projectId}/register/sync`, {
+      method: 'POST',
+      body: JSON.stringify({ conversation_id: conversationId }),
+    }),
+
   /**
    * The conversation's durable run history, newest first and bounded by the
    * server. It is what lets a completed result outlive session storage: after

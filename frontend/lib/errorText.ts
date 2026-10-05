@@ -249,6 +249,7 @@ export const PREPARATION_REQUEST_FALLBACK = 'The revision could not be prepared.
 /** PR-D1: the Register page's own fallback sentences. */
 export const REGISTER_CAPTURE_FALLBACK = 'The capture could not be requested.';
 export const REGISTER_DIRECTORY_FALLBACK = 'The register directory refresh could not be requested.';
+export const REGISTER_SYNC_FALLBACK = 'The register sync could not be requested.';
 export const REGISTER_READ_FALLBACK = 'The register could not be read.';
 
 /** What the website shows when a Prepare is refused: the code's own reason. */

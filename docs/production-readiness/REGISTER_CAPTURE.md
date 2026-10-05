@@ -242,6 +242,70 @@ rows of a mapper version other than the current one, once the snapshot's
 build under the current mapper version is complete. Their digest item is
 `<snapshot_key> <mapper_version>`.
 
+## Sync register (PR-SYNC-1)
+
+The **Sync register** button (`POST /projects/{id}/register/sync`) is the one
+way to keep the register complete and current: no tozar to pick, nothing to
+configure. It executes the capture job once with `--register-sync`
+(`backend/catalog/register/sync.py`). One run lease owns the whole sync, and
+the groups it captures one after another.
+
+What one sync does, in order, inside a hard budget of **80 data.gov.il
+requests** (`SYNC_MAX_REQUESTS`; every send and every retry counts):
+
+1. **Check** (2 requests): `package_show` and the register's exact total. If
+   both match what the last sync recorded for the current directory version,
+   nothing changed.
+2. **Light directory** (~11 requests), only on a change or when a captured
+   tozar's count differs from the directory: the same tozar-column scan as
+   **Refresh directory**, then one count only for each tozar whose count moved
+   or that is new. A new directory version is recorded only on change.
+3. **Backlog**: tozars never captured, then those whose last capture failed or
+   was interrupted, then those whose captured count differs from the directory,
+   each in byte order of the tozar. It is recomputed from the database on every
+   run, so a sync that stops loses nothing and the next one starts where it
+   stopped. A tozar is never given up.
+4. **Rolling refresh**: only once the backlog is empty, the 2 tozars captured
+   longest ago under an older directory version are captured again. If the
+   resource's published version has not changed, an unchanged tozar lands on
+   its SAME snapshot and adds no rows. A tozar already captured under the
+   current version is not requested again.
+5. **Capture**, through the same request, capacity guard, verification,
+   archive, activation, variants and compaction as **Capture selected**. A
+   unit whose requests (`1 + pages + 1`, 3 for a small tozar) do not fit what
+   is left of the budget is not started. It is left for the next sync.
+
+The sync never waits on the firewall. Its client has no 60/180/300 s
+schedule: the first 403 block page or 429 ends the sync at once
+(`GOV_SYNC_THROTTLED`), and nothing more is sent. The unit it hit is recorded
+failed (retryable), exactly like any failed capture. **A throttled sync is
+normal; run it again later.** Wait at least the capture lease (~5 minutes)
+so the next sync can adopt a snapshot the stopped one left pending.
+
+Only one register job runs at a time. A sync is refused (`409
+CATALOG_REGISTER_BUSY`, no job started) while a capture, a directory refresh
+or another sync is live. A group capture is refused the same way while a
+directory refresh or a sync is live.
+
+Every sync prints one line (stdout, and the run's output). The Register page
+shows the last one:
+
+`SYNC_SUMMARY|changed=<bool>|directory_version=<12 hex>|work=<n>|captured=<n>|reused=<n>|failed=<n>|deferred=<n>|requests=<used>/80|stop=<complete|budget|throttled|capacity>|backlog=<tozars>/<rows>|coverage=<captured_rows>/<directory_rows>`
+
+| Field | Meaning |
+|---|---|
+| `changed` | the check saw a change (or no earlier sync), so the light directory ran |
+| `work` | tozars planned this run: the backlog, else the rolling refresh |
+| `captured` / `reused` | captured into a new snapshot / re-captured into the snapshot it already had |
+| `failed` / `deferred` | failed this run (retried by the next) / not reached this run (budget, throttle or capacity) |
+| `stop` | `complete`, `budget` (80 requests), `throttled` (firewall), `capacity` (the capacity guard refused; nothing partial) |
+| `backlog` | tozars and directory rows still to capture after this run; it shrinks run by run |
+| `coverage` | rows of captured tozars / rows in the directory |
+
+At the 1.10 numbers (93 small tozars, 3,740 rows missing), the first sync
+spends 15 requests on the check and light directory, then captures 21 tozars
+(78/80). About 5 syncs empty the backlog.
+
 ## Configuration (API unless noted)
 
 | Key | Default | |

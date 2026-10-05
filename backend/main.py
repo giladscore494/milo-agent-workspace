@@ -825,6 +825,16 @@ def request_register_directory(project_id: UUID, request: RegisterDirectoryReque
     return answer
 
 
+# PR-SYNC-1: one incremental register sync (the capture job, sync mode).
+# Single flight: refused 409 CATALOG_REGISTER_BUSY while anything is live.
+@app.post("/projects/{project_id}/register/sync", status_code=202)
+def request_register_sync(project_id: UUID, request: RegisterDirectoryRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    require_stage_enabled(register_service.REGISTER_FLAG, "register sync")
+    enforce_rate_limit("register_actions_user", str(user.user_id))
+    return register_service.request_sync(repo, user.user_id, project_id, conversation_id=request.conversation_id,
+                                         trigger=trigger)
+
+
 # PR-D3: manufacturer normalisation. The read (canonical names, pending
 # groups) and the owner's approval ride the Register page's flag; the ONE
 # guarded K3 call executes the normalisation job (CLOUD_RUN_NORMALISATION_JOB,
