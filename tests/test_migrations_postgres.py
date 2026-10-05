@@ -8863,7 +8863,8 @@ SCOPED_MIGRATION_VERSIONS = ("20260922000100", "20260923000100", "20260924000100
 PENDING_MIGRATION_VERSIONS = ("20260924000200", "20260925000100", "20260927000100",
                               "20260928000100", "20260929000100", "20260930000100",
                               "20260930000200", "20261001000100", "20261002000100",
-                              "20261002000200", "20261003000100", "20261004000100")
+                              "20261002000200", "20261003000100", "20261004000100",
+                              "20261005000100")
 PARTIAL_PG_PORT = "54995"
 
 
@@ -9007,7 +9008,7 @@ def production_shaped_db():
         server.psql(sql=SEED_LEGACY_ROWS)
         server.psql(sql=SUPABASE_AUTH_SHIM)
         applied = [m for m in MIGRATIONS if not m.name.startswith(PENDING_MIGRATION_VERSIONS)]
-        assert len(applied) == 41 and len(MIGRATIONS) == 53
+        assert len(applied) == 41 and len(MIGRATIONS) == 54
         for migration in applied:
             server.psql(file=migration)
         versions = ", ".join(f"('{m.name.split('_', 1)[0]}')" for m in applied)
@@ -9041,8 +9042,8 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as partially-migrated (41/53" in state.stdout, state.stdout
-    assert "12 local migration(s) not present in remote migration history" in state.stdout
+    assert "remote schema classified as partially-migrated (41/54" in state.stdout, state.stdout
+    assert "13 local migration(s) not present in remote migration history" in state.stdout
     for version in PENDING_MIGRATION_VERSIONS:
         assert version in state.stdout
     for version in SCOPED_MIGRATION_VERSIONS:
@@ -9063,7 +9064,7 @@ def test_the_production_shaped_database_is_named_exactly_as_one_migration_short(
     state = subprocess.run(["bash", str(MIGRATION_STATE_SCRIPT), "--database-url-env",
                             "MILO_TEST_READONLY_DB_URL"], capture_output=True, text=True,
                            env=env, timeout=300)
-    assert "remote schema classified as fully-migrated (53/53" in state.stdout, state.stdout
+    assert "remote schema classified as fully-migrated (54/54" in state.stdout, state.stdout
 
 
 
@@ -10964,3 +10965,45 @@ def test_a_role_without_select_is_a_privilege_finding_not_a_missing_migration(fu
                            env=env, timeout=300)
     assert "READONLY_ROLE_LACKS_SELECT" not in clean.stdout
     assert clean.returncode == 0, clean.stdout
+
+
+# =============================================================================
+# PR-SYNC-2 (20261005000100): the auto sync schedule -- service role only
+# =============================================================================
+
+def test_the_register_sync_schedule_table_is_service_role_only(db):
+    table = "register_sync_schedules"
+    assert db.psql(f"select relrowsecurity from pg_class where oid='public.{table}'::regclass") == "t"
+    assert db.psql(f"select count(*) from pg_policies where tablename='{table}'") == "0"
+    for role in ("anon", "authenticated"):
+        for privilege in ("select", "insert", "update", "delete"):
+            assert db.psql(f"select has_table_privilege('{role}', 'public.{table}', '{privilege}')") == "f"
+    for privilege, held in (("select", "t"), ("insert", "t"), ("update", "t"), ("delete", "f"),
+                            ("truncate", "f")):
+        assert db.psql(f"select has_table_privilege('service_role', 'public.{table}', '{privilege}')") == held
+    # One row per project; the switch must name who and where; the pause reason
+    # and the counters are closed sets.
+    project, conversation, user = (str(uuid.uuid4()) for _ in range(3))
+    db.psql(f"insert into public.projects (id, slug, name, workflow_key) values "
+            f"('{project}', 'sync-schedule', 'Sync Schedule', 'swarm_v2'); "
+            f"insert into public.conversations (id, project_id, title) values ('{conversation}', '{project}', 'c'); "
+            f"insert into public.{table} (project_id) values ('{project}')")
+    for bad in ("enabled = true",
+                "paused_reason = 'SYNC_PAUSED_SOMETHING'",
+                "consecutive_failures = -1",
+                "last_tick = '[1]'::jsonb"):
+        with pytest.raises(AssertionError, match="register_sync_schedules_"):
+            db.psql(f"update public.{table} set {bad} where project_id = '{project}'")
+    db.psql(f"update public.{table} set enabled = true, enabled_by = '{user}', conversation_id = '{conversation}', "
+            f"paused_reason = 'SYNC_PAUSED_CAPACITY', last_tick = '{{\"decision\": \"skip\"}}'::jsonb "
+            f"where project_id = '{project}'")
+    assert db.psql(f"select count(*) from public.{table}") == "1"
+    # The conversation the runs are recorded under, or the project, gone: so is the schedule.
+    db.psql(f"delete from public.conversations where id = '{conversation}'")
+    assert db.psql(f"select count(*) from public.{table} where project_id = '{project}'") == "0"
+    db.psql(f"insert into public.{table} (project_id) values ('{project}'); "
+            f"delete from public.projects where id = '{project}'")
+    assert db.psql(f"select count(*) from public.{table} where project_id = '{project}'") == "0"
+    # Rerun-safe.
+    db.psql(file=REPO_ROOT / "supabase" / "migrations" / "20261005000100_register_sync_schedules.sql")
+

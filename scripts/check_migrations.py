@@ -307,6 +307,15 @@ REQUIRED_PER_FILE["20261004000100_catalog_maintenance_rpc_timeouts.sql"] = [
     "alter function public.prune_register_snapshots(text[], text)\n  set lock_timeout = '5s';",
     "alter function public.prepare_work_scope_queue(uuid, text, integer, text, jsonb)\n  set statement_timeout = '300s';",
 ]
+REQUIRED_PER_FILE["20261005000100_register_sync_schedules.sql"] = [
+    # PR-SYNC-2: the auto sync schedule is service-role only and never deleted
+    # by the API; the switch names who turned it on and where runs are recorded.
+    "create table if not exists public.register_sync_schedules",
+    "alter table public.register_sync_schedules enable row level security;",
+    "revoke all on table public.register_sync_schedules from authenticated;",
+    "revoke delete, truncate on table public.register_sync_schedules from service_role;",
+    "check (not enabled or (enabled_by is not null and conversation_id is not null))",
+]
 REQUIRED_PER_FILE["20260930000200_catalog_work_scope_placeholder_exclusion.sql"] = [
     # P27: the queue build leaves PR-U's placeholder records out (never
     # eligible, never queued), records each with its reason and counts them.

@@ -13,6 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from backend.budget import BudgetConfig
 from backend.catalog import review as catalog_review
+from backend.catalog.register import autosync as register_autosync
 from backend.catalog.register import browser as catalog_browser
 from backend.catalog.register import normalization
 from backend.catalog.register import service as register_service
@@ -41,6 +42,7 @@ from backend.schemas import (
     ProposalRevise,
     ProposalRunCreate,
     RegisterCaptureRequest,
+    RegisterAutoSyncRequest,
     RegisterDirectoryRequest,
     NormalisationApproval,
     NormalisationRejection,
@@ -62,6 +64,7 @@ from backend.schemas import (
     WorkScopeRevise, WorkScopeState,
 )
 from backend.rate_limit import enforce_rate_limit
+from backend.scheduler_auth import get_verified_scheduler
 from backend.event_registry import is_known_event_type
 from backend.run_identity import (
     PRODUCT_WORKFLOW_KEYS,
@@ -794,7 +797,13 @@ def get_work_scope_preparation(work_scope_id: UUID, revision: int = Query(ge=1, 
 # here). The paths sit outside /catalog/, whose routes stay GET-only.
 @app.get("/projects/{project_id}/register")
 def get_register(project_id: UUID, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
-    return register_service.register_view(repo, user.user_id, project_id, trigger=trigger)
+    view = register_service.register_view(repo, user.user_id, project_id, trigger=trigger)
+    try:
+        view["auto_sync"] = register_autosync.view(repo, project_id)
+    except AppError:
+        # PR-SYNC-2: the page never depends on the schedule table being readable.
+        view["auto_sync"] = None
+    return view
 
 
 @app.post("/projects/{project_id}/register/captures")
@@ -833,6 +842,25 @@ def request_register_sync(project_id: UUID, request: RegisterDirectoryRequest, u
     enforce_rate_limit("register_actions_user", str(user.user_id))
     return register_service.request_sync(repo, user.user_id, project_id, conversation_id=request.conversation_id,
                                          trigger=trigger)
+
+
+# PR-SYNC-2: the Register page's Auto sync switch (on / off / resume),
+# authorised exactly like a sync; and the Cloud Scheduler tick, which only the
+# dedicated scheduler identity may call (backend/scheduler_auth.py) and which
+# no gateway rule proxies. The tick starts at most one sync, through the same
+# single-flight request_sync, and skips everything while register capture is
+# off (SYNC_REGISTER_DISABLED).
+@app.post("/projects/{project_id}/register/auto-sync")
+def set_register_auto_sync(project_id: UUID, request: RegisterAutoSyncRequest, user: AuthenticatedUser = Depends(get_authenticated_user), repo: Repository = Depends(get_repository)) -> dict:
+    require_stage_enabled(register_service.REGISTER_FLAG, "register auto sync")
+    enforce_rate_limit("register_actions_user", str(user.user_id))
+    return register_autosync.set_switch(repo, user.user_id, project_id, action=request.action,
+                                        conversation_id=request.conversation_id)
+
+
+@app.post("/internal/register/sync-tick")
+def register_sync_tick(scheduler: str = Depends(get_verified_scheduler), repo: Repository = Depends(get_repository), trigger=Depends(get_capture_trigger)) -> dict:
+    return register_autosync.tick(repo, trigger=trigger)
 
 
 # PR-D3: manufacturer normalisation. The read (canonical names, pending

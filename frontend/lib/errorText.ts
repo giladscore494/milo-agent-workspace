@@ -142,6 +142,8 @@ const ERROR_COPY: ReadonlyMap<string, string> = new Map([
   ['CATALOG_REGISTER_TRIGGER_FAILED', 'The capture job could not be started. Capture can be tried again.'],
   ['CATALOG_REGISTER_WORKFLOW_UNSUPPORTED', "This project's engine does not read the Government catalog, so it cannot capture the register."],
   ['CATALOG_REGISTER_CONVERSATION_UNAVAILABLE', 'Open a conversation of this project first; register capture is recorded under it.'],
+  // PR-SYNC-2: the Auto sync switch.
+  ['SYNC_RESUME_OVER_CAPACITY', 'The database is still above its capacity threshold, so Auto sync stays paused. Run the Register retention workflow with mode vacuum-full first, then Resume.'],
 
   // An ordinary task in a project whose runs read the Government catalog:
   // catalog work starts only from a prepared Mapping Plan batch. Nothing was
@@ -251,6 +253,7 @@ export const REGISTER_CAPTURE_FALLBACK = 'The capture could not be requested.';
 export const REGISTER_DIRECTORY_FALLBACK = 'The register directory refresh could not be requested.';
 export const REGISTER_SYNC_FALLBACK = 'The register sync could not be requested.';
 export const REGISTER_READ_FALLBACK = 'The register could not be read.';
+export const REGISTER_AUTO_SYNC_FALLBACK = 'Auto sync could not be changed.';
 
 /** What the website shows when a Prepare is refused: the code's own reason. */
 export function preparationRequestErrorText(error: unknown): string {

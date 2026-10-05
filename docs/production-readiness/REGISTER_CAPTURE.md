@@ -310,6 +310,117 @@ At the 1.10 numbers (93 small tozars, 3,740 rows missing), the first sync
 spends 15 requests on the check and light directory, then captures 21 tozars
 (78/80). About 5 syncs empty the backlog.
 
+## Auto sync (PR-SYNC-2)
+
+After one switch on the Register page and the one-time setup below, the
+register keeps itself complete and current with no operator: a sync every
+hour while there is a backlog, a change check every day once it is complete.
+It pauses itself on capacity and on repeated failures, backs off on firewall
+blocks, and the page shows why. The sync itself (PR-SYNC-1) is unchanged:
+`backend/catalog/register/autosync.py` only decides WHEN to start one, through
+the same single-flight `request_sync`.
+
+### The switch
+
+The Register page's **Auto sync** block shows On / Off / Paused, what the next
+tick would decide and why, the last tick (time, decision, reason, backlog,
+database size), the last sync summary above it, and two warnings: **Scheduler
+not ticking** (the switch is on and nothing ticked for 2 h; run
+`setup-register-scheduler.sh --check`) and the database at 90% of its
+threshold (360 MB of 400 MB at the defaults).
+
+- **Turn auto sync on** records who turned it on, the project and the open
+  conversation; every scheduled sync runs as that user, in that conversation,
+  authorised exactly like **Sync register** (`POST
+  /projects/{id}/register/auto-sync`, `{"action": "on"}`).
+- **Turn auto sync off**: every later tick starts nothing (`SYNC_AUTO_OFF`).
+- **Resume** clears a pause. It is the ONLY way out of one.
+
+One row per project in `register_sync_schedules` (migration
+`20261005000100`, service role only). The register is global: the earliest
+switch that is on drives the sync; any other is a standby. Every row gets
+every tick.
+
+### The tick and its rules
+
+Cloud Scheduler calls `POST /internal/register/sync-tick` hourly at minute 7
+UTC. Each tick evaluates the rules below in order, starts at most one sync,
+writes `last_tick` and prints exactly one line:
+
+`SYNC_TICK|decision=<start|skip>|reason=<CODE>|backlog=<tozars>/<rows>|db_mb=<n>[|warning=SYNC_DB_NEAR_CAPACITY]`
+
+| # | Condition | Decision |
+|---|---|---|
+| 1 | `MILO_ENABLE_REGISTER_CAPTURE` off (kill switch, a deploy, a website stage) | skip `SYNC_REGISTER_DISABLED` |
+| 2 | the switch is off | skip `SYNC_AUTO_OFF` |
+| 3 | paused | skip with the pause reason |
+| 4 | a capture, directory refresh or sync is live | skip `SYNC_BUSY` |
+| 5 | the last sync stopped `throttled` | skip `SYNC_COOLING_DOWN` until its finish + 6 h x 2^(throttles in a row - 1), at most 24 h (6, 12, 24, 24 h) |
+| 6 | the last sync stopped `capacity` (finished after the last Resume), or the database is at or above capacity x threshold (400 MB) | pause `SYNC_PAUSED_CAPACITY` |
+| 7 | the last 2 finished syncs both failed for any other reason | pause `SYNC_PAUSED_FAILING` |
+| 8 | no sync has finished yet | start `SYNC_FIRST` |
+| 9 | backlog > 0 in the last summary (or no summary: a crashed sync) and at least 1 h since it finished | start `SYNC_BACKLOG` |
+| 10 | backlog = 0 and at least 24 h since it finished | start `SYNC_DAILY_CHECK` |
+| 11 | otherwise | skip `SYNC_NOT_DUE` |
+
+Counters, each finished sync counted once: a `throttled` stop adds one
+throttle; any other finish resets the throttles; a `completed` /
+`partial_success` sync resets the failures, any other ending adds one. A start
+the API refuses is a skip with its code (`SYNC_BUSY` for
+`CATALOG_REGISTER_BUSY`, else the refusal's own code). Each transition into a
+pause sends ONE Sentry event (the reason code only) when `SENTRY_DSN` is bound;
+the skips that follow send nothing.
+
+The 1 h is measured from the last sync's FINISH. A sync takes about 5 minutes
+(5.10: 16:24-16:29), so the next hourly tick finds 55 minutes and a backlog
+start lands on every second tick. Replayed from the 5.10 state (83 tozars, 18
+per sync, runs 2 and 3 throttled; `tests/test_register_autosync.py`): with
+instant syncs the backlog reaches 0/0 23 h after the first tick, with 5-minute
+syncs 29.1 h; then one start per 24 h.
+
+### Pauses and their fixes
+
+| Reason | Fix |
+|---|---|
+| `SYNC_PAUSED_CAPACITY` | Run the **Register retention** workflow with mode `vacuum-full` (reviewer-gated, `production` environment), then press **Resume**. Resume is refused (`SYNC_RESUME_OVER_CAPACITY`) while the database is still at or above the threshold. |
+| `SYNC_PAUSED_FAILING` | Open the last two sync runs (their `error.code` / `failure_codes`), fix the cause, then press **Resume** (the failure count restarts at 0). |
+| Scheduler not ticking | `bash scripts/ops/setup-register-scheduler.sh --check` from Cloud Shell; `--apply` repairs a missing or drifted job. |
+
+### Authentication
+
+Only ONE caller may tick: the service account
+`milo-register-scheduler@<GCP_PROJECT_ID>` (no keys). Cloud Scheduler mints a
+Google-signed OIDC token as it, audience `MILO_GATEWAY_AUDIENCE` (the API URL),
+and sends it as `Authorization: Bearer`. Cloud Run's IAM admits it (the account
+holds `roles/run.invoker` on `milo-agent-api` and nothing else) and forwards
+the header; the API verifies it with the gateway's verifier (signature,
+issuer, audience, expiry, `email_verified`) and requires the email to equal
+`MILO_REGISTER_SCHEDULER_IDENTITY`, which `scripts/ops/deploy.sh` writes on the
+API from the operator configuration (step 10b). Missing or partial
+configuration, or that identity also listed as a gateway or worker identity,
+is 503 and nothing runs; any other token -- the gateway's included -- is 401.
+The route is in no gateway allowlist (`frontend/lib/server/gatewayPolicy.ts`).
+No Scheduler permission is given to the deployer: the kill switch stops the
+ticks by closing `MILO_ENABLE_REGISTER_CAPTURE` (rule 1).
+
+### One-time setup and release order
+
+1. **Migrations**: the *Deploy Supabase Migrations* workflow applies
+   `20261005000100_register_sync_schedules.sql`.
+2. **Deploy production** (the release): sets
+   `MILO_REGISTER_SCHEDULER_IDENTITY` on the API (step 10b).
+3. **Setup**, once, from Cloud Shell, as the project owner:
+
+   ```bash
+   git pull
+   bash scripts/ops/setup-register-scheduler.sh --plan    # read-only: what it will do
+   bash scripts/ops/setup-register-scheduler.sh --apply   # API, account, invoker, job; ends with --check PASS
+   bash scripts/ops/setup-register-scheduler.sh --check   # any time; also run by the deploy preflight
+   ```
+
+4. **Switch on**: Register page -> **Turn auto sync on** (with a conversation
+   of the project open).
+
 ## Configuration (API unless noted)
 
 | Key | Default | |

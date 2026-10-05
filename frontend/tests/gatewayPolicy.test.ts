@@ -174,6 +174,42 @@ describe('gateway policy', () => {
   });
 
   /**
+   * PR-SYNC-2: the scheduler's tick is never proxied, in any posture; the
+   * owner's Auto sync switch is a register write like Sync.
+   */
+  describe('the register auto sync', () => {
+    const POSTURES: Array<[string | undefined, string | undefined]> = [
+      [undefined, undefined], ['true', undefined], ['true', 'true'],
+    ];
+    afterEach(() => {
+      delete process.env.GATEWAY_ALLOW_EXECUTION_ROUTES;
+      delete process.env.GATEWAY_ALLOW_RUN_START_ROUTES;
+    });
+
+    it('never proxies the scheduler tick', () => {
+      for (const [execution, runStart] of POSTURES) {
+        if (execution) process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = execution;
+        if (runStart) process.env.GATEWAY_ALLOW_RUN_START_ROUTES = runStart;
+        for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
+          for (const path of ['/internal/register/sync-tick', '/internal/register/sync-tick/',
+            `/projects/${PROJECT_ID}/internal/register/sync-tick`, '/INTERNAL/REGISTER/SYNC-TICK']) {
+            expect(isGatewayRequestAllowed(method, path)).toBe(false);
+          }
+        }
+      }
+    });
+
+    it('proxies the switch only with the execution routes, and never as a run start', () => {
+      const path = `/projects/${PROJECT_ID}/register/auto-sync`;
+      expect(isGatewayRequestAllowed('POST', path)).toBe(false);
+      process.env.GATEWAY_ALLOW_EXECUTION_ROUTES = 'true';
+      expect(isGatewayRequestAllowed('POST', path)).toBe(true);
+      expect(isGatewayRequestAllowed('GET', path)).toBe(false);
+      expect(isRunCreationRequest('POST', path)).toBe(false);
+    });
+  });
+
+  /**
    * The activation sequence, one gateway posture at a time. Starting a run is
    * the LAST permission the website gets: every earlier posture -- Stage A,
    * plan authoring, and every moment while the backend is being armed --
