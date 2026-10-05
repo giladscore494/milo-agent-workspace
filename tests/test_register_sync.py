@@ -26,6 +26,7 @@ from backend.catalog.government.source import GovernmentSourceError
 from backend.catalog.government.transport import HttpResponse
 from backend.catalog.register import service as register_service
 from backend.catalog.register import sync as register_sync
+from backend.errors import AppError
 from backend.testing import government_capture as capture_fixtures
 from backend.testing.memory_repository import MemoryRepository
 from tests.test_catalog_operator_capture import authorized_argv, capture_env
@@ -454,3 +455,67 @@ def test_the_production_replay_converges_with_throttled_runs(monkeypatch, capsys
     assert len(lines) == done + 2 and (refresh["work"], refresh["backlog"], refresh["stop"]) == ("2", "0/0", "complete")
     print(f"converged: backlog empty after run {done + 1} of which 2 throttled; refresh from run {done + 2}")
     assert done + 1 == 6
+
+
+# =============================================================================
+# review findings: no silent directory loop, no rescan for backlog drift,
+# single flight re-checked after each claim
+# =============================================================================
+
+def test_more_moved_tozars_than_the_budget_can_count_fails_loudly_before_counting(monkeypatch, capsys):
+    counts = {f"T{i:02d}": 5 for i in range(90)}
+    repo, w, source = small_world(counts)
+    source.counts = {t: 6 for t in counts}
+    harness = Harness(monkeypatch, capsys, repo, w, source)
+    status, line, document = harness.sync()
+    assert status == entrypoint.EXIT_FAILED and document["reason_code"] == "GOV_SYNC_DIRECTORY_TOO_LARGE"
+    assert (line["requests"], line["stop"], line["captured"]) == ("3/80", "budget", "0")  # no count spent
+    assert len(repo._register_state()["directories"]) == 1
+    # One full Refresh directory, and the next sync proceeds.
+    repo.record_register_directory(src.WLTP_RESOURCE_ID, "2026-10-05T00:00:00+00:00",
+                                   [{"tozar": t, "expected_rows": n} for t, n in source.counts.items()])
+    status, line, _ = harness.sync()
+    assert status == entrypoint.EXIT_OK and line["changed"] == "true" and line["captured"] == "25"
+
+
+def test_drift_under_an_older_version_is_backlog_and_reads_no_directory(monkeypatch, capsys):
+    repo, w, source = small_world({"Alfa": 3, "Beta": 2})
+    harness = Harness(monkeypatch, capsys, repo, w, source)
+    harness.sync()
+    source.counts.update(Beta=3, Gamma=1)
+    source.block = {source.sends + 2 + 1 + 2 + 1}  # after the check, the scan and two counts: the 1st unit
+    status, line, _ = harness.sync()
+    assert line["stop"] == "throttled" and line["changed"] == "true"
+    sends = source.sends
+    status, line, _ = harness.sync()
+    assert status == entrypoint.EXIT_OK and line["changed"] == "false"
+    assert not [p for _a, p in source.calls[sends:] if p.get("fields") == "tozar"]
+    assert (line["work"], line["captured"], line["backlog"]) == ("2", "2", "0/0")
+
+
+def test_single_flight_is_checked_again_after_each_claim(monkeypatch):
+    repo, w = world()
+    version = directory(repo)
+    request(repo, w, version, ["טויוטה"])  # a live group capture...
+    monkeypatch.setattr(register_service, "register_busy", lambda _repo: False)  # ...the sync's check missed
+    trigger = FakeTrigger()
+    refused = client(repo, trigger).post(f"/projects/{w['project']}/register/sync", headers=as_user(),
+                                         json={"conversation_id": w["conversation"]})
+    assert refused.status_code == 409 and refused.json()["error"]["code"] == "CATALOG_REGISTER_BUSY"
+    assert trigger.calls == [] and repo.register_directory_groups(1)[0]["trigger_state"] == "trigger_failed"
+    # A capture whose first look missed a live sync.
+    repo, w = world()
+    version = directory(repo)
+    assert client(repo, trigger).post(f"/projects/{w['project']}/register/sync", headers=as_user(),
+                                      json={"conversation_id": w["conversation"]}).status_code == 202
+    real, looks = repo.register_directory_groups, []
+
+    def first_look_misses(limit: int) -> list[dict[str, Any]]:
+        looks.append(limit)
+        return [] if len(looks) == 1 else real(limit)
+
+    monkeypatch.setattr(repo, "register_directory_groups", first_look_misses)
+    with pytest.raises(AppError) as refusal:
+        request(repo, w, version, ["טויוטה"], trigger)
+    assert refusal.value.code == "CATALOG_REGISTER_BUSY" and len(trigger.calls) == 1
+    assert {u["status"] for u in repo.register_capture_units()} == {"failed"}

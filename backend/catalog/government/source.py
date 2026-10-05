@@ -226,6 +226,8 @@ GOVERNMENT_SOURCE_REASONS: Mapping[str, str] = {
     # PR-SYNC-1: a register sync stops at the firewall's first answer
     "GOV_SYNC_THROTTLED":
         "data.gov.il's firewall answered the register sync (HTTP 403 page or 429); run it again later",
+    "GOV_SYNC_DIRECTORY_TOO_LARGE":
+        "more tozars changed than one register sync may count; press Refresh directory once",
 }
 
 

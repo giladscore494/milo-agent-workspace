@@ -346,8 +346,12 @@ def light_directory(client: DataGovClient, previous: Mapping[str, int], budget: 
     resource_id = src.require_allowed_resource(resource_id)
     scanned, unfilterable = _scan_counts(client, resource_id, budget)
     names = sorted(scanned, key=lambda value: value.encode("utf-8"))
-    for tozar in names:
-        if previous.get(tozar) != scanned[tozar] and _count(client, resource_id, tozar, budget) != scanned[tozar]:
+    moved = [tozar for tozar in names if previous.get(tozar) != scanned[tozar]]
+    if len(moved) > budget.max_requests - budget.used:
+        # Refused BEFORE the counts are spent: they could never all fit.
+        raise GovernmentSourceError("GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED")
+    for tozar in moved:
+        if _count(client, resource_id, tozar, budget) != scanned[tozar]:
             raise GovernmentSourceError("GOV_DIRECTORY_RESULT_INVALID")
     return RegisterDirectory(resource_id=resource_id, units=tuple(DirectoryUnit(t, scanned[t]) for t in names),
                              fetched_at=now(), requests=budget.used, unfilterable_values=unfilterable)

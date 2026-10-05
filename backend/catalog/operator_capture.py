@@ -1724,8 +1724,7 @@ def _execute(args: argparse.Namespace, env: Mapping[str, str]) -> tuple[int, dic
 
     if register_document is not None and "sync" in register_document:
         sync_document = register_document["sync"]
-        reason = ("GOV_SYNC_THROTTLED" if sync_document["stop"] == "throttled" else
-                  "CATALOG_REGISTER_CAPTURE_FAILED" if sync_document["failure_codes"] else "")
+        reason = sync_document["reason_code"]
         # A failed unit may leave its snapshot pending under this run: the run
         # ends `failed` (below) so the next capture can adopt it. The summary
         # is kept in the run's output either way.

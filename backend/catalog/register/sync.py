@@ -4,9 +4,11 @@ One execution, one run lease, no operator decision:
 
 1. Check (2 requests): `package_show` and the register's exact total. Both as
    the last sync recorded them for the CURRENT directory version (its `basis`)
-   and nothing left to do: straight to the rolling refresh.
-2. Light directory, only on a change or when a captured tozar's count differs
-   from the directory: the directory's own scan, and a `_count` only for a
+   and nothing left to do: straight to the rolling refresh. More moved tozars
+   than the budget can count ends the run `GOV_SYNC_DIRECTORY_TOO_LARGE`
+   (one Refresh directory resolves it), never a silent loop.
+2. Light directory, only on a change or when a tozar captured under the
+   current version has another count: the directory's own scan, and a `_count` only for a
    tozar whose count moved or that is new (`directory.light_directory`),
    recorded through `record_register_directory` (a new version only on change).
 3. Diff, no requests, recomputed from the database every run: tozars never
@@ -51,6 +53,8 @@ from backend.errors import AppError
 SYNC_MAX_REQUESTS = 80
 #: Tozars re-captured per run by the rolling refresh, once the backlog is empty.
 SYNC_REFRESH_TOZARS = 2
+#: Requests kept free when fitting a unit: one retry never fails it halfway.
+SYNC_RETRY_HEADROOM = 1
 _BASIS = ("upstream_version", "metadata_modified", "source_total")
 
 
@@ -127,33 +131,40 @@ def run_sync(repository: Any, lease: Any, *, client: Any, meter: MeteredTranspor
     if directory is None:
         raise RegisterCaptureError("CATALOG_REGISTER_NO_DIRECTORY")
     basis = (service.last_sync(repository, before_run=lease.run_id) or {}).get("basis")
-    guard = _Budget(max_requests=SYNC_MAX_REQUESTS, max_seconds=DEFAULT_MAX_SECONDS, clock=time.monotonic)
-    stop, changed, work, backlog = "complete", True, [], []
+    def guard() -> _Budget:  # the directory helpers' own cap: what is left of the run's
+        return _Budget(max_requests=meter.remaining, max_seconds=DEFAULT_MAX_SECONDS, clock=time.monotonic)
+
+    stop, changed, reason, work, backlog = "complete", False, "", [], []
     try:
         metadata = client.package_show(src.WLTP_RESOURCE_ID)
         seen = {"upstream_version": metadata.upstream_version,
                 "metadata_modified": metadata.resource_metadata_modified,
-                "source_total": source_total(client, guard)}
+                "source_total": source_total(client, guard())}
         version = directory["version"]["register_version"]
-        changed = not basis or basis.get("directory_version") != version or any(
-            basis.get(key) != seen[key] for key in _BASIS)
         expected = {str(u["tozar"]): int(u["expected_rows"]) for u in directory["units"]}
         views = service.unit_views(repository)
-        drift = any(v.get("state") == "captured" and v.get("captured_rows") != expected.get(t)
-                    for t, v in views.items() if t in expected)
-        if changed or drift:
-            found = light_directory(client, expected, guard)
+        # Drift that only the directory can explain: a tozar captured under the
+        # CURRENT version with another count (an older-version capture with
+        # another count is backlog, fixed by capturing it again).
+        changed = not basis or basis.get("directory_version") != version or any(
+            basis.get(key) != seen[key] for key in _BASIS) or any(
+            v.get("state") == "captured" and v.get("register_version") == version
+            and v.get("captured_rows") != expected.get(t) for t, v in views.items() if t in expected)
+        if changed:
+            reason = "GOV_SYNC_DIRECTORY_TOO_LARGE"  # if the light directory runs out of budget
+            found = light_directory(client, expected, guard())
             repository.record_register_directory(found.resource_id, found.fetched_at.isoformat(), found.rpc_units())
             directory = repository.latest_register_directory()
             version = directory["version"]["register_version"]
             expected = {str(u["tozar"]): int(u["expected_rows"]) for u in directory["units"]}
-        basis = {**seen, "directory_version": version}
+        basis, reason = {**seen, "directory_version": version}, ""
         backlog = plan(expected, views, version)
         work = backlog or refresh(expected, views, version)
     except GovernmentSourceError as failure:
         if not meter.throttled and failure.reason_code != "GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED":
             raise
         stop = "throttled" if meter.throttled else "budget"
+        reason = "GOV_SYNC_THROTTLED" if meter.throttled else reason
         version = directory["version"]["register_version"]
         expected = {str(u["tozar"]): int(u["expected_rows"]) for u in directory["units"]}
         views = service.unit_views(repository)
@@ -163,14 +174,15 @@ def run_sync(repository: Any, lease: Any, *, client: Any, meter: MeteredTranspor
     position = 0
 
     def stop_before(unit: Mapping[str, Any]) -> bool:
-        return meter.throttled or estimate(unit["expected_rows"], client.page_limit) > meter.remaining
+        return meter.throttled or estimate(unit["expected_rows"], client.page_limit) + SYNC_RETRY_HEADROOM \
+            > meter.remaining
 
     while stop == "complete" and position < len(work):
         chosen, rows, cost = [], 0, 0
         for tozar in work[position:]:
             if chosen and rows + expected[tozar] > config.group_max_rows:
                 break
-            if cost + estimate(expected[tozar], client.page_limit) > meter.remaining:
+            if cost + estimate(expected[tozar], client.page_limit) + SYNC_RETRY_HEADROOM > meter.remaining:
                 break
             chosen.append(tozar)
             rows, cost = rows + expected[tozar], cost + estimate(expected[tozar], client.page_limit)
@@ -200,14 +212,17 @@ def run_sync(repository: Any, lease: Any, *, client: Any, meter: MeteredTranspor
                                stop_before_unit=stop_before)
         outcomes.update((unit.tozar, unit) for unit in report.units)
         if meter.throttled:
-            stop = "throttled"
+            stop, reason = "throttled", "GOV_SYNC_THROTTLED"
         elif meter.remaining <= 0 or any(unit.failure_code == "GOV_DIRECTORY_REQUEST_BUDGET_EXCEEDED"
                                          for unit in report.units):
             stop = "budget"
         elif len(report.units) < len(claim.get("units") or []):
             stop = "budget"
-    return _document(expected, views, version, work, backlog, outcomes, stop=stop, changed=changed,
-                     used=meter.budget.used, basis=basis)
+    document = _document(expected, views, version, work, backlog, outcomes, stop=stop, changed=changed,
+                         used=meter.budget.used, basis=basis)
+    # How the run ends: a failed unit fails it too (its pending snapshot is adopted later).
+    document["reason_code"] = reason or ("CATALOG_REGISTER_CAPTURE_FAILED" if document["failure_codes"] else "")
+    return document
 
 
 def _document(expected: Mapping[str, int], views: Mapping[str, Mapping[str, Any]], version: str,

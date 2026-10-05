@@ -393,6 +393,11 @@ def _request_capture(repo: Any, user_id: UUID, project_id: UUID, *, register_ver
         repo.record_register_capture_trigger(group["id"], run_id=run_id, trigger_state=state,
                                              execution_name=execution)
 
+    # Checked again AFTER the claim: a sync claimed between the two sees this
+    # claim, or this one sees it (single flight across two RPCs).
+    if any(_group_live(repo, other) for other in repo.register_directory_groups(1)):
+        record(trig.TRIGGER_FAILED, None)
+        raise _refusal("CATALOG_REGISTER_BUSY")
     run_id = _run_for(repo, conversation_id=conversation_id, user_id=user_id,
                       key=f"register-capture-{group['id']}", environment=environment)
     if run_id is None:
@@ -490,6 +495,10 @@ def request_sync(repo: Any, user_id: UUID, project_id: UUID, *, conversation_id:
             raise _refusal("CATALOG_REGISTER_BUSY")
         claim = repo.request_register_directory_refresh(user_id, grace_seconds=START_GRACE_SECONDS)
         if claim["decision"] != "claimed":
+            raise _refusal("CATALOG_REGISTER_BUSY")
+        if any(view["state"] == "capturing" for view in unit_views(repo).values()):  # again, after the claim
+            repo.record_register_capture_trigger(claim["group"]["id"], run_id=None,
+                                                 trigger_state=trig.TRIGGER_FAILED, execution_name=None)
             raise _refusal("CATALOG_REGISTER_BUSY")
         return _start_directory_group(repo, claim["group"], user_id=user_id, conversation_id=conversation_id,
                                       trigger=trigger, environment=environment, mode="sync")

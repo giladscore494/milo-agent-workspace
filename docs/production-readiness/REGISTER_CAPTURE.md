@@ -256,10 +256,13 @@ requests** (`SYNC_MAX_REQUESTS`; every send and every retry counts):
 1. **Check** (2 requests): `package_show` and the register's exact total. If
    both match what the last sync recorded for the current directory version,
    nothing changed.
-2. **Light directory** (~11 requests), only on a change or when a captured
-   tozar's count differs from the directory: the same tozar-column scan as
-   **Refresh directory**, then one count only for each tozar whose count moved
-   or that is new. A new directory version is recorded only on change.
+2. **Light directory** (~11 requests), only on a change or when a tozar
+   captured under the current directory version has another count: the same
+   tozar-column scan as **Refresh directory**, then one count only for each
+   tozar whose count moved or that is new. A new directory version is recorded
+   only on change. If more tozars moved than the budget can count, the sync
+   ends `GOV_SYNC_DIRECTORY_TOO_LARGE` before spending the counts: press
+   **Refresh directory** once, then sync again.
 3. **Backlog**: tozars never captured, then those whose last capture failed or
    was interrupted, then those whose captured count differs from the directory,
    each in byte order of the tozar. It is recomputed from the database on every
@@ -272,8 +275,9 @@ requests** (`SYNC_MAX_REQUESTS`; every send and every retry counts):
    current version is not requested again.
 5. **Capture**, through the same request, capacity guard, verification,
    archive, activation, variants and compaction as **Capture selected**. A
-   unit whose requests (`1 + pages + 1`, 3 for a small tozar) do not fit what
-   is left of the budget is not started. It is left for the next sync.
+   unit whose requests (`1 + pages + 1`, 3 for a small tozar) plus one spare
+   for a retry do not fit what is left of the budget is not started. It is
+   left for the next sync.
 
 The sync never waits on the firewall. Its client has no 60/180/300 s
 schedule: the first 403 block page or 429 ends the sync at once
@@ -294,7 +298,7 @@ shows the last one:
 
 | Field | Meaning |
 |---|---|
-| `changed` | the check saw a change (or no earlier sync), so the light directory ran |
+| `changed` | the check saw a change, count drift or no earlier sync, so the light directory was read (false when the check itself was stopped) |
 | `work` | tozars planned this run: the backlog, else the rolling refresh |
 | `captured` / `reused` | captured into a new snapshot / re-captured into the snapshot it already had |
 | `failed` / `deferred` | failed this run (retried by the next) / not reached this run (budget, throttle or capacity) |
