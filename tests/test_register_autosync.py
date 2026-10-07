@@ -20,7 +20,7 @@ And the kill switch: register capture off, every tick skips and starts nothing.
 from __future__ import annotations
 
 import threading
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
@@ -574,9 +574,7 @@ def test_the_production_state_starts_7_10_then_waits_72_hours_after_a_fourth_thr
     18:10 Israel time), no failures, no pause, backlog 83/41137, DB 326.6 MB.
     The 24 h cooldown ends 7.10 18:10, so the 19:07 tick starts; if that sync is
     throttled too (the 4th), nothing starts until its finish + 72 h."""
-    from zoneinfo import ZoneInfo
-
-    israel = ZoneInfo("Asia/Jerusalem")
+    israel = timezone(timedelta(hours=3), "IDT")  # Israel summer time until 25.10.2026
     w = World()
     w.switch("on")
     w.repo.register_database_bytes = 326_600_000
