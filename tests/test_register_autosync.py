@@ -1,7 +1,7 @@
 """PR-SYNC-2: the register sync runs itself -- offline.
 
 1. `decide()`: every rule and boundary, in a table (exactly 1 h / 24 h, the
-   6 -> 12 -> 24 -> 24 h throttle backoff, the counter resets, a pause before
+   6 -> 12 -> 24 -> 72 h throttle backoff (PR-SYNC-3), the counter resets, a pause before
    any start).
 2. The tick's authentication: only the dedicated scheduler identity; the
    gateway's own token, a wrong audience or issuer, an unverified email or no
@@ -86,8 +86,14 @@ CASES = [
      T0 + 12 * H, True, ("start", "SYNC_BACKLOG")),
     ("throttle 3: 24 h", on(consecutive_throttles=3), finished("throttled", status="failed"), False, 300,
      T0 + 24 * H - timedelta(seconds=1), True, ("skip", "SYNC_COOLING_DOWN")),
-    ("throttle 4: still 24 h", on(consecutive_throttles=4), finished("throttled", status="failed"), False, 300,
+    ("throttle 3: at 24 h", on(consecutive_throttles=3), finished("throttled", status="failed"), False, 300,
      T0 + 24 * H, True, ("start", "SYNC_BACKLOG")),
+    ("throttle 4: 72 h", on(consecutive_throttles=4), finished("throttled", status="failed"), False, 300,
+     T0 + 72 * H - timedelta(minutes=1), True, ("skip", "SYNC_COOLING_DOWN")),
+    ("throttle 4: at 72 h", on(consecutive_throttles=4), finished("throttled", status="failed"), False, 300,
+     T0 + 72 * H, True, ("start", "SYNC_BACKLOG")),
+    ("throttle 9: still 72 h", on(consecutive_throttles=9), finished("throttled", status="failed"), False, 300,
+     T0 + 72 * H - timedelta(minutes=1), True, ("skip", "SYNC_COOLING_DOWN")),
     ("capacity stop pauses", on(), finished("capacity"), False, 300, T0 + 5 * H, True,
      ("pause", "SYNC_PAUSED_CAPACITY")),
     ("db at the threshold pauses", on(), finished(), False, 400, T0 + 5 * H, True,
@@ -112,8 +118,22 @@ def test_decide(label, schedule, last, busy, db_mb, now, register_on, expected):
                            limit_bytes=400 * MB) == expected
 
 
-def test_the_backoff_is_6_12_24_24_hours():
-    assert [autosync.cooldown(n) for n in (1, 2, 3, 4, 9)] == [6 * H, 12 * H, 24 * H, 24 * H, 24 * H]
+def test_the_backoff_is_6_12_24_then_72_hours():
+    assert [autosync.cooldown(n) for n in (0, 1, 2, 3, 4, 5, 50)] == [6 * H, 6 * H, 12 * H, 24 * H, 72 * H,
+                                                                      72 * H, 72 * H]
+    assert autosync.THROTTLE_COOLDOWN_CAP == 72 * H
+
+
+def test_a_non_throttled_finish_after_four_throttles_restarts_the_backoff_at_6_hours():
+    state = autosync.observe(on(consecutive_throttles=4, counted_run_id="t4"), finished(run="ok"))
+    assert state["consecutive_throttles"] == 0
+    throttled = finished("throttled", status="failed", run="t5")
+    state = autosync.observe(state, throttled)
+    assert state["consecutive_throttles"] == 1
+    assert autosync.decide(state, throttled, False, 300 * MB, T0 + 6 * H - timedelta(minutes=1),
+                           limit_bytes=400 * MB) == ("skip", "SYNC_COOLING_DOWN")
+    assert autosync.decide(state, throttled, False, 300 * MB, T0 + 6 * H,
+                           limit_bytes=400 * MB) == ("start", "SYNC_BACKLOG")
 
 
 def test_counters_count_each_finished_sync_once_and_reset():
@@ -544,3 +564,52 @@ def test_a_start_whose_job_never_triggers_counts_as_a_failure(sentry):
     assert reasons == ["CATALOG_REGISTER_TRIGGER_FAILED", "CATALOG_REGISTER_TRIGGER_FAILED",
                        "SYNC_PAUSED_FAILING"] and sentry == ["SYNC_PAUSED_FAILING"]
 
+
+# =============================================================================
+# PR-SYNC-3: the production state of 7.10 under the 72 h cap
+# =============================================================================
+
+def test_the_production_state_starts_7_10_then_waits_72_hours_after_a_fourth_throttle():
+    """Production, 7.10: three throttles in a row (5.10 22:08, 6.10 05:09, 6.10
+    18:10 Israel time), no failures, no pause, backlog 83/41137, DB 326.6 MB.
+    The 24 h cooldown ends 7.10 18:10, so the 19:07 tick starts; if that sync is
+    throttled too (the 4th), nothing starts until its finish + 72 h."""
+    from zoneinfo import ZoneInfo
+
+    israel = ZoneInfo("Asia/Jerusalem")
+    w = World()
+    w.switch("on")
+    w.repo.register_database_bytes = 326_600_000
+    w.tick(datetime(2026, 10, 6, 18, 7, tzinfo=israel))
+    third = w.started()[-1]
+    w.finish(third, at=datetime(2026, 10, 6, 18, 10, tzinfo=israel), stop="throttled", status="failed")
+    w.repo.update_register_sync_schedule(w.project, {"consecutive_throttles": 3, "consecutive_failures": 0,
+                                                     "counted_run_id": third})
+
+    def ticks(first: datetime, last: datetime) -> list[tuple[datetime, dict[str, Any]]]:
+        out, now = [], first.astimezone(UTC)
+        while now <= last:
+            out.append((now.astimezone(israel), w.tick(now)))
+            now += H
+        return out
+
+    seventh = datetime(2026, 10, 7, 19, 7, tzinfo=israel)
+    waiting = ticks(datetime(2026, 10, 6, 19, 7, tzinfo=israel), seventh - H)
+    assert len(waiting) == 24 and {record["reason"] for _, record in waiting} == {"SYNC_COOLING_DOWN"}
+    record = w.tick(seventh)
+    assert (record["decision"], record["reason"], record["backlog"]) == ("start", "SYNC_BACKLOG", "83/41137")
+    fourth = w.started()[-1]
+    assert fourth != third
+    w.finish(fourth, at=datetime(2026, 10, 7, 19, 10, tzinfo=israel), stop="throttled", status="failed")
+    # Hourly from 7.10 20:07 to 10.10 19:07 Israel time: all 72 cool down.
+    waiting = ticks(seventh + H, datetime(2026, 10, 10, 19, 7, tzinfo=israel))
+    assert len(waiting) == 72 and {record["reason"] for _, record in waiting} == {"SYNC_COOLING_DOWN"}
+    assert w.started()[-1] == fourth
+    page = autosync.view(w.repo, w.project, now=datetime(2026, 10, 10, 19, 7, tzinfo=israel))
+    assert (page["consecutive_throttles"], page["consecutive_failures"], page["paused_reason"]) == (4, 0, None)
+    # The first tick at or after 10.10 19:10 (finish + 72 h) starts.
+    tenth = datetime(2026, 10, 10, 20, 7, tzinfo=israel)
+    (at, record), = ticks(tenth, tenth)
+    assert (record["decision"], record["reason"]) == ("start", "SYNC_BACKLOG")
+    assert at == tenth and len(w.started()) == 3
+    print(f"\nPRODUCTION|7.10 19:07 start|throttled 19:10 -> next start {at:%d.%m %H:%M} Israel")

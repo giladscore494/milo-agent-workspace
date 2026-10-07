@@ -356,7 +356,7 @@ writes `last_tick` and prints exactly one line:
 | 2 | the switch is off | skip `SYNC_AUTO_OFF` |
 | 3 | paused | skip with the pause reason |
 | 4 | a capture, directory refresh or sync is live | skip `SYNC_BUSY` |
-| 5 | the last sync stopped `throttled` | skip `SYNC_COOLING_DOWN` until its finish + 6 h x 2^(throttles in a row - 1), at most 24 h (6, 12, 24, 24 h) |
+| 5 | the last sync stopped `throttled` | skip `SYNC_COOLING_DOWN` until its finish + a cooldown by throttles in a row: 6, 12, 24, then 72 h (the 4th and every later one: a block that lasts for days is probed every 3 days) |
 | 6 | the last sync stopped `capacity` (finished after the last Resume), or the database is at or above capacity x threshold (400 MB) | pause `SYNC_PAUSED_CAPACITY` |
 | 7 | the last 2 finished syncs both failed for any other reason | pause `SYNC_PAUSED_FAILING` |
 | 8 | no sync has finished yet | start `SYNC_FIRST` |

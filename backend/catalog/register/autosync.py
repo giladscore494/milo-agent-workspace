@@ -25,7 +25,9 @@ START, SKIP, PAUSE = "start", "skip", "pause"
 BACKLOG_INTERVAL = timedelta(hours=1)
 DAILY_INTERVAL = timedelta(hours=24)
 THROTTLE_COOLDOWN = timedelta(hours=6)
-THROTTLE_COOLDOWN_CAP = timedelta(hours=24)
+THROTTLE_COOLDOWN_CAP = timedelta(hours=72)
+#: By throttles in a row: 6, 12, 24 h, then the cap for the 4th and every later one.
+THROTTLE_COOLDOWNS = (THROTTLE_COOLDOWN, 2 * THROTTLE_COOLDOWN, 4 * THROTTLE_COOLDOWN, THROTTLE_COOLDOWN_CAP)
 FAILURES_BEFORE_PAUSE = 2
 #: The non-blocking warning: 90% of the capacity limit (360 MB of 400 MB).
 WARNING_FRACTION = 0.9
@@ -96,8 +98,8 @@ def observe(schedule: Mapping[str, Any], last: Mapping[str, Any] | None) -> dict
 
 
 def cooldown(throttles: int) -> timedelta:
-    """6 h x 2^(n-1), capped at 24 h."""
-    return min(THROTTLE_COOLDOWN_CAP, THROTTLE_COOLDOWN * 2 ** (min(max(1, throttles), 4) - 1))
+    """6, 12, 24, then 72 h (a fixed table: no 48 h step); 0 throttles reads as 1."""
+    return THROTTLE_COOLDOWNS[min(max(1, throttles), len(THROTTLE_COOLDOWNS)) - 1]
 
 
 def decide(schedule: Mapping[str, Any] | None, last_sync: Mapping[str, Any] | None, busy: bool, db_bytes: int,
