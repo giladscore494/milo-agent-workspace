@@ -15,13 +15,18 @@ written by the same bulk helper, the build through `record_catalog_variants`,
 compaction through `compact_register_snapshot`). Autovacuum is off in this
 cluster so the dead-tuple counts are exactly what each path leaves behind.
 The retirement table is a probe created in this throwaway database only; it is
-not a migration.
+not a migration. The delta is measured as what it WRITES: its rows go through
+today's build and compaction as a separate, activated scope, because the
+never-activated delta path does not exist yet (PR-DELTA-1). The handful of
+constant rows each delta adds (its registry row, build row, snapshot row and
+unit updates) are not counted here.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import time
 
 import pytest
 
@@ -40,7 +45,7 @@ PROBE = "delta_retirements_probe"
 ROWS, ADDED, CHANGED, REMOVED = 1000, 8, 1, 1
 #: Whole re-captures replayed with a plain VACUUM between them (autovacuum's
 #: effect), to see where the file size settles.
-CYCLES = 4
+CYCLES = 6
 
 
 @pytest.fixture(scope="module")
@@ -106,12 +111,25 @@ def _capture(db, rows: list[dict], marque: str) -> dict:
 
 
 def _counters(db) -> dict[str, tuple[int, ...]]:
-    """(inserted, updated, deleted, dead) per table. Every psql call is its own
-    backend, which flushes its statistics when it exits."""
+    """(inserted, updated, deleted, dead) per table. Each psql call is its own
+    backend, and a backend's statistics reach the shared counters when it
+    exits -- which can be just AFTER psql returns. So read until two reads
+    0.3 s apart agree (bounded), instead of trusting one read."""
     names = ", ".join(f"'{t}'" for t in (*TABLES, PROBE))
-    out = db.psql("select relname, n_tup_ins, n_tup_upd, n_tup_del, n_dead_tup from pg_stat_user_tables "
-                  f"where schemaname = 'public' and relname in ({names})")
-    return {line.split("|")[0]: tuple(int(x) for x in line.split("|")[1:]) for line in out.splitlines()}
+
+    def read() -> dict[str, tuple[int, ...]]:
+        out = db.psql("select relname, n_tup_ins, n_tup_upd, n_tup_del, n_dead_tup from pg_stat_user_tables "
+                      f"where schemaname = 'public' and relname in ({names})")
+        return {line.split("|")[0]: tuple(int(x) for x in line.split("|")[1:]) for line in out.splitlines()}
+
+    previous = read()
+    for _ in range(30):
+        time.sleep(0.3)
+        current = read()
+        if current == previous:
+            return current
+        previous = current
+    return previous
 
 
 def _bytes(db, *, full: bool) -> int:
